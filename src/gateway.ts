@@ -104,7 +104,13 @@ async function handleData(route: string, b: any) {
     case "/stream/query":  return store.queryStream(b);
     case "/stream/search": return { messages: await store.searchStream(b.query, b.limit) };
     case "/stream/delete": return { deleted_count: store.deleteStream(b) };
-    case "/atoms/upsert":  return await store.upsertAtom(b);
+    case "/atoms/upsert":
+      if (Array.isArray(b.atoms)) {
+        const items = [];
+        for (const atom of b.atoms) items.push(await store.upsertAtom(atom));
+        return { items, total_count: items.length };
+      }
+      return await store.upsertAtom(b);
     case "/atoms/query":   return store.queryAtoms(b);
     case "/atoms/search":  return { items: await store.searchAtoms(b.query, b.limit) };
     case "/atoms/delete":  return { deleted_count: store.deleteAtoms(b.ids ?? []) };
