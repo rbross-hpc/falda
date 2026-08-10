@@ -52,6 +52,88 @@ Keep the MCP server off the public internet (no TLS/rate-limiting of its
 own) — bind to a private network/tailnet, same posture as the gateway
 (see `proxy/README.md` if you need a public-facing front door with TLS).
 
+## 2b. Docker / Compose (many containerized opencode agents, one FALDA)
+
+For the "one FALDA instance behind several containerized opencode agents"
+deployment this whole integration targets, run FALDA as another service on
+the same Compose network as the agents rather than by hand. This repo ships
+a `Dockerfile` (multi-stage: builds `better-sqlite3` + TypeScript, then a
+slim `node:24-trixie-slim` runtime running `node dist/mcp.js`) at the repo
+root, purpose-built for the MCP server (not the gateway).
+
+Add a `falda` service to your agents' `docker-compose.yml`, alongside
+whatever LLM-proxy/other shared services they already depend on:
+
+```yaml
+services:
+  falda:
+    build:
+      context: /path/to/falda        # a checkout of this repo
+    image: local/falda-mcp:latest
+    hostname: falda
+    restart: unless-stopped
+    init: true
+    environment:
+      FALDA_ROOT: /data
+      FALDA_MCP_PORT: "8079"
+      FALDA_MCP_TOKENS: /run/falda/tokens.json
+      FALDA_EMBED: local             # see "Embeddings" below to use a real model
+      FALDA_DIM: "768"
+    volumes:
+      - falda-data:/data                                       # persistent store
+      - /path/to/falda_mcp_tokens.json:/run/falda/tokens.json:ro # secret, host-only
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:8079/healthz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  your-agent:
+    # ...
+    depends_on:
+      falda:
+        condition: service_healthy
+
+volumes:
+  falda-data:
+```
+
+Notes:
+
+- **Create the token file on the host first** — it is never baked into the
+  image (`.dockerignore` excludes it) and must exist before `docker compose
+  up`, e.g. `cp falda_mcp_tokens.example.json /path/to/falda_mcp_tokens.json`
+  then fill in a real `openssl rand -hex 24` token. It's bind-mounted
+  read-only, so rotating it is just editing the host file — no rebuild.
+- **Agents reach FALDA by service name**: `http://falda:8079/mcp`, the same
+  way they'd reach any other shared service (e.g. an LLM proxy) on the
+  Compose network — no host port needs to be published.
+- **Persistent store**: `falda-data` is a named volume for `FALDA_ROOT`, so
+  atoms/stream survive `docker compose down`/image rebuilds. Use `docker
+  compose down -v` only if you intend to wipe memory.
+- **Embeddings**: starts as `FALDA_EMBED=local` (deterministic, offline,
+  weak recall — fine to confirm wiring). To use a real embedding model
+  served by something else on the Compose network (e.g. an existing
+  OpenAI-compatible proxy), first confirm it actually serves
+  `/v1/embeddings`:
+  ```bash
+  docker compose exec falda node -e "fetch('http://<proxy-service>:<port>/v1/embeddings',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({model:'<model-id>',input:'hi'})}).then(r=>r.text()).then(console.log)"
+  ```
+  If that returns a vector, switch to:
+  ```yaml
+      FALDA_EMBED: remote
+      FALDA_EMBED_BASE_URL: http://<proxy-service>:<port>/v1
+      FALDA_EMBED_MODEL: <model-id>
+      FALDA_DIM: "<model-dim>"        # must match the model exactly
+  ```
+  The embedding-lock manifest (`EMBEDDING.json`, written into `/data` on
+  first boot) pins model+dim for that store — changing them later requires
+  re-embedding, not just a config edit.
+- **Build context**: the Dockerfile only needs `package.json`,
+  `package-lock.json`, `tsconfig.json`, and `src/` (see `.dockerignore`);
+  it does not need `docs/`, `test/`, `integrations/`, or the Python
+  distiller.
+
 ## 3. Per-project opencode config
 
 Copy `opencode.json.example` into each project's `opencode.json` (merge with
@@ -133,7 +215,8 @@ curated by the distillation pipeline).
 2. Issue (or reuse) a bearer token for the container; add its tenant(s) to
    `falda_mcp_tokens.json`.
 3. Point `opencode.json`'s `mcp.falda` at the FALDA MCP server with that
-   token + tenant header.
+   token + tenant header (service name if running in Compose, e.g.
+   `http://falda:8079/mcp`).
 4. Add the capture plugin if you want automatic turn logging.
 5. If sharing memory across projects, declare a pool and grant access.
 6. Keep the MCP server off the public internet.
