@@ -1,0 +1,31 @@
+node_modules
+dist
+.git
+.gitignore
+.github
+
+# Secrets — must never enter an image layer.
+falda_mcp_tokens.json
+proxy/falda_proxy_tokens.json
+proxy/falda_proxy.crt
+proxy/falda_proxy.key
+
+# Runtime data / not needed in the build context.
+falda-data/
+example-blobs/
+*.db
+*.db-wal
+*.db-shm
+*.log
+
+# Not needed to build the MCP server image.
+test
+examples
+deck
+demo
+docs
+integrations
+proxy
+deploy
+KUKLA_DELTA.md
+KUKLA_DELTA_embedding_lock.md
