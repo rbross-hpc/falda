@@ -12,6 +12,7 @@ __pycache__/
 falda-data/
 *.bak-premerge-*
 *.tenant-aware.py
+opencode.json
 
 # FALDA access proxy secrets (never commit)
 proxy/falda_proxy_tokens.json
