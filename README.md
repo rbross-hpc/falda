@@ -69,8 +69,24 @@ curl localhost:8077/healthz
 
 See [`docs/API.md`](docs/API.md) for the full route table.
 
-To connect an agent runtime (Hermes, OpenClaw, or your own) to FALDA — shadow
-or live, single-tenant or shared-pool — see
+### As an MCP server (opencode and other MCP clients)
+
+For deployments where many agents (e.g. containerized opencode instances)
+share one FALDA over a network, use the authenticated MCP server instead of
+the gateway directly:
+
+```bash
+cp falda_mcp_tokens.example.json falda_mcp_tokens.json   # fill in real tokens
+npm run mcp          # Streamable HTTP MCP endpoint on :8079
+curl localhost:8079/healthz
+```
+
+See [`docs/MCP.md`](docs/MCP.md) for the tool table and auth model, and
+[`integrations/opencode/README.md`](integrations/opencode/README.md) for the
+opencode-specific setup (MCP config + auto-capture plugin).
+
+To connect an agent runtime (Hermes, OpenClaw, opencode, or your own) to
+FALDA — shadow or live, single-tenant or shared-pool — see
 [`docs/HARNESS_INTEGRATION.md`](docs/HARNESS_INTEGRATION.md).
 
 ### Distillation (T0 → T1 → T2 → T3)

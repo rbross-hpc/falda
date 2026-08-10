@@ -1,0 +1,15 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "falda": {
+      "type": "remote",
+      "url": "http://falda-host:8079/mcp",
+      "enabled": true,
+      "headers": {
+        "Authorization": "Bearer REPLACE_WITH_THIS_CONTAINER'S_TOKEN",
+        "X-Falda-Tenant": "REPLACE_WITH_THIS_PROJECT'S_TENANT"
+      }
+    }
+  },
+  "plugin": ["./.opencode/plugins/falda-capture.ts"]
+}

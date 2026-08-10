@@ -1,0 +1,14 @@
+{
+  "tokens": {
+    "REPLACE_WITH_openssl_rand_hex_24": {
+      "tenants": ["proj-a", "proj-b"],
+      "pools": ["shared-corpus"],
+      "label": "opencode container — proj-a & proj-b"
+    },
+    "REPLACE_WITH_ANOTHER_openssl_rand_hex_24": {
+      "tenants": ["*"],
+      "pools": [],
+      "label": "fully-trusted internal container (any tenant)"
+    }
+  }
+}

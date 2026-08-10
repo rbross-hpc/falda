@@ -201,6 +201,46 @@ mode by default; flip `memory.provider: falda` in config to go live.
 
 ---
 
+## 2b. opencode
+
+opencode is different from Hermes/OpenClaw in one important way: it consumes
+external tools via [MCP](https://opencode.ai/docs/mcp-servers/) or
+[plugins](https://opencode.ai/docs/plugins/), not a bespoke memory-provider
+interface, and the deployment shape here is typically **many containerized
+opencode agents against one shared FALDA instance**, with a single container
+often working across several projects. That combination — many untrusted-ish
+network peers, one container spanning multiple tenants — is why FALDA ships a
+dedicated, **authenticated** MCP server (`src/mcp.ts`) alongside the
+unauthenticated JSON gateway used by Hermes/OpenClaw above.
+
+Full setup recipe (server config, per-project opencode config, auto-capture
+plugin, shared pools): `integrations/opencode/README.md` and `docs/MCP.md`.
+Summary:
+
+- **Tools**: recall (`falda_stream_search`, `falda_atoms_search`, ...) and
+  write for Stream/Atoms only (`falda_stream_add`, `falda_atoms_upsert`).
+  Scenes (T2) and Core (T3) are read-only over MCP — they stay curated by the
+  distillation pipeline, not freehand agent edits.
+- **Auto-capture**: a small opencode plugin
+  (`integrations/opencode/plugin/falda-capture.ts`) subscribes to opencode's
+  message/part events and forwards settled turns to `falda_stream_add`, so
+  conversation history is captured without relying on the model to call a
+  tool every turn.
+- **Auth**: a bearer token identifies a principal (typically one container)
+  with an explicit `tenants` allow-list; an `X-Falda-Tenant` header selects
+  which tenant a given request addresses, checked against that allow-list.
+  This lets one container/token drive several projects (each project = a
+  different FALDA tenant) by varying the header per-project, while keeping
+  cross-tenant access impossible outside the token's allow-list — see
+  `docs/MCP.md` for the full contract, and `proxy/` for the analogous
+  (stricter, one-token-one-tenant) pattern already used for external REST
+  demo access.
+- **Shared pools**: identical mechanism to §3 below — declare a pool on the
+  gateway (admin-only, not exposed over MCP) and add it to the relevant
+  tokens' `pools` allow-list.
+
+---
+
 ## 3. Shared-pool collaboration between harnesses
 
 When the two harnesses should share a slice of memory (not their whole stores),
