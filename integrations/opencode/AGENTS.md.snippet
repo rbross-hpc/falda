@@ -1,0 +1,16 @@
+## Memory (FALDA)
+
+This project has a FALDA memory store connected via MCP (`falda_*` tools).
+
+- Before starting non-trivial work, use `falda_atoms_search` to recall durable
+  facts, preferences, decisions, and rules about this project.
+- Use `falda_stream_search` to recall specific past conversation turns.
+- Use `falda_core_read` to read the project's persona/context summary.
+- When you learn something durable worth remembering long-term (a fact,
+  preference, rule, or decision — not a transient detail), call
+  `falda_atoms_upsert` with `{ content, type }`. The field is `content`, not
+  `text`.
+- Raw conversation turns are captured automatically; you do not need to call
+  `falda_stream_add` yourself except to backfill or annotate.
+- `falda_scenes_*` and `falda_core_read` are read-only here — scenes and core
+  are maintained by FALDA's distillation pipeline, not by direct agent edits.

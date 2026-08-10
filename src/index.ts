@@ -10,3 +10,6 @@ export { makeEmbedder, makeLocalEmbedder } from "./embedder.js";
 export type { EmbedderConfig } from "./embedder.js";
 export { PoolManager, PoolError } from "./pools.js";
 export type { Access, PoolDecl } from "./pools.js";
+export { makeFaldaMcpServer, handleFaldaMcpRequest } from "./mcp.js";
+export { TokenStore, AuthError, parseBearer } from "./mcp_auth.js";
+export type { Principal } from "./mcp_auth.js";

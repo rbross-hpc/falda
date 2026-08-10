@@ -35,59 +35,17 @@
  *   /healthz         (GET)                               -> {ok, tiers}
  */
 import { createServer } from "node:http";
-import { readFileSync as _lockReadFile, writeFileSync as _lockWriteFile } from "node:fs";
-import { join as _lockJoin } from "node:path";
 import { PoolManager, PoolError } from "./pools.js";
-import { makeEmbedder, makeLocalEmbedder } from "./embedder.js";
+import { selectEmbedder, enforceEmbeddingLock } from "./boot.js";
 
 const PORT = Number(process.env.FALDA_PORT ?? 8077);
 const DIM = Number(process.env.FALDA_DIM ?? 768);
 const ROOT = process.env.FALDA_ROOT ?? "./falda-data";
 const DEFAULT_TENANT = process.env.FALDA_DEFAULT_TENANT ?? "default";
 
-// Embedder selection:
-//   FALDA_EMBED=local                  -> deterministic offline embedder (no network)
-//   FALDA_EMBED=remote                 -> require a configured /v1/embeddings endpoint
-//   (unset) + FALDA_EMBED_BASE_URL set -> remote
-//   (unset) + no base URL                -> local offline default (so it just works)
-function selectEmbedder() {
-  const mode = (process.env.FALDA_EMBED ?? "").toLowerCase();
-  const hasRemote = !!process.env.FALDA_EMBED_BASE_URL;
-  if (mode === "local") { console.log("FALDA embedder: local (offline, deterministic)"); return makeLocalEmbedder(DIM); }
-  if (mode === "remote" || hasRemote) { console.log(`FALDA embedder: remote (${process.env.FALDA_EMBED_BASE_URL ?? "http://localhost:11434/v1"})`); return makeEmbedder(); }
-  console.log("FALDA embedder: local (offline default; set FALDA_EMBED_BASE_URL for dense recall)");
-  return makeLocalEmbedder(DIM);
-}
+enforceEmbeddingLock(ROOT, DIM, "FALDA gateway");
 
-// Embedding lock: verify running embed model+dim against the store's locked
-// manifest (EMBEDDING.json) at boot. Prevents silent recall corruption from a
-// same-dim/different-model swap, and broken inserts from a dim change.
-function enforceEmbeddingLock() {
-  const path = _lockJoin(ROOT, "EMBEDDING.json");
-  const model = process.env.FALDA_EMBED_MODEL ?? "";
-  let locked: any;
-  try {
-    locked = JSON.parse(_lockReadFile(path, "utf8"));
-  } catch {
-    // First boot / no manifest: write the current config as the lock.
-    locked = { model, dim: DIM, locked: true, locked_at: new Date().toISOString().slice(0, 10) };
-    try { _lockWriteFile(path, JSON.stringify(locked, null, 2)); } catch {}
-    console.log(`FALDA embedding lock: initialized manifest model=${model} dim=${DIM}`);
-    return;
-  }
-  const mismatch: string[] = [];
-  if (locked.model !== undefined && locked.model !== model) mismatch.push(`model ${locked.model} != ${model}`);
-  if (locked.dim   !== undefined && Number(locked.dim) !== DIM) mismatch.push(`dim ${locked.dim} != ${DIM}`);
-  if (mismatch.length) {
-    console.error(`FATAL: embedding config does not match locked store manifest (${path}): ${mismatch.join("; ")}. ` +
-      `Serving would corrupt recall. Fix FALDA_EMBED_MODEL/FALDA_DIM to match, or re-embed the store and update the manifest.`);
-    process.exit(1);
-  }
-  console.log(`FALDA embedding lock: OK model=${model} dim=${DIM}`);
-}
-enforceEmbeddingLock();
-
-const pools = new PoolManager({ root: ROOT, embed: selectEmbedder(), dim: DIM });
+const pools = new PoolManager({ root: ROOT, embed: selectEmbedder(DIM, "FALDA gateway"), dim: DIM });
 
 /** Routes that mutate the addressed store (need readwrite on a shared pool). */
 const WRITE_ROUTES = new Set([

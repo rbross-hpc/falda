@@ -1,0 +1,123 @@
+# FALDA MCP server
+
+A remote (Streamable HTTP) [Model Context Protocol](https://modelcontextprotocol.io)
+server exposing FALDA's recall + write tools to any MCP client (opencode and
+others) over a network — for deployments where **one FALDA instance serves
+many agents**, potentially each working across several projects.
+
+For the JSON/HTTP gateway (a different, unauthenticated surface meant for
+trusted loopback/tailnet callers), see `docs/API.md`.
+
+## Why a separate server from the gateway
+
+The gateway (`src/gateway.ts`) trusts a `tenant` field straight from the
+request body — by design, for trusted single-network deployments (see
+`docs/POOLS.md`). The MCP server is meant to be reachable by many
+containerized agents over a shared network, so **every request is
+authenticated**.
+
+## Run it
+
+```bash
+cp falda_mcp_tokens.example.json falda_mcp_tokens.json
+# fill in real tokens (openssl rand -hex 24), each with a tenants[] allow-list
+
+FALDA_ROOT=~/.falda/data \
+FALDA_MCP_PORT=8079 \
+FALDA_MCP_TOKENS=./falda_mcp_tokens.json \
+FALDA_EMBED=local \
+node --import tsx src/mcp.ts
+# or: npm run mcp
+
+curl -s localhost:8079/healthz   # {"ok":true,"mcp":true}
+```
+
+MCP endpoint: `POST/GET/DELETE http://<host>:8079/mcp` (Streamable HTTP
+transport, stateless — a fresh session per connection).
+
+## Auth model
+
+Every request must carry:
+
+| Header | Meaning |
+|---|---|
+| `Authorization: Bearer <token>` | Identifies a **principal** (e.g. one container/host). Unknown/missing token → `401` before any MCP handshake. |
+| `X-Falda-Tenant: <tenant>` | **Selects** which tenant this request addresses. |
+
+The principal's `tenants` allow-list in the token file determines which
+tenants it may select via the header:
+
+```json
+{
+  "tokens": {
+    "<opaque-token>": {
+      "tenants": ["proj-a", "proj-b"],
+      "pools": ["shared-corpus"],
+      "label": "opencode container — proj-a & proj-b"
+    },
+    "<another-token>": {
+      "tenants": ["*"],
+      "pools": [],
+      "label": "fully-trusted internal container (any tenant)"
+    }
+  }
+}
+```
+
+- `tenants: ["*"]` — the principal may select any tenant. Use only for fully
+  trusted internal deployments.
+- `tenants: ["proj-a", "proj-b"]` — the principal may only select one of
+  these. Selecting any other tenant → tool call returns an error result
+  (`token is not authorized for tenant "..."`).
+- **Why token authorizes but header selects** (rather than one-token-one-
+  tenant, as the REST-facing `proxy/` uses): a single container commonly
+  works across multiple projects. One token per container, one tenant header
+  per project's `opencode.json`, lets that container reach every project
+  it's authorized for without juggling per-project tokens.
+- A `pool` tool argument is checked against the principal's `pools`
+  allow-list. `pool: "self"` (the default, omitted) is always allowed.
+- The token file is hot-read per request — rotating/adding a token doesn't
+  require a restart. **Never commit it** (`falda_mcp_tokens.json` is
+  git-ignored).
+
+This is a routing/authorization boundary, not transport security — run the
+MCP server on a private network/tailnet. It has no TLS of its own; if you
+need a public-facing endpoint, terminate TLS in front of it (see
+`proxy/README.md` for the pattern FALDA already uses for the REST gateway).
+
+## Tools
+
+All tools accept an optional `pool` argument (must be in the token's `pools`
+allow-list; omit for the tenant's private `self` store).
+
+| Tool | Tier | R/W | Description |
+|---|---|---|---|
+| `falda_stream_search` | T0 Stream | read | Hybrid dense+lexical search over raw turns |
+| `falda_stream_query` | T0 Stream | read | List turns by session/time window |
+| `falda_stream_add` | T0 Stream | write | Append raw turns |
+| `falda_atoms_search` | T1 Atoms | read | Hybrid dense+lexical search over distilled facts/prefs/rules |
+| `falda_atoms_query` | T1 Atoms | read | List atoms by type/time window |
+| `falda_atoms_upsert` | T1 Atoms | write | Create/update a distilled atom (`content`, not `text`) |
+| `falda_core_read` | T3 Core | read | Read the persona/project core document |
+| `falda_scenes_ls` | T2 Scenes | read | List episodic scene summaries |
+| `falda_scenes_read` | T2 Scenes | read | Read a scene summary by path |
+
+**T2 Scenes and T3 Core are intentionally read-only over MCP.** Those tiers
+are maintained by the distillation pipeline (`falda_distiller.py` /
+`src/distiller.ts`), not by freehand agent edits. Pool administration
+(`/pools/declare`, `/pools/grant`, ...) is likewise **not** exposed over
+MCP — use the gateway's `/pools/*` routes from an internal/admin context.
+
+## Environment
+
+| var | meaning | default |
+|---|---|---|
+| `FALDA_MCP_PORT` | port to listen on | `8079` |
+| `FALDA_ROOT` | pool root dir (shared with the gateway) | `./falda-data` |
+| `FALDA_MCP_TOKENS` | path to token file | `./falda_mcp_tokens.json` |
+| `FALDA_DIM` / `FALDA_EMBED*` | as in the gateway | — |
+
+## opencode integration
+
+See `integrations/opencode/README.md` for the full setup recipe (MCP config
++ auto-capture plugin) for containerized opencode agents.

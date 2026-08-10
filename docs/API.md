@@ -3,6 +3,11 @@
 All routes are `POST` with a JSON body and JSON response, except `/healthz` (`GET`).
 Gateway default port: `8077` (`FALDA_PORT`).
 
+This gateway trusts the `tenant`/`pool` fields it's given — appropriate for
+trusted loopback/tailnet callers (see `docs/POOLS.md`). For deployments where
+many agents share one FALDA over an untrusted network (e.g. containerized
+opencode agents), use the authenticated MCP server instead — see `docs/MCP.md`.
+
 ## Tier T0 — Stream
 
 ### `POST /stream/add`
