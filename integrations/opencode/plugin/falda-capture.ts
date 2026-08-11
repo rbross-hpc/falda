@@ -14,36 +14,72 @@
  * `time.completed` set, or immediately for a user message, which doesn't
  * stream).
  *
- * This plugin talks to the FALDA MCP server (src/mcp.ts) using the same
- * bearer token + X-Falda-Tenant header your project's `mcp.falda` config
- * already uses (see ../opencode.json.example), so it's authorized for
- * exactly the same tenant your recall tools use — no separate credential.
+ * Tenant resolution — FALDA is meant to be scoped **per project**, not per
+ * agent/container (see ../README.md "Per-project opencode config"): each
+ * project sets its own tenant in its `opencode.json`'s `mcp.falda.headers`.
+ * This plugin must capture to that *same* tenant, or recall (via the
+ * `falda_*` MCP tools) and capture would silently diverge. So at plugin init
+ * it asks opencode for the resolved config for this project's directory
+ * (`client.config.get({ query: { directory } })`, which returns the merged
+ * global + project config — the same merge opencode itself uses to wire up
+ * `mcp.falda`) and reuses its `mcp.falda.headers` (`Authorization`,
+ * `X-Falda-Tenant`) and `url` directly. No separate credential, and no way
+ * for capture to use a different tenant than recall for this project.
  *
- * Config (env, or hardcode per project):
- *   FALDA_MCP_URL      e.g. http://falda-host:8079/mcp
- *   FALDA_MCP_TOKEN    same bearer token as opencode.json's mcp.falda.headers
- *   FALDA_TENANT       same tenant as opencode.json's mcp.falda.headers (X-Falda-Tenant)
- *   FALDA_CAPTURE      "0" to disable capture entirely (default: enabled)
+ * Falls back to the FALDA_MCP_URL/FALDA_MCP_TOKEN/FALDA_TENANT env vars only
+ * if the resolved config has no `mcp.falda` entry (e.g. no opencode.json in
+ * this project and no global default either) — this keeps the plugin usable
+ * standalone (env-only, no opencode.json) for non-container setups.
+ *
+ * Config:
+ *   opencode.json  mcp.falda.{url,headers.Authorization,headers.X-Falda-Tenant}
+ *                  (per-project or global — see ../opencode.json.example)
+ *   FALDA_MCP_URL / FALDA_MCP_TOKEN / FALDA_TENANT   fallback if no mcp.falda config resolves
+ *   FALDA_CAPTURE  "0" to disable capture entirely (default: enabled)
  *
  * Install: copy this file to .opencode/plugins/falda-capture.ts (project) or
  * ~/.config/opencode/plugins/falda-capture.ts (global), and add a
  * package.json alongside it with `@modelcontextprotocol/sdk` as a dependency
  * (see ../package.json.example) — opencode runs `bun install` for you.
  */
-import type { Plugin } from "@opencode-ai/plugin";
+import type { Plugin, PluginInput } from "@opencode-ai/plugin";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 
-const MCP_URL = process.env.FALDA_MCP_URL;
-const MCP_TOKEN = process.env.FALDA_MCP_TOKEN;
-const TENANT = process.env.FALDA_TENANT;
-const ENABLED = process.env.FALDA_CAPTURE !== "0" && !!MCP_URL && !!MCP_TOKEN && !!TENANT;
+interface FaldaCreds { url: string; token: string; tenant: string; }
+
+/**
+ * Resolve this project's FALDA MCP url/token/tenant from opencode's merged
+ * (global + project) config, falling back to env vars. Re-resolved once at
+ * plugin init (not per-message) — a project's tenant doesn't change mid-session.
+ */
+async function resolveFaldaCreds(client: PluginInput["client"], directory: string): Promise<FaldaCreds | undefined> {
+  try {
+    const { data } = await client.config.get({ query: { directory } });
+    const falda = data?.mcp?.["falda"];
+    if (falda && falda.type === "remote" && falda.enabled !== false) {
+      const headers = falda.headers ?? {};
+      const auth = headers["Authorization"] ?? headers["authorization"];
+      const tenant = headers["X-Falda-Tenant"] ?? headers["x-falda-tenant"];
+      const token = auth?.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : auth;
+      if (falda.url && token && tenant) return { url: falda.url, token, tenant };
+    }
+  } catch {
+    // fall through to env vars below — e.g. running outside a real opencode server
+  }
+
+  const url = process.env.FALDA_MCP_URL;
+  const token = process.env.FALDA_MCP_TOKEN;
+  const tenant = process.env.FALDA_TENANT;
+  if (url && token && tenant) return { url, token, tenant };
+  return undefined;
+}
 
 interface PendingText { sessionID: string; text: string[]; }
 
-async function callFaldaStreamAdd(sessionId: string, role: string, content: string, id: string) {
-  const transport = new StreamableHTTPClientTransport(new URL(MCP_URL!), {
-    requestInit: { headers: { Authorization: `Bearer ${MCP_TOKEN}`, "X-Falda-Tenant": TENANT! } },
+async function callFaldaStreamAdd(creds: FaldaCreds, sessionId: string, role: string, content: string, id: string) {
+  const transport = new StreamableHTTPClientTransport(new URL(creds.url), {
+    requestInit: { headers: { Authorization: `Bearer ${creds.token}`, "X-Falda-Tenant": creds.tenant } },
   });
   const client = new Client({ name: "opencode-falda-capture", version: "1.0" });
   try {
@@ -57,8 +93,11 @@ async function callFaldaStreamAdd(sessionId: string, role: string, content: stri
   }
 }
 
-export const FaldaCapturePlugin: Plugin = async ({ client }) => {
-  if (!ENABLED) return {};
+export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
+  if (process.env.FALDA_CAPTURE === "0") return {};
+  const resolved = await resolveFaldaCreds(client, directory);
+  if (!resolved) return {};
+  const creds: FaldaCreds = resolved;
 
   // messageID -> accumulated text parts, until the message settles.
   const pending = new Map<string, PendingText>();
@@ -78,7 +117,7 @@ export const FaldaCapturePlugin: Plugin = async ({ client }) => {
     settledRole.delete(messageId);
     flushedIds.add(messageId);
     try {
-      await callFaldaStreamAdd(entry.sessionID, role, text, messageId);
+      await callFaldaStreamAdd(creds, entry.sessionID, role, text, messageId);
     } catch (e) {
       flushedIds.delete(messageId);
       await client.app.log({

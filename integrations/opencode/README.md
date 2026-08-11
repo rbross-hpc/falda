@@ -11,7 +11,11 @@ FALDA ships both halves of the integration:
 
 This is designed for **one FALDA deployment serving many containerized
 opencode agents**, where a single container may work across **several
-projects** (each project = a different FALDA tenant).
+projects** (each project = a different FALDA tenant). **Tenants are scoped
+per project, not per agent/container** — the tenant a container's memory
+tools address is whatever `X-Falda-Tenant` is set in the *project's own*
+`opencode.json` (see "Per-project opencode config" below), not something
+fixed for the whole container.
 
 ## Why not the JSON gateway directly?
 
@@ -173,14 +177,15 @@ cp path/to/falda/integrations/opencode/plugin/falda-capture.ts .opencode/plugins
 cp path/to/falda/integrations/opencode/package.json.example .opencode/package.json
 ```
 
-Set matching env vars (same token/tenant as the MCP config above) wherever
-the opencode process runs:
+The plugin reads this project's *resolved* `opencode.json` at startup and
+reuses whatever `mcp.falda.headers` (`Authorization`, `X-Falda-Tenant`) and
+`url` you set in step 3 above — no separate credential and no risk of
+capture writing to a different tenant than recall reads from. Nothing else
+to configure per project.
 
-```bash
-FALDA_MCP_URL=http://falda-host:8079/mcp
-FALDA_MCP_TOKEN=<this-container's-token>
-FALDA_TENANT=<this-project's-tenant>
-```
+If you're running the plugin outside a full opencode project (no
+`opencode.json` resolves for it at all), it falls back to
+`FALDA_MCP_URL`/`FALDA_MCP_TOKEN`/`FALDA_TENANT` env vars instead.
 
 Set `FALDA_CAPTURE=0` to disable capture without removing the plugin.
 
@@ -208,15 +213,27 @@ See `docs/MCP.md` for the full tool table (recall/read across all four
 tiers; write for Stream + Atoms only — Scenes and Core stay read-only,
 curated by the distillation pipeline).
 
-## Checklist for a new opencode deployment
+## Checklist for setting up a new project's tenant
 
-1. Choose a tenant id per project (not per container — one container’s token
-   may span several tenants).
-2. Issue (or reuse) a bearer token for the container; add its tenant(s) to
-   `falda_mcp_tokens.json`.
-3. Point `opencode.json`'s `mcp.falda` at the FALDA MCP server with that
-   token + tenant header (service name if running in Compose, e.g.
-   `http://falda:8079/mcp`).
-4. Add the capture plugin if you want automatic turn logging.
+Tenants are per-project, not per-container/agent — do this once for each
+project you want FALDA memory for:
+
+1. Choose a tenant id for the project (e.g. the project's slug — doesn't
+   need to match its directory name, but that's a reasonable default).
+2. Add that tenant id to the `tenants[]` allow-list of whichever bearer
+   token this container/host uses, in `falda_mcp_tokens.json` (one
+   container's token commonly spans several projects/tenants).
+3. Add/merge `opencode.json` in the *project's own directory* (not the
+   global config) with `mcp.falda` pointing at the FALDA MCP server, that
+   token, and that tenant (see "Per-project opencode config" above; service
+   name if running in Compose, e.g. `http://falda:8079/mcp`). This is the
+   single source of truth both recall tools and the capture plugin use.
+4. Add the capture plugin to the project if you want automatic turn
+   logging — it picks up the same tenant from step 3 automatically.
 5. If sharing memory across projects, declare a pool and grant access.
 6. Keep the MCP server off the public internet.
+
+A container with no per-project `opencode.json` falls back to whatever
+tenant its *global* `~/.config/opencode/opencode.json` sets (if any) — treat
+that as a default, not a substitute for giving each real project its own
+tenant.
