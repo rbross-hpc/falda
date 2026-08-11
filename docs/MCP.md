@@ -37,6 +37,14 @@ transport, stateless — a fresh session per connection).
 
 ## Auth model
 
+**Tenants are scoped per project, not per container/agent.** A token
+identifies a principal (typically one container/host), but the tenant a
+given request addresses is selected per call via `X-Falda-Tenant` — in
+practice, whatever that *project's own* `opencode.json` sets (see
+`integrations/opencode/README.md` "Per-project opencode config"). This is
+what lets one container work across many projects, each with its own
+isolated memory, without juggling per-project tokens.
+
 Every request must carry:
 
 | Header | Meaning |
