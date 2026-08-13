@@ -31,6 +31,14 @@
  * this project and no global default either) — this keeps the plugin usable
  * standalone (env-only, no opencode.json) for non-container setups.
  *
+ * Lazy resolution — opencode awaits every plugin's factory function during
+ * startup, before the server has finished coming up. Calling back into that
+ * same server (`client.config.get(...)`) from inside the factory deadlocks
+ * startup: the server can't answer while it's still blocked loading plugins.
+ * So the factory returns its hooks immediately, and credential resolution is
+ * deferred to the first captured event, then memoized (a project's tenant
+ * doesn't change mid-session, so resolving once is enough).
+ *
  * Config:
  *   opencode.json  mcp.falda.{url,headers.Authorization,headers.X-Falda-Tenant}
  *                  (per-project or global — see ../opencode.json.example)
@@ -95,9 +103,20 @@ async function callFaldaStreamAdd(creds: FaldaCreds, sessionId: string, role: st
 
 export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
   if (process.env.FALDA_CAPTURE === "0") return {};
-  const resolved = await resolveFaldaCreds(client, directory);
-  if (!resolved) return {};
-  const creds: FaldaCreds = resolved;
+
+  // Resolved lazily on the first captured event (see "Lazy resolution"
+  // above), not here — must never await server calls during plugin init.
+  let credsPromise: Promise<FaldaCreds | undefined> | undefined;
+  let disabled = false; // set once creds resolve to undefined — stop accumulating
+  function getCreds(): Promise<FaldaCreds | undefined> {
+    if (!credsPromise) {
+      credsPromise = resolveFaldaCreds(client, directory).then((creds) => {
+        if (!creds) disabled = true;
+        return creds;
+      });
+    }
+    return credsPromise;
+  }
 
   // messageID -> accumulated text parts, until the message settles.
   const pending = new Map<string, PendingText>();
@@ -113,6 +132,8 @@ export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
     if (!entry || flushedIds.has(messageId)) return;
     const text = entry.text.join("\n").trim();
     if (!text) return;
+    const creds = await getCreds();
+    if (!creds) return;
     pending.delete(messageId);
     settledRole.delete(messageId);
     flushedIds.add(messageId);
@@ -128,6 +149,8 @@ export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
 
   return {
     event: async ({ event }) => {
+      if (disabled) return;
+
       if (event.type === "message.part.updated") {
         const part = (event.properties as any)?.part;
         if (part?.type !== "text" || !part.text) return;
