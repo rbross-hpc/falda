@@ -189,6 +189,20 @@ If you're running the plugin outside a full opencode project (no
 
 Set `FALDA_CAPTURE=0` to disable capture without removing the plugin.
 
+> **Version tracking (containerized deployments).** If you're installing
+> this plugin via a container image that bakes in a `package.json` for its
+> deps (as the `argo-oc` image in a `docker-setups`-style deployment
+> does), keep the pinned `@opencode-ai/plugin` version in sync with the
+> installed `opencode` version, and remember that a running container's
+> `~/.config/opencode/{bun.lock,node_modules}` won't pick up a bump on
+> their own if they live on a persistent volume — see that deployment
+> repo's README ("What's built-in vs. what you still configure") for the
+> full explanation and the fix. This matters here specifically because the
+> plugin factory is `await`ed by opencode during startup: it must never
+> block on a call back into the opencode server before returning its
+> hooks (see the "Lazy resolution" note in `plugin/falda-capture.ts`) or
+> the agent hangs on startup with no error logged.
+
 ## 5. Shared pools across projects/agents
 
 If two projects/agents should share a slice of memory, declare a pool on the
