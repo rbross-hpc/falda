@@ -227,6 +227,20 @@ export function makeFaldaMcpServer(pools: PoolManager, tokenStore: TokenStore): 
     },
   );
 
+  server.registerTool(
+    "falda_whoami",
+    {
+      description: "Return the FALDA tenant this connection resolves to (from the X-Falda-Tenant header). Use to confirm which tenant your memory reads/writes address — does not disclose the bearer token or its full tenant/pool allow-lists.",
+      inputSchema: {},
+    },
+    async (_args, extra) => {
+      try {
+        const ctx = ctxFromExtra(extra);
+        return textResult({ tenant: ctx.tenant });
+      } catch (e) { return errorResult(e); }
+    },
+  );
+
   return server;
 }
 

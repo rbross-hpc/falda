@@ -120,6 +120,19 @@ async function main() {
     check("5c no falda_core_write tool", !names.includes("falda_core_write"));
   });
 
+  // ── 6. falda_whoami: echoes only the resolved tenant, nothing sensitive ────
+  await withClient(port, "tok-a", "proj-a", async (client) => {
+    const who = textOf(await client.callTool({ name: "falda_whoami", arguments: {} }));
+    check("6a whoami reports the resolved tenant", who.tenant === "proj-a");
+    check("6b whoami does not leak the token", !JSON.stringify(who).includes("tok-a"));
+    check("6c whoami does not leak the tenants allow-list", !("tenants" in who));
+    check("6d whoami does not leak the pools allow-list", !("pools" in who));
+  });
+  await withClient(port, "tok-star", "proj-z", async (client) => {
+    const who = textOf(await client.callTool({ name: "falda_whoami", arguments: {} }));
+    check("6e whoami reflects the selected tenant for a wildcard principal", who.tenant === "proj-z");
+  });
+
   pools.closeAll();
   server.close();
   fs.rmSync(root, { recursive: true, force: true });

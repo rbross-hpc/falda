@@ -14,3 +14,5 @@ This project has a FALDA memory store connected via MCP (`falda_*` tools).
   `falda_stream_add` yourself except to backfill or annotate.
 - `falda_scenes_*` and `falda_core_read` are read-only here — scenes and core
   are maintained by FALDA's distillation pipeline, not by direct agent edits.
+- If recall results seem off (e.g. missing what you just wrote), call
+  `falda_whoami` to confirm which tenant this connection resolves to.
