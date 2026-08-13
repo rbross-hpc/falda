@@ -189,19 +189,122 @@ If you're running the plugin outside a full opencode project (no
 
 Set `FALDA_CAPTURE=0` to disable capture without removing the plugin.
 
-> **Version tracking (containerized deployments).** If you're installing
-> this plugin via a container image that bakes in a `package.json` for its
-> deps (as the `argo-oc` image in a `docker-setups`-style deployment
-> does), keep the pinned `@opencode-ai/plugin` version in sync with the
-> installed `opencode` version, and remember that a running container's
-> `~/.config/opencode/{bun.lock,node_modules}` won't pick up a bump on
-> their own if they live on a persistent volume — see that deployment
-> repo's README ("What's built-in vs. what you still configure") for the
-> full explanation and the fix. This matters here specifically because the
-> plugin factory is `await`ed by opencode during startup: it must never
-> block on a call back into the opencode server before returning its
-> hooks (see the "Lazy resolution" note in `plugin/falda-capture.ts`) or
-> the agent hangs on startup with no error logged.
+> **Containerized deployments:** see §4b below for the entrypoint-based
+> auto-install pattern, dependency version tracking, and startup-deadlock
+> hazard notes that apply when the plugin is installed via a container image.
+
+## 4b. Automated install via a container entrypoint (optional)
+
+For "one FALDA instance behind many containerized opencode agents" setups,
+it's cleaner to have the container entrypoint wire up FALDA automatically
+at each start rather than copying the plugin manually per project.
+`integrations/opencode/entrypoint.sh.example` is a ready-to-adapt reference
+implementation. The pattern has two steps:
+
+1. **Copy the capture plugin** from a mounted FALDA checkout into
+   `~/.config/opencode/plugins/` on every container start (so the plugin
+   always tracks whatever checkout is mounted — no image rebuild needed to
+   pick up plugin changes).
+
+2. **Write a global fallback `mcp.falda` config** from
+   `FALDA_MCP_URL`/`FALDA_MCP_TOKEN`/`FALDA_TENANT` into
+   `~/.config/opencode/opencode.json`, **only if one doesn't already
+   exist**. This is a fallback default only — a project's own
+   `opencode.json` (with that project's own `X-Falda-Tenant`) overrides
+   it, because opencode merges global + project config.
+
+Both steps are best-effort and silently skip if their inputs are absent.
+
+### Minimal Dockerfile wiring
+
+```dockerfile
+# Install opencode globally
+RUN npm install -g opencode-ai
+
+# Bake in the plugin's npm deps so opencode's bun install can resolve them
+# at startup (see opencode-deps.package.json.example for the contents and
+# version-tracking note)
+COPY opencode-deps.package.json /home/node/.config/opencode/package.json
+
+# Install and register the entrypoint
+COPY entrypoint.sh /usr/local/bin/falda-entrypoint
+RUN chmod +x /usr/local/bin/falda-entrypoint
+
+ENTRYPOINT ["falda-entrypoint"]
+CMD ["bash"]
+```
+
+At runtime, bind-mount the FALDA checkout and set `FALDA_PLUGIN_SRC` to
+its `integrations/opencode/plugin/falda-capture.ts` path inside the
+container, or set `FALDA_PLUGIN_SRC` in the environment if your mount path
+differs from the default in `entrypoint.sh.example`.
+
+### Per-project opencode.json must be the full mcp.falda block
+
+> **opencode does not deep-merge `mcp.<name>.headers`.** A per-project
+> `opencode.json` that sets only `X-Falda-Tenant` (hoping to inherit `url`
+> and `Authorization` from the global config) will silently keep the global
+> config's tenant instead — recall and capture would then diverge with no
+> error. Always include the complete block in each project's config:
+>
+> ```jsonc
+> "mcp": {
+>   "falda": {
+>     "type": "remote",
+>     "url": "http://falda:8079/mcp",
+>     "enabled": true,
+>     "headers": {
+>       "Authorization": "Bearer <token>",
+>       "X-Falda-Tenant": "<this-project's-tenant>"
+>     }
+>   }
+> }
+> ```
+>
+> Verified with `opencode debug config --pure` (scalar keys like `enabled`
+> do override; nested `headers` objects do not merge).
+
+To avoid copying the raw bearer token into every project config, see the
+`{file:...}` token de-duplication option commented out in
+`entrypoint.sh.example`.
+
+### Startup-deadlock hazard
+
+> **The capture plugin factory must never block during opencode startup.**
+> opencode `await`s every plugin's factory function before finishing
+> bootstrap. If the factory calls back into the opencode server (e.g.
+> `client.config.get(...)`) before returning its hooks, the server can't
+> answer while it's still blocked loading plugins — circular wait, silent
+> hang, no error logged. This was the original bug fixed in
+> `plugin/falda-capture.ts` (see the "Lazy resolution" doc comment). Any
+> future edits to the plugin factory must not re-introduce an `await` of
+> server calls at the top level.
+
+### Dependency version tracking and persistent-volume caveats
+
+The plugin's npm deps (`@opencode-ai/plugin`, `@modelcontextprotocol/sdk`)
+are declared in a `package.json` baked into the image (see
+`opencode-deps.package.json.example`); opencode runs `bun install` at
+startup to install them into `~/.config/opencode/node_modules/`.
+
+**Keep `@opencode-ai/plugin` in sync with the installed opencode version.**
+The plugin SDK and the opencode runtime are versioned together; a large
+mismatch can surface subtle API differences.
+
+**If `~/.config/opencode/` lives on a persistent volume** (common in
+long-lived named-volume setups so sessions/config survive container
+restarts), the `bun.lock`/`node_modules` cached there from the previous
+start won't automatically pick up a version bump in the image's
+`package.json`. After bumping the version, clear the stale lock on each
+agent's home volume before restarting:
+
+```bash
+docker compose exec <agent> \
+  bash -lc 'rm -rf ~/.config/opencode/{bun.lock,node_modules}'
+```
+
+Then restart the container so opencode re-runs `bun install` against the
+updated `package.json`.
 
 ## 5. Shared pools across projects/agents
 
