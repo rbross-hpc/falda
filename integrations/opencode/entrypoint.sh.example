@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+#
+# Example container entrypoint for an opencode agent with FALDA memory.
+#
+# Copy and adapt this file as your image's ENTRYPOINT. It wires up FALDA
+# memory for opencode at container start, then hands off to the container's
+# real command ("$@"):
+#
+#   1. Auto-capture plugin: copy the FALDA capture plugin from a mounted
+#      FALDA checkout into ~/.config/opencode/plugins/ so opencode picks it
+#      up at startup (https://opencode.ai/docs/plugins/ "local files").
+#      Copied fresh on every container start, so the plugin always tracks
+#      whatever FALDA checkout is currently mounted — no image rebuild needed
+#      to pick up plugin changes. Set FALDA_CAPTURE=0 to skip this step.
+#
+#   2. Global mcp.falda config: if no global opencode.json exists yet and
+#      FALDA_MCP_URL / FALDA_MCP_TOKEN / FALDA_TENANT are all set, write one
+#      registering the FALDA MCP server (recall + write tools) under
+#      FALDA_TENANT. This is a *fallback default* only — a project's own
+#      opencode.json (with that project's own X-Falda-Tenant) overrides it,
+#      because opencode merges global + project config (see
+#      https://opencode.ai/docs/config "Locations"). Tenants should be set
+#      per PROJECT, not per container — add an opencode.json to each project
+#      under your workspaces mount that you want isolated FALDA memory for
+#      (see integrations/opencode/README.md "Per-project opencode config").
+#
+#      IMPORTANT — per-project opencode.json must carry the *full* mcp.falda
+#      block (url, Authorization, X-Falda-Tenant, enabled). opencode does not
+#      deep-merge mcp.<name>.headers: a project file that sets only
+#      X-Falda-Tenant will silently inherit the global config's tenant
+#      instead. See integrations/opencode/README.md "Automated install" for
+#      the merge-behavior caveat and the token de-duplication option.
+#
+# Both steps are best-effort: they silently skip if their inputs are absent,
+# so this entrypoint still works with no FALDA deployment at all.
+#
+# Env:
+#   FALDA_CAPTURE      "0" disables capture plugin install (default: enabled)
+#   FALDA_PLUGIN_SRC   path to falda-capture.ts inside the container
+#                      (default below — set to wherever your FALDA checkout
+#                      is mounted; this is deployment-specific)
+#   FALDA_MCP_URL      e.g. http://falda:8079/mcp  (service name on the
+#                      Compose network, or host:port for other setups)
+#   FALDA_MCP_TOKEN    bearer token the agents use to authenticate
+#   FALDA_TENANT       X-Falda-Tenant for the *global fallback* config only;
+#                      real per-project tenants belong in each project's own
+#                      opencode.json, which overrides this default
+#
+# See integrations/opencode/README.md "Automated install via a container
+# entrypoint" for the full pattern, Dockerfile snippet, and hazard notes
+# (startup-deadlock, dependency version tracking, persistent-volume caveats).
+set -euo pipefail
+
+OC_CONFIG_DIR="${HOME}/.config/opencode"
+PLUGIN_DIR="${OC_CONFIG_DIR}/plugins"
+GLOBAL_CONFIG="${OC_CONFIG_DIR}/opencode.json"
+
+# Default plugin source: adjust to wherever your FALDA checkout is mounted.
+# Common pattern: bind-mount the FALDA repo into /opt/falda or alongside
+# your workspaces, then set FALDA_PLUGIN_SRC accordingly (or override via env).
+PLUGIN_SRC="${FALDA_PLUGIN_SRC:-/opt/falda/integrations/opencode/plugin/falda-capture.ts}"
+
+# ---- 1. capture plugin -----------------------------------------------------
+if [ "${FALDA_CAPTURE:-1}" != "0" ] && [ -f "${PLUGIN_SRC}" ]; then
+  mkdir -p "${PLUGIN_DIR}"
+  cp -f "${PLUGIN_SRC}" "${PLUGIN_DIR}/falda-capture.ts"
+  echo "falda-entrypoint: installed capture plugin from ${PLUGIN_SRC}"
+elif [ "${FALDA_CAPTURE:-1}" != "0" ]; then
+  echo "falda-entrypoint: capture plugin source not found at ${PLUGIN_SRC} — skipping" >&2
+fi
+
+# ---- 2. global mcp.falda config --------------------------------------------
+if [ ! -f "${GLOBAL_CONFIG}" ] && \
+   [ -n "${FALDA_MCP_URL:-}" ] && \
+   [ -n "${FALDA_MCP_TOKEN:-}" ] && \
+   [ -n "${FALDA_TENANT:-}" ]; then
+  mkdir -p "${OC_CONFIG_DIR}"
+  cat > "${GLOBAL_CONFIG}" <<EOF
+{
+  "\$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "falda": {
+      "type": "remote",
+      "url": "${FALDA_MCP_URL}",
+      "enabled": true,
+      "headers": {
+        "Authorization": "Bearer ${FALDA_MCP_TOKEN}",
+        "X-Falda-Tenant": "${FALDA_TENANT}"
+      }
+    }
+  }
+}
+EOF
+  echo "falda-entrypoint: wrote global ${GLOBAL_CONFIG} (mcp.falda, tenant=${FALDA_TENANT})"
+elif [ ! -f "${GLOBAL_CONFIG}" ] && [ "${FALDA_CAPTURE:-1}" != "0" ]; then
+  echo "falda-entrypoint: skipping global mcp.falda config — one or more of FALDA_MCP_URL/FALDA_MCP_TOKEN/FALDA_TENANT is unset (recall tools and auto-capture will fall back to a project's own opencode.json, if any, or stay disabled)" >&2
+fi
+
+# ---- optional: token de-duplication via {file:...} substitution ------------
+# Instead of embedding the raw bearer token in every per-project opencode.json,
+# you can write it once to a file and reference it as:
+#   "Authorization": "Bearer {file:~/.config/opencode/falda-token}"
+# opencode substitutes {file:...} values at config-load time.
+#
+# CAVEAT: verify that your opencode version substitutes {file:...} when
+# embedded mid-string (not only as an entire value) before relying on this.
+# If mid-string substitution isn't supported, store the full "Bearer <token>"
+# line in the file and reference it as the entire Authorization value:
+#   "Authorization": "{file:~/.config/opencode/falda-token}"
+#
+# To enable, uncomment these lines and update the per-project opencode.json
+# recipe in your docs to use the {file:...} form:
+#
+# if [ -n "${FALDA_MCP_TOKEN:-}" ]; then
+#   printf '%s' "${FALDA_MCP_TOKEN}" > "${OC_CONFIG_DIR}/falda-token"
+#   chmod 600 "${OC_CONFIG_DIR}/falda-token"
+# fi
+
+exec "$@"
