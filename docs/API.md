@@ -3,10 +3,33 @@
 All routes are `POST` with a JSON body and JSON response, except `/healthz` (`GET`).
 Gateway default port: `8077` (`FALDA_PORT`).
 
-This gateway trusts the `tenant`/`pool` fields it's given — appropriate for
-trusted loopback/tailnet callers (see `docs/POOLS.md`). For deployments where
-many agents share one FALDA over an untrusted network (e.g. containerized
-opencode agents), use the authenticated MCP server instead — see `docs/MCP.md`.
+## Authentication
+
+Every route below requires `Authorization: Bearer <token>` **except**
+`GET /healthz`, which is intentionally unauthenticated (used for liveness
+checks). Auth uses the same token-file/principal model as the MCP server
+(`docs/MCP.md`) — see that doc's "Auth model" section for the full token
+file shape and rationale; the short version:
+
+| Header | Meaning |
+|---|---|
+| `Authorization: Bearer <token>` | Identifies a **principal**. Unknown/missing token → `401`. |
+| `X-Falda-Tenant: <tenant>` | **Selects** which tenant this request addresses. Missing, or outside the principal's `tenants` allow-list → `403`. There is no default tenant. |
+
+The `tenant` field in request bodies below is **not used for addressing** —
+tenant selection is header-only. `pool` (where shown) is still a body field,
+checked against the principal's `pools` allow-list (`self`/omitted is always
+allowed).
+
+Pool-admin routes (`/pools/*`) are cross-tenant management operations and
+require a fully-trusted principal (`tenants: ["*"]`) regardless of
+`X-Falda-Tenant`; any other principal gets `403`.
+
+The gateway refuses to boot if `FALDA_TOKENS` doesn't point at a valid,
+non-empty token file (fail-fast — see `docs/POOLS.md` "Environment").
+Auth is defense-in-depth on top of whatever network exposure you choose
+(e.g. binding to localhost); it does not itself change where the gateway
+listens.
 
 ## Tier T0 — Stream
 

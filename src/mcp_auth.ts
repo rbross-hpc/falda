@@ -1,11 +1,10 @@
 /**
- * FALDA MCP auth — bearer-token principals with an allowed-tenant set.
+ * FALDA auth — bearer-token principals with an allowed-tenant set.
  *
- * Unlike the FALDA gateway (which trusts a `tenant` field straight from the
- * request body — fine on a trusted loopback/tailnet, see docs/POOLS.md), the
- * MCP server is meant to be reachable from many containerized agents over a
- * shared network. Design, matching proxy/falda_access_proxy.py's clamp
- * pattern but extended for one container spanning multiple projects:
+ * Shared by both the MCP server (src/mcp.ts) and the JSON gateway
+ * (src/gateway.ts) — one auth story for both front doors onto the pool
+ * layer. Design, matching proxy/falda_access_proxy.py's clamp pattern but
+ * extended for one container spanning multiple projects:
  *
  *   - A bearer token identifies a PRINCIPAL (e.g. one opencode container/host).
  *   - Each principal has an explicit `tenants` allow-list (or ["*"] for a
@@ -76,6 +75,54 @@ export class TokenStore {
     if (principal.pools.includes(pool)) return pool;
     throw new AuthError(403, `token is not authorized for pool ${JSON.stringify(pool)}`);
   }
+}
+
+/**
+ * Pure check for whether a token file at `path` is usable: exists, parses as
+ * JSON, and declares at least one token. A missing/malformed/empty token file
+ * is a silent lockout trap — the server boots fine but TokenStore.load()'s
+ * tolerant per-request fallback (`{ tokens: {} }`) means every request 401s
+ * forever with no indication why. This makes that condition explicit and
+ * testable without touching process.exit.
+ */
+export function validateTokenFile(path: string): { ok: true; count: number } | { ok: false; reason: string } {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch (e: any) {
+    return { ok: false, reason: `cannot read ${JSON.stringify(path)}: ${e?.code ?? e?.message ?? e}` };
+  }
+  let parsed: any;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (e: any) {
+    return { ok: false, reason: `${JSON.stringify(path)} is not valid JSON: ${e?.message ?? e}` };
+  }
+  const count = Object.keys(parsed?.tokens ?? {}).length;
+  if (count === 0) return { ok: false, reason: `${JSON.stringify(path)} declares no tokens (empty "tokens" map)` };
+  return { ok: true, count };
+}
+
+/**
+ * Boot-time assertion: FATAL + exit(1) if the token file is missing,
+ * malformed, or empty. Mirrors boot.ts's enforceEmbeddingLock — fail loud and
+ * immediately rather than silently serving a server that can never
+ * authenticate anyone. Does not replace TokenStore's tolerant per-request
+ * hot-read (rotating tokens still needs no restart); this only catches the
+ * "nobody can ever get in" case at startup.
+ */
+export function requireTokenFile(path: string, label = "FALDA"): void {
+  const result = validateTokenFile(path);
+  if (!result.ok) {
+    console.error(
+      `FATAL: ${label} token file problem — ${result.reason}. ` +
+        `Every request would be rejected with 401. Create the file with at least one ` +
+        `{"tokens": {"<bearer-token>": {"tenants": [...], "pools": [...]}}} entry, or point ` +
+        `FALDA_MCP_TOKENS/FALDA_TOKENS at a valid file.`,
+    );
+    process.exit(1);
+  }
+  console.log(`${label} token file OK: ${result.count} token(s) loaded from ${path}`);
 }
 
 /** Extract "Bearer <token>" from an Authorization header value. */

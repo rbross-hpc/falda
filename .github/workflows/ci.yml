@@ -33,6 +33,12 @@ jobs:
       - name: Smoke test (13 tier checks)
         run: npm run smoke
 
+      - name: Gateway auth test
+        run: npm run test:gateway
+
+      - name: Token-file fail-fast guard test
+        run: npm run test:mcp-auth
+
   origin-clean:
     name: origin-clean guard
     runs-on: ubuntu-latest

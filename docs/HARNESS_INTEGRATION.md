@@ -21,11 +21,19 @@ Everything below is built on three primitives:
 |--------------------|---------------------------------------------|------------------|
 | HTTP gateway       | `POST` JSON to `:8077` (`/stream/*`, `/atoms/*`, `/scenes/*`, `/core/*`, `/pools/*`) | `docs/API.md`, `docs/POOLS.md` |
 | CLI                | `bin/falda` — same operations from a shell | `README.md` |
-| Multi-tenant addr  | every op takes optional `{tenant, pool}`; no pool ⇒ the tenant's private `self` store | `docs/POOLS.md` |
+| Multi-tenant addr  | tenant is selected via the `X-Falda-Tenant` header (not a body field); optional body `pool` ⇒ a shared pool instead of the tenant's private `self` store | `docs/POOLS.md` |
 
 Pick a stable **tenant id per agent** (e.g. one per agent identity). Two agents
 sharing memory do it via an opt-in named **pool** (`docs/POOLS.md`), never by
 sharing a tenant.
+
+> **Auth (all examples below):** the gateway requires
+> `Authorization: Bearer <token>` + `X-Falda-Tenant: <tenant>` on every route
+> except `GET /healthz` — see `docs/API.md` "Authentication". The `curl`/env
+> snippets in this guide predate that requirement and, where they show a bare
+> `POST` or a body `{tenant: ...}`, still need a bearer token added and the
+> tenant moved to the header to work against a current gateway.
+> `falda_distiller.py` already sends both (`FALDA_TOKEN` env var).
 
 Health check, harness-independent:
 

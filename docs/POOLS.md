@@ -21,7 +21,7 @@ Every data operation is addressed by a **(tenant, pool)** pair.
 
 | field    | meaning                                   | default            |
 |----------|-------------------------------------------|--------------------|
-| `tenant` | agent identity (`kukla`, `ollie`, …)      | `FALDA_DEFAULT_TENANT` (`default`) |
+| `tenant` | agent identity (`kukla`, `ollie`, …), selected via `X-Falda-Tenant` header (see Authentication below) | none — required, no default |
 | `pool`   | namespace within reach                    | `self` (private)   |
 
 - **No `pool`** → the tenant's own private store (`self`). Pure single-store parity.
@@ -37,6 +37,20 @@ Every data operation is addressed by a **(tenant, pool)** pair.
   (`not_a_member`). Membership is allow-list, not deny-list.
 - Per-member access modes: `none` (default), `read`, `readwrite`. A `read`
   member writing is denied (`read_only`).
+
+## Authentication
+
+Every gateway route (except `GET /healthz`) requires `Authorization: Bearer
+<token>` and `X-Falda-Tenant: <tenant>` — see `docs/API.md` "Authentication"
+and `docs/MCP.md` "Auth model" for the full model (shared `TokenStore`
+principal/allow-list, same token-file shape as the MCP server). Tenant
+selection is **header-only**; a request body `tenant` field, if present, is
+ignored. Pool-admin routes (`/pools/*`) additionally require a fully-trusted
+(`tenants: ["*"]`) principal.
+
+The gateway fails fast at boot (`FATAL` + exit 1) if `FALDA_TOKENS` doesn't
+point at a valid, non-empty token file — a missing/empty file would otherwise
+boot successfully but reject every request with `401`, with no obvious cause.
 
 ## Strict-clean isolation is PHYSICAL, not predicate-based
 
@@ -112,24 +126,25 @@ pool. Read routes require `read` or `readwrite`.
 
 | var | meaning | default |
 |-----|---------|---------|
-| `FALDA_ROOT`           | pool root dir        | `./falda-data` |
-| `FALDA_DEFAULT_TENANT` | tenant when unset    | `default` |
+| `FALDA_ROOT`   | pool root dir                                          | `./falda-data` |
+| `FALDA_TOKENS` | path to the gateway's bearer-token file (required — boot fails if missing/empty, see Authentication above) | `./falda_gateway_tokens.json` |
 | `FALDA_PORT` / `FALDA_DIM` / `FALDA_EMBED*` | as before | — |
 
 ## Migration from single-store
 
 The old `FALDA_DB` / `FALDA_BLOBS` single-store layout is superseded by
 `FALDA_ROOT`. To migrate an existing deployment's data into the new layout,
-move the old store under the default tenant's self slot:
+move the old store under whatever tenant name your token file will select
+(e.g. `default`):
 
 ```
-mkdir -p $FALDA_ROOT/tenants/$FALDA_DEFAULT_TENANT/self
+mkdir -p $FALDA_ROOT/tenants/default/self
 mv old/falda.db        $FALDA_ROOT/tenants/default/self/falda.db
 mv old/falda-blobs     $FALDA_ROOT/tenants/default/self/blobs
 ```
 
-After that, an unaddressed request (`{}`) hits exactly the old data — no behavior
-change for existing single-tenant callers.
+After that, a request with `X-Falda-Tenant: default` (and no `pool`) hits
+exactly the old data.
 
 ## What this contract does NOT yet include (next deltas)
 

@@ -37,6 +37,10 @@ FALDA   = os.environ.get("FALDA_URL", "http://localhost:8078")
 # instance per tenant. Defaults to "default" for backward compatibility.
 FALDA_TENANT = os.environ.get("FALDA_TENANT", "default")
 FALDA_POOL   = os.environ.get("FALDA_POOL", "")  # empty = private "self" store
+# The gateway requires bearer-token auth (see docs/API.md "Authentication").
+# Required: no default. Set to a token in the gateway's FALDA_TOKENS file
+# whose `tenants` allow-list includes FALDA_TENANT (or ["*"]).
+FALDA_TOKEN  = os.environ.get("FALDA_TOKEN", "")
 # Any OpenAI-compatible chat-completions endpoint. Point at your own proxy.
 ARGO_URL  = os.environ.get("LLM_BASE_URL") or os.environ.get("ARGO_BASE_URL", "http://localhost:8000/v1")
 # Required: no default. Set LLM_API_KEY (or ARGO_API_KEY) in the environment.
@@ -75,15 +79,17 @@ def http_json(url, payload, headers=None, timeout=120):
 
 
 def falda(route, payload):
-    # Thread multi-tenant addressing into every gateway call so this distiller
-    # only ever reads/writes the tenant it is scoped to. Without this the
-    # gateway falls back to FALDA_DEFAULT_TENANT and the distiller would
-    # silently operate on the wrong store.
+    # Thread multi-tenant addressing + auth into every gateway call so this
+    # distiller only ever reads/writes the tenant it is scoped to. Tenant
+    # selection is header-only (the gateway ignores a body "tenant" field) —
+    # see docs/API.md "Authentication". Without FALDA_TOKEN/FALDA_TENANT set
+    # correctly, every call 401s/403s rather than silently hitting the wrong
+    # store.
     p = dict(payload)
-    p.setdefault("tenant", FALDA_TENANT)
     if FALDA_POOL:
         p.setdefault("pool", FALDA_POOL)
-    return http_json(f"{FALDA}{route}", p)
+    headers = {"Authorization": f"Bearer {FALDA_TOKEN}", "X-Falda-Tenant": FALDA_TENANT}
+    return http_json(f"{FALDA}{route}", p, headers=headers)
 
 
 def argo_chat(system, user, max_tokens=2000, timeout=180):

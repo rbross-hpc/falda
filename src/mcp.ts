@@ -4,10 +4,11 @@
  * for many agents sharing one FALDA deployment.
  *
  * Why this exists alongside the JSON gateway (src/gateway.ts):
- *   The gateway trusts a `tenant` field straight from the request body — fine
- *   on a trusted loopback/tailnet (see docs/POOLS.md), but this server is
- *   meant to be reached by many containerized opencode agents over a shared
- *   network, so it authenticates every request.
+ *   Both servers share the same TokenStore/Principal auth model
+ *   (src/mcp_auth.ts) and authenticate every request. This server speaks the
+ *   MCP protocol for MCP clients (opencode and others); the gateway is a
+ *   small JSON/HTTP surface for direct programmatic callers and also exposes
+ *   pool-admin routes this server intentionally omits.
  *
  * Auth model (see src/mcp_auth.ts for the full rationale):
  *   - `Authorization: Bearer <token>` identifies a PRINCIPAL (e.g. one
@@ -37,7 +38,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { z } from "zod";
 import { PoolManager, PoolError } from "./pools.js";
 import { selectEmbedder, enforceEmbeddingLock } from "./boot.js";
-import { TokenStore, AuthError, parseBearer, type Principal } from "./mcp_auth.js";
+import { TokenStore, AuthError, parseBearer, requireTokenFile, type Principal } from "./mcp_auth.js";
 
 interface RequestCtx { tenant: string; principal: Principal; }
 
@@ -281,6 +282,7 @@ if (IS_MAIN) {
   const TOKENS_PATH = process.env.FALDA_MCP_TOKENS ?? "./falda_mcp_tokens.json";
 
   enforceEmbeddingLock(ROOT, DIM, "FALDA MCP");
+  requireTokenFile(TOKENS_PATH, "FALDA MCP");
   const pools = new PoolManager({ root: ROOT, embed: selectEmbedder(DIM, "FALDA MCP"), dim: DIM });
   const tokenStore = new TokenStore(TOKENS_PATH);
 

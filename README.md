@@ -63,11 +63,15 @@ const hits = await memory.searchAtoms("what temperature is the cryostat?", 3);
 ### As a service
 
 ```bash
+cp falda_gateway_tokens.example.json falda_gateway_tokens.json   # fill in real tokens
 npm run gateway     # JSON HTTP API on :8077
-curl localhost:8077/healthz
+curl localhost:8077/healthz   # unauthenticated
+curl -X POST localhost:8077/atoms/search \
+  -H "Authorization: Bearer <token>" -H "X-Falda-Tenant: <tenant>" \
+  -d '{"query":"..."}'
 ```
 
-See [`docs/API.md`](docs/API.md) for the full route table.
+See [`docs/API.md`](docs/API.md) for the full route table and auth model.
 
 ### As an MCP server (opencode and other MCP clients)
 
@@ -107,6 +111,7 @@ restart-safe checkpoint in `~/.falda/distiller_state.json`.
 ```bash
 export LLM_BASE_URL=http://localhost:8000/v1   # any OpenAI-compatible chat endpoint
 export LLM_API_KEY=...                          # required, no default
+export FALDA_TOKEN=...                          # required, no default — gateway bearer token
 export DISTILLER_MODEL=gpt-4o-mini
 python3 falda_distiller.py --once             # one backfill pass
 python3 falda_distiller.py                    # continuous loop
@@ -116,6 +121,7 @@ python3 falda_distiller.py                    # continuous loop
 |------------------|--------------------|------------------------------------|
 | `LLM_BASE_URL`   | `localhost:8000/v1`| chat-completions endpoint          |
 | `LLM_API_KEY`    | _(required)_       | bearer token for the chat endpoint |
+| `FALDA_TOKEN`    | _(required)_       | gateway bearer token (must be authorized for `FALDA_TENANT`) |
 | `DISTILLER_MODEL`| `gpt-4o-mini`      | extraction/synthesis model id      |
 | `L1_EVERY_N`     | `10`               | new turns before an atom pass      |
 | `L2_INTERVAL_S`  | `3600`             | scene synthesis cadence            |
@@ -137,6 +143,7 @@ locally (Ollama, vLLM, llama.cpp) or against a self-hosted lab server.
 | `FALDA_DB`              | `./falda.db`                 | SQLite file                            |
 | `FALDA_BLOBS`           | `./falda-blobs`              | scene + core blob directory            |
 | `FALDA_PORT`            | `8077`                         | gateway port                           |
+| `FALDA_TOKENS`          | `./falda_gateway_tokens.json`  | gateway bearer-token file (required — see `docs/API.md`) |
 
 Recommended open embedding models: `nomic-embed-text` (768), `BAAI/bge-base-en-v1.5`
 (768), `nomic-ai/nomic-embed-text-v1.5` (768). Set `FALDA_DIM` to match.
