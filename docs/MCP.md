@@ -109,6 +109,13 @@ allow-list; omit for the tenant's private `self` store).
 | `falda_core_read` | T3 Core | read | Read the persona/project core document |
 | `falda_scenes_ls` | T2 Scenes | read | List episodic scene summaries |
 | `falda_scenes_read` | T2 Scenes | read | Read a scene summary by path |
+| `falda_whoami` | — | read | Return the tenant this connection resolves to |
+
+`falda_whoami` takes no arguments (not even `pool`) and discloses **only**
+the resolved tenant — never the bearer token, and never the principal's
+full `tenants`/`pools` allow-lists. Use it to confirm which tenant a given
+connection actually addresses (e.g. after changing a project's
+`opencode.json`), not to enumerate what a token can reach.
 
 **T2 Scenes and T3 Core are intentionally read-only over MCP.** Those tiers
 are maintained by the distillation pipeline (`falda_distiller.py` /
