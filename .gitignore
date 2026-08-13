@@ -23,3 +23,6 @@ proxy/proxy.log
 
 # FALDA MCP server secrets (never commit)
 falda_mcp_tokens.json
+
+# FALDA gateway secrets (never commit)
+falda_gateway_tokens.json

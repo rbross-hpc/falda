@@ -30,6 +30,8 @@
     "smoke": "tsx test/smoke.ts",
     "test:pools": "tsx test/pools.test.ts",
     "test:mcp": "tsx test/mcp.test.ts",
+    "test:gateway": "tsx test/gateway.test.ts",
+    "test:mcp-auth": "tsx test/mcp_auth.test.ts",
     "gateway": "tsx src/gateway.ts",
     "mcp": "tsx src/mcp.ts",
     "example": "tsx examples/basic.ts",

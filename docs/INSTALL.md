@@ -57,12 +57,16 @@ The installer:
 ## Using the CLI
 
 ```bash
+cp falda_gateway_tokens.example.json falda_gateway_tokens.json  # fill in real tokens; required
 falda serve            # start the HTTP gateway (default :8077)
-falda health           # curl /healthz
+falda health           # curl /healthz (unauthenticated)
 falda smoke            # re-run the offline smoke test
 falda build            # recompile to dist/
 falda version
 ```
+
+The gateway requires a bearer-token file (`FALDA_TOKENS`) and refuses to boot
+without one — see `docs/API.md` "Authentication".
 
 ## Using it as a library
 
@@ -83,6 +87,7 @@ const hits = await mem.recall("kukla", "what should I remember?");
 | Variable | Default | Meaning |
 |---|---|---|
 | `FALDA_PORT` | `8077` | Gateway listen port |
+| `FALDA_TOKENS` | `./falda_gateway_tokens.json` | Bearer-token file (required — see `docs/API.md`) |
 | `FALDA_DB` | `./falda.db` | SQLite path (`:memory:` for ephemeral) |
 | `FALDA_EMBED_BASE_URL` | _(unset)_ | OpenAI-compatible `/v1/embeddings` base URL |
 | `FALDA_EMBED_API_KEY` | _(unset)_ | API key for the embedder, if required |

@@ -5,16 +5,20 @@ server exposing FALDA's recall + write tools to any MCP client (opencode and
 others) over a network — for deployments where **one FALDA instance serves
 many agents**, potentially each working across several projects.
 
-For the JSON/HTTP gateway (a different, unauthenticated surface meant for
-trusted loopback/tailnet callers), see `docs/API.md`.
+For the JSON/HTTP gateway (a lower-level surface with the same bearer-token
+auth model, typically run on a trusted loopback/tailnet), see `docs/API.md`.
 
 ## Why a separate server from the gateway
 
-The gateway (`src/gateway.ts`) trusts a `tenant` field straight from the
-request body — by design, for trusted single-network deployments (see
-`docs/POOLS.md`). The MCP server is meant to be reachable by many
-containerized agents over a shared network, so **every request is
-authenticated**.
+Both the gateway (`src/gateway.ts`) and this MCP server share the same
+`TokenStore`/`Principal` auth model (`src/mcp_auth.ts`) and both require
+`Authorization: Bearer <token>` + `X-Falda-Tenant` on every request except
+`GET /healthz`. The MCP server exists as a separate process because it speaks
+the MCP protocol (Streamable HTTP, tool schemas) for MCP clients like
+opencode, while the gateway is a small JSON/HTTP surface for direct
+programmatic callers (e.g. the distiller) — same auth story, different
+transport and tool surface (the gateway also exposes pool-admin routes the
+MCP server intentionally omits, see "Tools" below).
 
 ## Run it
 
