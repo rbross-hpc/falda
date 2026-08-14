@@ -34,12 +34,16 @@
  *   FALDA_DIM / FALDA_EMBED*  As in the gateway
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
+import { join as pathJoin } from "node:path";
+import { mkdirSync } from "node:fs";
+import Database from "better-sqlite3";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { PoolManager, PoolError } from "./pools.js";
 import { selectEmbedder, enforceEmbeddingLock } from "./boot.js";
 import { TokenStore, AuthError, parseBearer, requireTokenFile, type Principal } from "./mcp_auth.js";
+import { initQueueSchema, enqueue, getJob } from "./distill/queue.js";
 
 interface RequestCtx { tenant: string; principal: Principal; }
 
@@ -52,7 +56,7 @@ function errorResult(e: unknown) {
   return { content: [{ type: "text" as const, text: message }], isError: true };
 }
 
-export function makeFaldaMcpServer(pools: PoolManager, tokenStore: TokenStore): McpServer {
+export function makeFaldaMcpServer(pools: PoolManager, tokenStore: TokenStore, queueDb?: Database.Database): McpServer {
   const server = new McpServer({ name: "falda", version: "0.1.0" });
   const poolArg = z.string().optional().describe(
     "Named shared pool to address instead of the tenant's private store. Must be one this token is authorized for."
@@ -252,6 +256,43 @@ export function makeFaldaMcpServer(pools: PoolManager, tokenStore: TokenStore): 
     },
   );
 
+  // ── Distillation ─────────────────────────────────────────────────────────────
+
+  server.registerTool(
+    "falda_distill",
+    {
+      description: "Enqueue a distillation job for the addressed store. Returns a job_id for status polling. Asynchronous — does not wait for distillation to complete.",
+      inputSchema: { pool: poolArg },
+    },
+    async ({ pool }, extra) => {
+      try {
+        const ctx = ctxFromExtra(extra);
+        const checkedPool = TokenStore.requirePool(ctx.principal, pool);
+        const storeKey = `${ctx.tenant}:${checkedPool ?? "self"}`;
+        if (!queueDb) return errorResult(new Error("distillation queue not available on this server"));
+        const jobId = enqueue(queueDb, storeKey);
+        return textResult({ job_id: jobId, store_key: storeKey });
+      } catch (e) { return errorResult(e); }
+    },
+  );
+
+  server.registerTool(
+    "falda_distill_status",
+    {
+      description: "Poll the status of a distillation job by job_id (returned by falda_distill).",
+      inputSchema: { job_id: z.string(), pool: poolArg },
+    },
+    async ({ job_id }, extra) => {
+      try {
+        ctxFromExtra(extra); // validates auth
+        if (!queueDb) return errorResult(new Error("distillation queue not available on this server"));
+        const job = getJob(queueDb, job_id);
+        if (!job) return errorResult(new Error(`job not found: ${job_id}`));
+        return textResult(job);
+      } catch (e) { return errorResult(e); }
+    },
+  );
+
   // ── Meta ──────────────────────────────────────────────────────────────────────
 
   server.registerTool(
@@ -276,6 +317,7 @@ export async function handleFaldaMcpRequest(
   tokenStore: TokenStore,
   req: IncomingMessage,
   res: ServerResponse,
+  queueDb?: Database.Database,
 ): Promise<void> {
   try {
     const bearer = parseBearer(req.headers["authorization"]);
@@ -288,7 +330,7 @@ export async function handleFaldaMcpRequest(
     }
     throw e;
   }
-  const server = makeFaldaMcpServer(pools, tokenStore);
+  const server = makeFaldaMcpServer(pools, tokenStore, queueDb);
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => { transport.close(); server.close(); });
   await server.connect(transport);
@@ -307,6 +349,12 @@ if (IS_MAIN) {
   const pools = new PoolManager({ root: ROOT, embed: selectEmbedder(DIM, "FALDA MCP"), dim: DIM });
   const tokenStore = new TokenStore(TOKENS_PATH);
 
+  // MCP server shares the gateway's queue db if it exists.
+  const queueDbPath = pathJoin(ROOT, "distill_queue.db");
+  mkdirSync(ROOT, { recursive: true });
+  const mcpQueueDb = new Database(queueDbPath);
+  initQueueSchema(mcpQueueDb);
+
   createServer((req, res) => {
     if (req.method === "GET" && req.url === "/healthz") {
       res.writeHead(200, { "content-type": "application/json" });
@@ -318,7 +366,7 @@ if (IS_MAIN) {
       res.end(JSON.stringify({ error: "not found" }));
       return;
     }
-    handleFaldaMcpRequest(pools, tokenStore, req, res).catch((e) => {
+    handleFaldaMcpRequest(pools, tokenStore, req, res, mcpQueueDb).catch((e) => {
       console.error("[falda-mcp] fatal:", e);
       if (!res.headersSent) {
         res.writeHead(e instanceof PoolError ? 400 : 500, { "content-type": "application/json" });
