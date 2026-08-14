@@ -113,7 +113,7 @@ async function handleData(pools: PoolManager, principal: Principal, headers: Hea
       return store.upsertAtom(b);
     case "/atoms/query":     return store.queryAtoms(b);
     case "/atoms/search":    return { items: await store.searchAtoms(b.query, b.limit) };
-    case "/atoms/delete":    return { deleted_count: store.deleteAtoms(b.ids ?? []) };
+    case "/atoms/delete":    return { deleted_count: store.hardDeleteAtomsUnsafe(b.ids ?? []) };
     case "/atoms/supersede": return (store.supersedeAtom(b.old_id, b.new_id), { ok: true });
     case "/atoms/merge":     return (store.mergeAtoms(b.loser_ids ?? [], b.winner_id), { ok: true });
     case "/atoms/archive":   return (store.archiveAtom(b.id), { ok: true });
