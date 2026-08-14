@@ -61,3 +61,44 @@ export function passId(storeKey: string, seqStart: number | null, seqEnd: number
   const input = `${storeKey}|${seqStart ?? ""}|${seqEnd}`;
   return "pass-" + createHash("sha256").update(input).digest("hex").slice(0, 16);
 }
+
+// ─── Core state: persist L3 input hash for correct hash-gating ────────────────
+
+/**
+ * Initialize the core_state table (idempotent).
+ * Persists the last input hash used to synthesize core, keyed by store_key.
+ * Without this, distillOnce would compare the input hash (computeCoreHash)
+ * against the output hash (sha256(readCore())) which can never match.
+ */
+export function initCoreStateSchema(db: Database.Database): void {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS core_state (
+      store_key TEXT PRIMARY KEY,
+      input_hash TEXT NOT NULL,
+      generated_at TEXT NOT NULL
+    )
+  `);
+}
+
+export interface CoreState {
+  store_key: string;
+  input_hash: string;
+  generated_at: string;
+}
+
+export function getCoreState(db: Database.Database, storeKey: string): CoreState | null {
+  const row = db.prepare("SELECT * FROM core_state WHERE store_key=?").get(storeKey);
+  return (row ?? null) as CoreState | null;
+}
+
+export function setCoreState(db: Database.Database, storeKey: string, inputHash: string): void {
+  const now = new Date().toISOString();
+  db.prepare(
+    `INSERT INTO core_state(store_key,input_hash,generated_at) VALUES(?,?,?)
+     ON CONFLICT(store_key) DO UPDATE SET input_hash=excluded.input_hash, generated_at=excluded.generated_at`
+  ).run(storeKey, inputHash, now);
+}
+
+export function clearCoreState(db: Database.Database, storeKey: string): void {
+  db.prepare("DELETE FROM core_state WHERE store_key=?").run(storeKey);
+}

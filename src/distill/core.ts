@@ -19,7 +19,10 @@ import {
   extractionPrompt, consolidationPrompt,
   sceneTitlePrompt, sceneSummaryPrompt, coreSynthesisPrompt,
 } from "./prompts.js";
-import { initWatermarkSchema, getWatermark, setWatermark, passId } from "./watermark.js";
+import {
+  initWatermarkSchema, getWatermark, setWatermark, passId,
+  initCoreStateSchema, getCoreState, setCoreState, clearCoreState,
+} from "./watermark.js";
 
 export interface LLMFn {
   (prompt: string): Promise<string>;
@@ -182,6 +185,7 @@ export async function distillOnce(
   const db = (store as any).db as import("better-sqlite3").Database;
 
   initWatermarkSchema(db);
+  initCoreStateSchema(db);
 
   const result: DistillResult = {
     pass_id: "",
@@ -535,21 +539,24 @@ export async function distillOnce(
   }
 
   // ── L3: Synthesize core ──────────────────────────────────────────────────
+  // Hash-gate: compare the *input* hash (what the core synthesis prompt would
+  // consume) against the last input hash we actually used, persisted in
+  // core_state. The old code compared against sha256(readCore()) — the LLM
+  // *output* — which could never match the input hash, so core was always
+  // regenerated on every pass with active scenes. (MODEL.md §8.4)
 
   const newCoreHash = store.computeCoreHash();
-  const currentCore = store.readCore();
-  const currentCoreHash = currentCore
-    ? createHash("sha256").update(currentCore).digest("hex")
-    : null;
+  const coreState = getCoreState(db, storeKey);
 
   // Check if any active scenes exist.
   const sceneCount = (db.prepare("SELECT COUNT(*) c FROM scenes WHERE status='active'").get() as any).c;
   if (sceneCount === 0) {
-    // No active scenes → delete core.
+    // No active scenes → delete core and clear persisted input hash.
     const fp = join((store as any).blobDir, "core.md");
     try { if (existsSync(fp)) unlinkSync(fp); } catch {}
+    clearCoreState(db, storeKey);
   } else {
-    // Re-synthesize only if scene structure changed.
+    // Re-synthesize only if input structure changed since last synthesis.
     const finalScenes = db.prepare(
       "SELECT * FROM scenes WHERE status='active' ORDER BY scene_id"
     ).all() as any[];
@@ -562,16 +569,19 @@ export async function distillOnce(
       return { scene_kind: sc.scene_kind, title: sc.title, atoms };
     });
 
-    const needsRegen = newCoreHash !== currentCoreHash;
+    const needsRegen = newCoreHash !== coreState?.input_hash;
     if (needsRegen) {
       try {
         const newCore = await llm(coreSynthesisPrompt(coreInput));
         store.writeCore(newCore);
+        setCoreState(db, storeKey, newCoreHash);
         result.core_regenerated = true;
         log(`[distill] L3 core synthesized`);
       } catch (e) {
         log(`[distill] L3 core synthesis failed: ${e}`);
       }
+    } else {
+      log(`[distill] L3 core unchanged (input hash matches), skipping`);
     }
   }
 
