@@ -26,6 +26,9 @@
  *
  *   FALDA_PORT          HTTP JSON API port (default 8077)
  *   FALDA_MCP_PORT       MCP port (default 8079)
+ *   FALDA_MCP_TOOLSET    "default" (compact agent API, recommended) or
+ *                        "full" (adds tier-specific storage tools) — see
+ *                        src/mcp/registry.ts.
  *
  * Config (see src/runtime.ts for the full list): FALDA_ROOT, FALDA_DIM,
  * FALDA_EMBED*, FALDA_TOKENS (canonical — one token file for both
@@ -42,6 +45,7 @@ import { handleRequest } from "./gateway.js";
 import { handleFaldaMcpRequest } from "./mcp.js";
 import { startDistiller, type DistillerHandle } from "./distill/worker.js";
 import { buildRuntime, type FaldaRuntime, type RuntimeConfig } from "./runtime.js";
+import type { ToolsetName } from "./mcp/registry.js";
 import type { Server } from "node:http";
 
 export interface ServeOptions {
@@ -49,6 +53,7 @@ export interface ServeOptions {
   mcpPort?: number;
   workerIntervalMs?: number;
   noMcp?: boolean;
+  mcpToolset?: ToolsetName;
   runtimeConfig?: RuntimeConfig;
 }
 
@@ -89,7 +94,7 @@ export function startHttpApi(runtime: FaldaRuntime, port: number): Server {
 }
 
 /** Start the MCP endpoint on its own listener, against the shared runtime. */
-export function startMcp(runtime: FaldaRuntime, port: number): Server {
+export function startMcp(runtime: FaldaRuntime, port: number, toolset?: ToolsetName): Server {
   const server = createServer((req, res) => {
     if (req.method === "GET" && req.url === "/healthz") {
       res.writeHead(200, { "content-type": "application/json" });
@@ -101,7 +106,7 @@ export function startMcp(runtime: FaldaRuntime, port: number): Server {
       res.end(JSON.stringify({ error: "not found" }));
       return;
     }
-    handleFaldaMcpRequest(runtime.pools, runtime.tokenStore, req, res, runtime.queueDb).catch((e) => {
+    handleFaldaMcpRequest(runtime.pools, runtime.tokenStore, req, res, runtime.queueDb, { toolset }).catch((e) => {
       console.error("[falda-mcp] fatal:", e);
       if (!res.headersSent) {
         res.writeHead(e instanceof PoolError ? 400 : 500, { "content-type": "application/json" });
@@ -126,7 +131,7 @@ export function serve(opts: ServeOptions = {}): ServeHandle {
   const runtime = buildRuntime({ label: "FALDA", ...opts.runtimeConfig });
 
   const httpServer = startHttpApi(runtime, httpPort);
-  const mcpServer = opts.noMcp ? null : startMcp(runtime, mcpPort);
+  const mcpServer = opts.noMcp ? null : startMcp(runtime, mcpPort, opts.mcpToolset);
   const distiller = startDistiller(runtime.queueDb, runtime.pools, runtime.llm, workerIntervalMs);
 
   return {

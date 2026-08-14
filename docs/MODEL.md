@@ -670,10 +670,12 @@ replaced, giving a `searchScenes` / `falda_scenes_search` hybrid-recall path
 also be **scoped by kind or by specific episode/topic** — "what happened in
 this session" or "what does this store know about topic X" are now
 answerable directly against T2's structure, not just as a byproduct of
-reading T3. A per-tier search tool per tier (stream/atoms/scenes) is the
-interim recall surface; a *public* unified budget-assembled cross-tier
-context call is deferred (§13) — but see §8.9 for a private, experimental
-version of exactly that assembly, pulled forward into Branch B.
+reading T3. A per-tier search tool per tier (stream/atoms/scenes) remains
+available as an advanced/debug surface (`FALDA_MCP_TOOLSET=full`); the
+default agent-facing recall surface is now the public, unified
+budget-assembled cross-tier `falda_recall` MCP tool (`src/mcp/tools/recall.ts`),
+built directly on the `assembleContext()` machinery described in §8.9 —
+the previously-private/experimental Branch B assembly is what backs it.
 
 ## 7. Recall
 
@@ -949,7 +951,7 @@ regenerates L2/L3 on every underlying change (debounced). FALDA's first
 pass uses **interval + on-demand triggers only**; ramp/idle/final is
 deferred (§13) until a session-lifecycle table exists (§4.3).
 
-### 8.9 Private cross-tier context assembly (evaluation-only, Branch B)
+### 8.9 Cross-tier context assembly (now the public `falda_recall` surface)
 
 The retrieval evaluation set (§7.2, §13) was originally scoped to atom
 ranking alone — but atom ranking cannot answer the question that actually
@@ -962,17 +964,26 @@ atoms, whether core crowds out specifics a scene or atom would have
 supplied better, or whether the same fact is being redundantly served from
 two tiers at once.
 
-Branch B therefore includes a **private, internal** `assembleContext(store,
-query, budget)` function — not a public MCP tool or gateway route (the
-public, budget-assembled cross-tier endpoint stays deferred, §13) — whose
-only consumer is the retrieval evaluation harness. It performs, in one
-call: the pinned-first pass (§7.5), query-ranked atom recall (§7.1–7.2),
+Branch B therefore introduced `assembleContext(store, query, budget)`
+(`src/distill/context.ts`), originally private/evaluation-only, whose only
+consumer was the retrieval evaluation harness. It performs, in one call:
+the pinned-first pass (§7.5), query-ranked atom recall (§7.1–7.2),
 query-ranked scene recall scoped across both kinds (§6.5), and a core
 excerpt, trimmed to the budget in that priority order. The evaluation set
-is extended accordingly: alongside `(query → expected atoms)` labels, it
-gains `(query, budget) → expected assembled context` cases that can surface
-tier redundancy or crowding directly, before any of this is exposed as a
-public API.
+was extended accordingly: alongside `(query → expected atoms)` labels, it
+gained `(query, budget) → expected assembled context` cases that surface
+tier redundancy or crowding directly.
+
+That function is now also the implementation behind the public
+`falda_recall` MCP tool (§ simplify-mcp-surface, `src/mcp/tools/recall.ts`):
+the compact agent-facing default tool set exposes recall/remember/forget/
+distill/whoami instead of per-tier tools, and `falda_recall` is the single
+retrieval entry point built directly on `assembleContext`, extended with
+structured per-hit provenance (`{tier, id, score?}`) and a `truncated` flag
+so a caller can tell tier/identity apart from the rendered text without the
+model needing to choose which tier to query. The per-tier tools
+(`falda_atoms_search`, `falda_scenes_search`, ...) remain available under
+`FALDA_MCP_TOOLSET=full` for diagnostics/admin use — see `docs/MCP.md`.
 
 ## 9. Forgetting vs. erasure
 
@@ -1101,11 +1112,12 @@ Carried forward rather than silently dropped. None of these block Branch A
   item is specifically about relaxing topic's one-per-atom rule.
 - **Erasure** implementation (§9) — the model is specified; the hard-delete
   path is not built.
-- A **public**, budget-assembled **cross-tier context** endpoint (pinned +
-  ranked atoms + relevant scenes in one call, §6.5) — per-tier search tools
-  ship first. A **private, evaluation-only** version of this assembly is no
-  longer deferred: it is implemented in `src/distill/context.ts` specifically to make
-  the retrieval eval set meaningful before any public surface is designed.
+- ~~A **public**, budget-assembled **cross-tier context** endpoint~~ —
+  **no longer deferred.** `assembleContext()` (`src/distill/context.ts`,
+  §8.9) now backs the public `falda_recall` MCP tool
+  (`src/mcp/tools/recall.ts`), the default agent-facing retrieval surface.
+  Per-tier search tools (`falda_atoms_search`, etc.) remain available
+  behind `FALDA_MCP_TOOLSET=full` for diagnostics.
 - **Per-turn** (rather than window-level) provenance attribution (§5.2).
 - T3's **unbounded scene-set token growth** (§8.4) — noted as a scale risk,
   not solved.

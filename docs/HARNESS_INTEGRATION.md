@@ -230,13 +230,19 @@ Full setup recipe (server config, per-project opencode config, auto-capture
 plugin, shared pools): `integrations/opencode/README.md` and `docs/MCP.md`.
 Summary:
 
-- **Tools**: recall (`falda_stream_search`, `falda_atoms_search`, ...) and
-  write for Stream/Atoms only (`falda_stream_add`, `falda_atoms_upsert`).
-  Scenes (T2) and Core (T3) are read-only over MCP — they stay curated by the
-  distillation pipeline, not freehand agent edits.
+- **Tools**: by default the model sees a compact, intention-level surface —
+  `falda_recall`, `falda_remember`, `falda_forget`, `falda_distill`,
+  `falda_distill_status`, `falda_whoami` — not the tier-specific
+  (`falda_stream_search`/`falda_atoms_search`/...) tools. Set
+  `FALDA_MCP_TOOLSET=full` on the FALDA server to also expose those for
+  debugging/admin use. Scenes (T2) and Core (T3) remain read-only over MCP
+  in either toolset — they stay curated by the distillation pipeline, not
+  freehand agent edits. See `docs/MCP.md` "Tools".
 - **Auto-capture**: a small opencode plugin
   (`integrations/opencode/plugin/falda-capture.ts`) subscribes to opencode's
-  message/part events and forwards settled turns to `falda_stream_add`, so
+  message/part events and forwards settled turns to `falda_stream_add`. This
+  is machine ingestion, not a model-chosen action — it stays on the default
+  MCP surface (harness-facing, not meant to be picked interactively) so
   conversation history is captured without relying on the model to call a
   tool every turn.
 - **Auth**: a bearer token identifies a principal (typically one container)
