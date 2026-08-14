@@ -343,6 +343,58 @@ describe("distillOnce", () => {
       assert.notEqual(hash1, hash2);
     } finally { cleanup(s, blobDir); }
   });
+
+  test("episode identity: scene_id is stable even after LLM renames the title", async () => {
+    const { s, blobDir } = makeStore();
+    try {
+      await s.addStream("sess-rename", [{ role: "user", content: "neutrino detector offline" }]);
+
+      const llmPass1 = makeMockLLM([
+        `{"type":"fact","content":"Neutrino detector went offline.","confidence":"high"}`,
+        `{"action":"store","target_ids":[],"rationale":"New fact."}`,
+        // L2 title/summary — LLM gives the episode a real title (not the provisional one).
+        "Detector Incident — Q3",
+        "The neutrino detector experienced an unexpected offline event.",
+        // L3 core
+        "# Core\nDetector incident logged.",
+      ]);
+
+      const r1 = await distillOnce(s, llmPass1, { storeKey: "rename-test:self" });
+      assert.ok(r1.scenes_derived >= 1, "at least one scene derived (episode + optional topic)");
+
+      const db = (s as any).db;
+      const epAfterPass1 = db.prepare(
+        "SELECT * FROM scenes WHERE scene_kind='episode'"
+      ).all() as any[];
+      assert.equal(epAfterPass1.length, 1, "exactly one episode scene");
+      const sceneIdPass1 = epAfterPass1[0].scene_id;
+      const titleAfterPass1 = epAfterPass1[0].title;
+      assert.equal(titleAfterPass1, "Detector Incident — Q3", "LLM title applied");
+
+      // Add a new turn so pass 2 has something to process.
+      await s.addStream("sess-rename", [{ role: "user", content: "detector back online" }]);
+
+      const llmPass2 = makeMockLLM([
+        `{"type":"fact","content":"Detector restored to online.","confidence":"high"}`,
+        `{"action":"store","target_ids":[],"rationale":"New."}`,
+        // L2 title/summary for the same episode — LLM may write a different title again.
+        "Detector Incident Resolved",
+        "Detector went offline and was subsequently restored.",
+        // L3 core
+        "# Core\nDetector restored.",
+      ]);
+
+      const r2 = await distillOnce(s, llmPass2, { storeKey: "rename-test:self" });
+      assert.ok(r2.scenes_derived >= 1, "at least one scene derived on pass 2");
+
+      const epAfterPass2 = db.prepare(
+        "SELECT * FROM scenes WHERE scene_kind='episode'"
+      ).all() as any[];
+      assert.equal(epAfterPass2.length, 1, "still exactly one episode scene — no duplicate");
+      assert.equal(epAfterPass2[0].scene_id, sceneIdPass1, "scene_id is stable across passes");
+      assert.equal(epAfterPass2[0].title, "Detector Incident Resolved", "title updated to new LLM output");
+    } finally { cleanup(s, blobDir); }
+  });
 });
 
 // ─── 4. assembleContext ────────────────────────────────────────────────────────
