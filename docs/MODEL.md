@@ -1,11 +1,19 @@
 # FALDA Data Model — Concepts
 
-Status: **design doc.** Describes the target data model after aligning FALDA's
-memory model with [`shinzui/kioku`](https://github.com/shinzui/kioku)'s concepts
-(see `docs/user/concepts.md`, `docs/user/distillation.md`, `docs/user/recall.md`
-in that repo). Parts of this doc describe the *current* shipped model
-(`src/falda.ts`, `src/pools.ts`); parts describe the *target* model this doc's
-final section plans to implement. Each section says which it is.
+Status: **design doc, v2.** Describes the target data model after aligning
+FALDA's memory model with [`shinzui/kioku`](https://github.com/shinzui/kioku)
+(see that repo's `docs/user/concepts.md`, `docs/user/distillation.md`,
+`docs/user/recall.md`) — and after a design review that deliberately
+**diverges** from kioku in several places where copying its constants or
+conventions would have imported unresolved ambiguities. Every divergence is
+called out explicitly; see §12 for the full crosswalk.
+
+Parts of this doc describe the *current* shipped model (`src/falda.ts`,
+`src/pools.ts`); parts describe the *target* model §14's implementation plan
+builds. Each section says which. A few points are explicitly **not yet
+resolved** — see §13 — because they need empirical work (a retrieval eval
+set) or further design (context assembly, erasure) before they can be
+pinned.
 
 This page is the mental model behind FALDA. Read it once; the rest of the
 codebase and docs assume it.
@@ -17,52 +25,78 @@ FALDA is four strata, each a refinement of the one below:
 ```
  T3  Core     ── one distilled persona/project profile per store
        ▲         "who/what is this, and what's durable about it"
- T2  Scenes   ── readable markdown blocks summarizing a store's atoms
+ T2  Scenes   ── zero-to-many clustered topical summaries over a store's atoms
        ▲
  T1  Atoms    ── concise, durable memory sentences
        ▲
  T0  Stream   ── raw conversation/observation turns — the floor
 ```
 
-| Tier | Name   | What it is                              | Storage (current, `src/falda.ts`) |
-|------|--------|------------------------------------------|-------------------------------------|
-| T0   | Stream | raw conversation/observation turns       | SQLite `stream` table + FTS5 + sqlite-vec |
-| T1   | Atoms  | distilled atomic memories                | SQLite `atoms` table + FTS5 + sqlite-vec |
-| T2   | Scenes | synthesized episode summaries            | markdown blob files                 |
-| T3   | Core   | long-lived persona/project profile       | one markdown blob file (`core.md`)  |
+| Tier | Name   | What it is                                  | Storage (target) |
+|------|--------|-----------------------------------------------|-------------------|
+| T0   | Stream | raw conversation/observation turns             | SQLite `stream` table + FTS5 + sqlite-vec |
+| T1   | Atoms  | distilled atomic memories                      | SQLite `atoms` table + FTS5 + sqlite-vec |
+| T2   | Scenes | clustered topical summaries, each over a subset of a store's atoms | SQLite `scenes` table + FTS5 + sqlite-vec, + best-effort markdown mirror |
+| T3   | Core   | one long-lived persona/project profile per store | one markdown blob file (`core.md`) |
 
 **Tiers are not the same axis as atom `type`** (§3). A tier says *where* a
 memory lives in the durability/synthesis pipeline. `type` is a label on T1
-atoms only (`fact`, `pattern`, …). T0/T2/T3 have no `type` field. This
-distinction is easy to blur — kioku's own naming collides "L1 atom type
-`episodic`" against no such collision (kioku has no `episodic` type); FALDA's
-*current* MCP tool schema does have an `episodic` atom type that reads like a
-tier name and is being retired in favor of kioku's five types (§3) precisely
-to remove this confusion.
+atoms only (`fact`, `pattern`, …). T0/T2/T3 have no `type` field.
 
-## 2. Scope: tenant + pool
+**T2 is a genuine intermediate representation, not "Core, but shorter."**
+An earlier version of this design summarized a whole store's atoms into one
+scene blob per store — which made a scene nothing more than a shorter core,
+with no independent purpose. The target model instead makes each scene a
+**cluster** of topically-related atoms with its own identity, title, and
+summary (§6). T3 then synthesizes across the resulting *set* of scenes. This
+is the single largest structural change from the originally merged version
+of this doc.
+
+## 2. Scope: tenant + pool, and what a pool actually is
 
 FALDA partitions memory by **(tenant, pool)** — see `docs/POOLS.md` for the
-full contract. This is FALDA's equivalent of kioku's "scope."
+full contract. This is FALDA's equivalent of kioku's "scope," but the
+ownership model needs to be stated precisely, because it is easy to
+misdescribe (an earlier version of this doc did).
 
-- **tenant** — agent/project identity, selected per-request via
+- **tenant** — an agent/project identity, selected per-request via
   `X-Falda-Tenant`. Always required, no default.
-- **pool** — `self` (private, default) or a named, explicitly-declared shared
-  pool. Sharing is opt-in; touching an undeclared pool is an error.
+- **pool** — either the reserved private namespace `self`, or the name of an
+  explicitly-declared **shared resource**.
 
-Isolation is **physical**, not predicate-based: each `(tenant, pool)` resolves
-to its own SQLite file + blob directory (`src/pools.ts`). There is no shared
-table with a tenant column a forgotten `WHERE` could leak. A store literally
-cannot open another store's files.
+**A named pool is an independent shared resource, not a namespace scoped
+beneath a tenant.** Pool identity is the pool *name* alone — there is
+exactly one physical store per pool name (`root/pools/<name>/`), and every
+tenant on its member roster reads and writes that same store. `(tenant,
+pool)` is an **access grant**, not a storage address: the tenant supplies
+authorization and an attribution identity (see §5), not a separate physical
+location. This is distinct from `self`, where the pair genuinely *is* the
+physical address (`root/tenants/<tenant>/self/`) because no sharing is
+possible there.
 
-Every tier — stream, atoms, scenes, core — is scoped to one `(tenant, pool)`
-store. Distillation (§6) runs per-store: one store's T0 promotes into that
-same store's T1/T2/T3. There is currently no cross-store ("pool-wide")
-distillation; see `docs/POOLS.md` "Pool-scoped distillation" for that gap.
+Stated this way, the two "physical separation" properties in this doc are
+about two different things and both hold simultaneously:
+
+- **`self` stores are physically isolated per tenant** — no shared table, no
+  predicate-based leak risk (`src/pools.ts`).
+- **A named pool is physically *shared* by design** among its declared
+  members — that is the entire point of declaring one. It is isolated from
+  every *other* tenant and every *other* pool, but not from its own members.
+
+Sharing is opt-in and explicit: a pool exists only after being declared with
+a member roster; touching an undeclared pool is an error, never an
+autovivify. Per-member access is `none | read | readwrite`.
+
+Every tier — stream, atoms, scenes, core — is scoped to one physical store
+(one `self`, or one named pool). Distillation (§8) runs per-store. **This
+plan's initial branches implement distillation only for `self` stores.**
+Distilling a shared pool raises questions this doc intentionally defers
+(§13): whose LLM/embedder credentials run the pool's worker, and how
+provenance (§5) attributes a pool turn to the tenant that contributed it.
 
 ## 3. Memory (T1 Atom)
 
-*(Target model — see §9 Branch A. Fields marked "current" already exist.)*
+*(Target model — see §14 Branch A.)*
 
 An atom is one durable thing an agent has learned.
 
@@ -70,13 +104,15 @@ An atom is one durable thing an agent has learned.
 |---|---|---|
 | `id` | Stable identifier | current |
 | `type` | One of `fact \| pattern \| preference \| constraint \| instruction` | current column, **new enum** |
-| `content` | The memory text itself | current |
-| `background` | Optional free-text supporting context | current |
-| `priority` | Importance signal: `0` = maximum recall boost ("always inject" convention), `100` = default/no boost | **new** |
-| `confidence` | `high`, `medium`, or `low` | **new** |
-| `status` | `active`, `superseded`, `merged`, or `archived` | **new** |
-| `tags` | A set of free-form labels (JSON array) | **new** |
-| `supersedes` | Id of the memory this one replaces, if any | **new** |
+| `content` | The memory text itself. **Immutable** once written (§3.3). | current |
+| `background` | Optional free-text supporting context for humans — not a structured-data sink (§3.5) | current |
+| `priority` | Re-rank boost signal, `0`–`100` (§3.2) | **new** |
+| `confidence` | `high \| medium \| low` — evidential fidelity, not truth (§3.2) | **new** |
+| `pinned` | Boolean. If true, always included in a pinned-first recall pass (§7.5) | **new** |
+| `status` | `active \| superseded \| merged \| archived` | **new** |
+| `tags` | Free-form labels (JSON array); filter-only, does not affect ranking or regeneration (§3.2) | **new** |
+| `supersedes` | Id of the atom this one replaces, if any | **new** |
+| `source_turn_ids` / `source_session_ids` | Denormalized provenance summary — see §5 | **new** |
 | `created_at` / `updated_at` | Timestamps | current |
 
 ### 3.1 Atom types
@@ -87,71 +123,143 @@ An atom is one durable thing an agent has learned.
 - **constraint** — a hard rule ("never touch the `legacy/` directory").
 - **instruction** — a standing directive ("always run the formatter before committing").
 
-This replaces FALDA's current three divergent vocabularies (the shipped MCP
-enum `fact/preference/rule/decision/episodic/instruction`, the Python
-sidecar's `persona/episodic/instruction`, and `src/distiller.ts`'s
-`fact/preference/rule/decision`) with one set, adopted verbatim from kioku.
-`rule → constraint`; `decision` and `episodic` are dropped (an episodic
-memory is a `fact` about something that happened, not a separate type — the
-T2 *Scene* tier is where episodic narrative actually lives). Legacy `persona`
-atoms map to `fact`.
+Adopted verbatim from kioku, replacing FALDA's three prior divergent
+vocabularies (the shipped MCP enum, the Python sidecar's, and
+`src/distiller.ts`'s — see §12 for the mapping). `type` outside this set is
+**rejected**, not silently coerced.
 
-`type` and `confidence` outside the allowed sets are **rejected**, not
-silently coerced to a default — a bad value fails the write loudly rather
-than corrupting the vocabulary.
+### 3.2 Priority, confidence, and pinning
 
-### 3.2 Priority and confidence
+These three fields are easy to conflate. They answer three different
+questions, and this doc pins each one precisely because an earlier version
+left two of them ambiguous enough to be actively misleading.
 
-- **priority**: `0` is a convention meaning "always inject," and the maximum
-  boost; `100` is default/no boost. Values are clamped `0`–`100`.
-- **confidence**: `high | medium | low`. Agent-written atoms (via
-  `falda_atoms_upsert`) default to `medium` when omitted.
+**Priority** answers *"how much should this atom be boosted in ranking,
+relative to other relevant atoms?"* It is a re-rank weight, `0`–`100`,
+clamped. Lower is higher-boost; `0` is the maximum. **Priority `0` is named
+`critical`, not "always inject."** An earlier draft used kioku's "always
+inject" convention for priority `0` and then had to admit, in the same
+breath, that priority only affects re-ranking *after* candidate selection —
+so it never actually guarantees inclusion. That is a real contradiction, not
+a documentation nuance, and copying it would have kept a broken promise in
+the model. `critical` claims exactly what priority `0` delivers: maximum
+boost, nothing more.
 
-Both feed recall re-ranking (§5) — they are not merely metadata.
+Priority is **not extractor-assigned**. The L1 extraction LLM call does not
+set `priority` — an LLM-assigned, per-atom, heavily-weighted ranking signal
+would be a noisy, non-reproducible input feeding the highest-leverage term
+in the recall formula (§7.2), which is precisely the failure mode this
+review is trying to avoid elsewhere. Instead: **priority is caller/policy
+set.** Atoms written directly by an agent or operator (`falda_atoms_upsert`)
+may set it explicitly. Atoms produced by distillation get a **type-derived
+default** (e.g. `constraint`/`instruction` default higher than
+`fact`/`pattern`/`preference`); the exact defaults are a tuning parameter,
+not fixed by this doc.
 
-### 3.3 Lifecycle
+**Pinning** answers a different question: *"must this atom be present in
+every recall result for this store, regardless of the query?"* This is
+what "always inject" was actually reaching for, and it needs its own
+mechanism, not an overloaded priority value. `pinned` is a plain boolean,
+mutable independent of `type`/`priority`. Recall's pinned-first pass (§7.5)
+fetches all active pinned atoms unconditionally, within a reserved budget,
+before running query-dependent ranking on the rest. A standing instruction
+like "never modify production" should be `pinned=true`, not `priority=0`.
+
+**Confidence** answers a third, still-different question, and its meaning
+is the one most likely to be guessed wrong: **confidence is the atom's
+confidence that it accurately and faithfully represents its supporting
+evidence — not a general truth probability, and not a freshness signal.**
+An atom can be `high`-confidence (it faithfully captures what the source
+turns said) and still be stale (the fact changed since); staleness is
+handled entirely by **age** (recency decay, §7.2) and **supersession**
+(§3.3), deliberately kept separate. Concretely:
+
+- During L1 extraction, `confidence` is the model's assessment of
+  summarization fidelity to the turns it was drawn from — a judgment LLMs
+  are reasonably good at — never an epistemic claim about whether the fact
+  is true, which they are not reliable judges of.
+- Confidence is only strictly meaningful when an atom has supporting
+  evidence to be faithful *to* (§5). An atom written with **no** evidence
+  edge (agent-authored via `falda_atoms_upsert`, or imported) has no
+  fidelity to assess. Such atoms default to `medium`: a neutral value, not
+  an assertion of moderate fidelity. They are never auto-verified.
+- On consolidation **merge/update** (§8.2), confidence is **re-assessed**
+  against the union of absorbed evidence, not inherited from either parent
+  — a merge can raise confidence (corroborating evidence) or lower it (the
+  merged claim over-generalizes what any one turn supports).
+
+`confidence` outside `high|medium|low` is rejected, not coerced.
+
+### 3.3 Immutability and lifecycle
+
+**An atom's proposition — its `content` and `type` — is immutable once the
+atom exists.** Metadata (`tags`, `confidence`, `status`, `priority`,
+`pinned`) may be updated in place. Changing the proposition itself always
+means recording a **new, superseding atom**; nothing is ever rewritten to
+say something different than what it originally said.
+
+This closes a real inconsistency in the previously merged version of this
+doc: distillation's "update" action already worked this way (a new atom
+supersedes the old one), but direct writes via `falda_atoms_upsert` used
+the same `id` to silently rewrite content/type in place — a second,
+contradictory notion of atom identity living behind a different API path.
+Two identity models meant provenance and audit history depended on which
+door a caller walked through. There is now one rule, enforced regardless of
+call path: **`falda_atoms_upsert` on an existing id with changed
+`content` or `type` is rejected as an error** ("content is immutable; the
+caller must record a new atom and supersede, rather than being silently
+allowed to mutate a proposition in place"). Metadata-only changes to an
+existing id continue to succeed. Callers using content-hash-derived ids
+(as the distiller does) get this for free: different content naturally
+produces a different id.
 
 A memory starts **active**. From there:
 
-- **superseded** — replaced by a newer memory (the new one records
-  `supersedes`; nothing is edited in place).
-- **merged** — folded into another memory (a winner absorbs one or more
+- **superseded** — replaced by a newer atom (the new one records
+  `supersedes`).
+- **merged** — folded into another atom (a winner absorbs one or more
   losers).
 - **archived** — retired without a replacement.
 
-Superseded, merged, and archived are **terminal**. Only `active` memories are
-returned by recall (§5). `status`, `confidence`, and `tags` can be updated in
-place while a memory is active.
+Superseded, merged, and archived are **terminal**. Only `active` atoms are
+returned by recall (§7.3).
 
-**Forgetting propagates.** Superseding, archiving, or merging a memory — or
-changing its **confidence** — schedules regeneration of that store's T2 scene
-(and, transitively, its T3 core), so forgotten or downgraded content does not
-survive downstream. Changing only a memory's **tags** does not: tags feed
-neither the scene's source hash nor its prompt (§6.3).
+**Forgetting propagates, and it is logical, not erasure — see §9 for the
+distinction.** Superseding, archiving, or merging an atom — or changing its
+**confidence** — dirties every T2 scene that has that atom as a member
+(§6), which transitively dirties T3 core. Changing only **tags** or
+**priority**/**pinned** does not dirty anything downstream: tags are
+filter-only (§3.2) and never feed a scene's content hash or prompt;
+priority/pinned affect ranking only, not what a scene says.
 
-When the last active memory in a store is forgotten, the store's scene(s) and
-core **are deleted**, not regenerated to empty. There is nothing left to
-summarize.
+When a store's last active atom is forgotten, every scene that would be
+left with zero active members is **deleted**, not regenerated empty; if
+that empties the store entirely, core is deleted too. There is nothing left
+to summarize — see §9 for what this does and does not remove from the
+store.
 
 ### 3.4 Idempotency
 
 A duplicate atom write that matches what already happened succeeds as a
-no-op. A conflicting one (same id, different content/type) updates in place
-under FALDA's current `upsertAtom` semantics — FALDA does not adopt kioku's
-full event-sourced conflict model here; the `atoms` table remains the
-authoritative row store (see §9 "Scope calls").
+no-op. Because content/type are immutable (§3.3), "matches what already
+happened" is unambiguous: same id, same content, same type. Anything else
+targeting an existing id is a metadata update or a rejected conflict — there
+is no third case.
 
-### 3.5 Consolidation audit
+### 3.5 `background` is not a structured-data sink
 
-Every distillation decision that creates, supersedes, or merges an atom is
-recorded in a `consolidation_decisions` audit table: the action actually
-applied, its targets, the resulting atom id, and a rationale. The audit key
-is deterministic, so a re-run distillation pass does not duplicate audit
-rows. See §6.2.
+`background` is optional free text for a human or agent to read — it is
+**not** where priority, provenance, or source information belongs. An
+earlier iteration of the distillation sidecar packed
+`priority=…;src=distiller;at=…` into `background`, because no structured
+field existed yet. Now that `priority`, `confidence`, `source_turn_ids`, and
+timestamps are real columns (§3, §5), `background` goes back to being what
+its name says: free-text context, nothing parsed out of it by any code
+path.
 
 ## 4. Evidence (T0 Stream)
 
-*(§4.1 is current; §4.2 is target — see §9 Branch A.)*
+*(§4.1 is current; §4.2 is target — see §14 Branch A.)*
 
 ### 4.1 Current fields
 
@@ -163,171 +271,413 @@ rows. See §6.2.
 | `content` | Turn text |
 | `ts` | Timestamp |
 
-`session_id` is already captured, indexed, and queryable/deletable by session
-(`src/falda.ts`). This is the one piece of kioku's T0 model FALDA already had
-before this design pass.
+`session_id` is already captured, indexed, and queryable/deletable by
+session (`src/falda.ts`).
 
-### 4.2 New fields — deterministic ordering + idempotency
+### 4.2 New fields — deterministic ordering + full idempotency
 
 | Field | Meaning |
 |---|---|
 | `turn_index` | Strictly-increasing index within a session (nullable — legacy callers may omit it) |
 | `turn_id` | Idempotency token for this turn, independent of the row `id` |
 
-Two problems this fixes:
+Two problems this fixes, and **two invariants**, not one, are enforced:
 
-- **Ordering.** Today, stream reads order by `ts` (an ISO timestamp string).
-  Two turns recorded in the same millisecond, or under clock skew, can
-  reorder — which corrupts the transcript a distillation pass reconstructs.
-  `turn_index`, when present, orders `(session_id, turn_index)` instead.
-- **Idempotency.** Today, `/stream/add` blindly inserts; a retried capture
-  (a network hiccup in a capture plugin, a replayed worker call) silently
-  double-counts turns. With `turn_index` supplied:
-  - same `(session_id, turn_index)` + identical content/`turn_id` → **no-op**
-    (returns the existing id);
-  - same `(session_id, turn_index)` + **different** content/`turn_id` →
-    **rejected as a conflict** — a stale or out-of-order turn cannot silently
-    overwrite a committed one.
+- **Ordering.** Stream reads today order by `ts` (an ISO timestamp string);
+  same-millisecond writes or clock skew can reorder turns and corrupt the
+  transcript a distillation pass reconstructs. When `turn_index` is
+  present, ordering is `(session_id, turn_index)` instead, falling back to
+  `ts` when absent.
+- **Idempotency has two invariants, both enforced by a unique index each:**
+  1. `UNIQUE(session_id, turn_index) WHERE turn_index IS NOT NULL` — the
+     same index cannot be recorded twice with different content: a stale or
+     out-of-order retry cannot silently overwrite a committed turn.
+  2. `UNIQUE(session_id, turn_id) WHERE turn_id IS NOT NULL` — the same
+     idempotency token cannot be reused at a *different* index. An earlier
+     version of this doc enforced only the first invariant; kioku enforces
+     both, and dropping the second would let a caller's replay logic
+     silently double-record a turn under a new index while believing its
+     `turn_id` guaranteed idempotency.
 
-A unique index on `(session_id, turn_index)` (partial: `WHERE turn_index IS
-NOT NULL`) enforces this without constraining callers who don't supply an
-index — they keep today's UUID-id, `ts`-ordered behavior exactly.
+Given both indexes: re-adding an identical `(session_id, turn_index,
+turn_id, content)` is a no-op; anything that collides on one unique key
+while disagreeing on the other is a rejected conflict. Callers that omit
+`turn_index`/`turn_id` entirely keep today's UUID-id, `ts`-ordered,
+no-idempotency behavior exactly.
 
 ### 4.3 Explicitly not adopted (this pass)
 
 kioku's T0/Session model additionally has: a session `focus`/topic field, a
 full session lifecycle (`start → running → awaiting → completed/failed`),
-delegation/continuation lineage between sessions, and per-turn tool-summary +
-token-count metadata. None of these land in this pass. `focus` and a session
-lifecycle table are natural companions to the ramp/idle/final distillation
-triggers (§6.4) deferred in §9 — they will land together, if ever. Lineage
-and per-turn token accounting are judged out of scope for FALDA's use case
-(scientific-agent memory, not multi-agent delegation orchestration).
+delegation/continuation lineage between sessions, and per-turn tool-summary
++ token-count metadata. None of these land in this pass — see §13.
 
-## 5. Recall
+## 5. Provenance: the atom → evidence edge
 
-*(Target model — see §9 Branch A. FALDA already has hybrid FTS+vector+RRF;
-the re-ranking, status filter, and character budgets are new.)*
+*(New — target model, see §14 Branch A/B.)* This section did not exist in
+the first version of this doc. T1 atoms carry `type`, `content`,
+`background`, `priority`, `confidence`, `status`, `tags`, and supersession
+— but nothing that says *what evidence supports this specific memory*. The
+`consolidation_decisions` audit table (§8.2) records **why a distillation
+decision was made**; that is not the same fact as **what evidence a memory
+is grounded in**, and the model needs both, kept explicitly distinct.
+
+### 5.1 The edge
+
+A new join table, `atom_evidence(atom_id, turn_id, session_id, added_at)`,
+plus denormalized `source_turn_ids` / `source_session_ids` JSON columns on
+the atom row for cheap single-atom reads. The join table is the canonical
+edge and supports both directions: `evidenceForAtom(atom_id)` and
+`atomsFromTurn(turn_id)` / `atomsFromSession(session_id)`.
+
+### 5.2 Granularity
+
+Extraction (§8.2) runs over a **window** of turns, not one turn at a time,
+so the honest unit of attribution today is *"this atom was distilled from
+this window of turns,"* not a specific sentence within it. The edge records
+window-level attribution now. Per-turn attribution (the extractor stating
+exactly which turn(s) support a given atom) is future work (§13) — it would
+need a structured-output contract from the extractor and is not required
+for the provenance edge to be useful.
+
+### 5.3 Population
+
+- **store** (§8.2): the new atom's evidence = the extraction window's turns.
+- **update / merge** (§8.2): the winning atom's evidence = the **union** of
+  every absorbed atom's prior evidence, plus the current window's turns.
+  Provenance is never dropped across consolidation — an atom's evidence
+  trail survives every supersession in its lineage.
+- **skip**: no evidence recorded (no atom was written).
+
+### 5.4 Deletion policy
+
+`deleteStream` can remove T0 turns that atoms depend on. Deletion does
+**not** cascade to delete or archive the dependent atoms automatically.
+Instead, `deleteStream` **returns the set of atom ids whose evidence was
+affected** by the deletion, so a caller (or a reconciliation pass) can
+choose to re-evaluate them. The memory survives; its provenance is flagged
+stale rather than silently dangling or aggressively cascaded.
+
+### 5.5 Provenance vs. audit — not the same table
+
+- **`atom_evidence`** answers *"what supports this atom existing, with this
+  content?"* — the evidence.
+- **`consolidation_decisions`** (§8.2) answers *"why did a distillation
+  pass take this specific action (store/update/merge/skip)?"* — the
+  decision, its targets, and its rationale.
+
+An atom can have rich evidence and a terse audit rationale, or vice versa.
+Neither substitutes for the other, and a future verification pass — "does
+this atom still faithfully represent its evidence?" (§3.2) — reads
+`atom_evidence`, not `consolidation_decisions`.
+
+## 6. Scenes (T2): clustered intermediate representations
+
+*(New / substantially revised — target model, see §14 Branch A/B.)* This is
+the second-largest structural change from the first version of this doc,
+which modeled T2 as one path-addressed markdown blob per store — in effect
+a shorter, redundant copy of core. The target model makes each scene a
+first-class, independently identified cluster of atoms.
+
+### 6.1 Schema
+
+| Field | Meaning |
+|---|---|
+| `scene_id` | Stable identifier |
+| `title` | Short label naming the cluster's dominant topic |
+| `summary` | Narrative markdown body |
+| `atom_ids` | Denormalized membership (JSON array) |
+| `content_hash` | Hash of member atoms' content + status, for hash-gated regeneration (§8.3) |
+| `created_at` / `updated_at` | Timestamps |
+
+Membership is also recorded in a `scene_atoms(scene_id, atom_id)` join
+table for efficient reverse lookup (`scenesForAtom(atom_id)`), which is what
+makes forgetting-propagation (§3.3) surgical: an atom's lifecycle change
+dirties exactly the scenes that reference it, not every scene in the store.
+
+Storage is SQLite (rows are authoritative), with a **best-effort** rendered
+markdown mirror written to `blobDir/scenes/<scene_id>.md` on every
+regeneration, so a scene remains directly readable as a file. The mirror is
+a convenience cache; if the write fails, distillation still succeeds and
+the row remains the source of truth.
+
+The previous path-addressed scene API
+(`/scenes/{ls,read,write,rm}` keyed by a file `path`) is **replaced**, not
+extended, by an id-addressed entity API — this is a deliberate breaking
+change (§14 Branch A), on the grounds that the T2 surface was read-only for
+agents and lightly used, so a clean break now is cheaper than carrying two
+addressing schemes forward.
+
+### 6.2 Clustering and reconciliation
+
+L2 (§8.3) assigns a store's active atoms to scenes via **embedding
+clustering** over `atoms_vec` (which already exists for recall); an LLM
+call writes only the **title and summary** for each resulting cluster, not
+the membership decision itself. This keeps membership assignment
+deterministic-ish and cheap, and reserves the LLM for what it's good at —
+narrative synthesis — rather than clustering.
+
+**Scene identity across passes is stabilized, not naively recomputed.**
+Re-clustering from scratch on every pass would reassign `scene_id`s
+constantly, defeating the content-hash-skip mechanism (§8.3) and making
+scenes useless as durable, independently-recallable targets (§6.3). Naive
+permanently-fixed identity is just as wrong the other direction — an early
+bad clustering would ossify. The rule is a **reconcile-with-hysteresis**
+step run every pass:
+
+1. Re-cluster the store's current active atoms fresh.
+2. Match each new cluster against existing scenes by membership overlap; a
+   match above a **match threshold** keeps the prior `scene_id`
+   (atoms may have joined or left, but it is judged "the same scene," and
+   only regenerates if `content_hash` changed).
+3. A proposed reorganization of existing scenes (a split, a merge, or a
+   reassignment) only takes effect if it clears a separate, higher **reorg
+   threshold** — enough net membership churn, or a new cluster large/cohesive
+   enough to justify disruption. Below that bar, the prior scene structure
+   wins even if the fresh clustering would have drawn slightly different
+   lines.
+4. A new cluster with no adequate match spawns a new `scene_id`; an existing
+   scene with no matching cluster is retired (§3.3's emptying rule applies
+   if that leaves it with zero members).
+
+Both thresholds are configuration, not fixed constants — see §13 (they
+belong in the same eval-driven tuning pass as the recall weights, §7.2).
+
+### 6.3 Scene recall
+
+Scenes are independently recallable, not just a T3 feeder: each scene's
+`title`+`summary` is embedded (and FTS-indexed) on write, exactly like
+atoms, giving a `searchScenes` / `falda_scenes_search` hybrid-recall path
+(§7.1's fusion applies equally here). A per-tier search tool per tier
+(stream/atoms/scenes) is the interim recall surface; a unified
+budget-assembled cross-tier context call is deferred (§13).
+
+## 7. Recall
+
+*(Target model — see §14 Branch A. FALDA already has hybrid FTS+vector+RRF;
+everything past fusion below is new, and — per design review — explicitly
+**not frozen**; see §7.2's caveat.)*
 
 Recall answers "what does this store know that's relevant to this query?"
-FALDA's recall is **hybrid**:
+for atoms, and (§6.3) for scenes.
+
+### 7.1 Hybrid fusion
 
 - **Lexical** — SQLite FTS5, BM25-ranked.
 - **Dense** — sqlite-vec, cosine distance.
-- **Fusion** — both, combined via **Reciprocal Rank Fusion** (`rrf(rank) = 1
-  / (60 + rank)`; a candidate absent from a channel contributes `0` for it),
-  then **re-ranked** by recency, priority, and confidence, then trimmed to a
-  character budget.
+- **Fusion** — both combined via Reciprocal Rank Fusion,
+  `rrf(rank) = 1 / (60 + rank)` (a candidate absent from a channel
+  contributes `0` for it).
 
-### 5.1 Blended score
+### 7.2 Blended score — parameterized, not frozen
 
 ```
 score =  rrf(ftsRank)
        + rrf(vecRank)
-       + 0.10 · recencyDecay(createdAt)
-       + 0.15 · priorityWeight(priority)
-       + 0.05 · confidenceWeight(confidence)
+       + w_recency  · recencyDecay(createdAt)
+       + w_priority · priorityWeight(priority)
+       + w_confidence · confidenceWeight(confidence)
 ```
 
-- **Recency decay**: exponential, 30-day half-life —
-  `exp(-ln2 · ageDays / 30)`.
-- **Priority weight**: `priority ≤ 0` → `1`. Otherwise
-  `clamp01(1 − priority/100)` — lower numeric priority scores higher.
-- **Confidence weight**: `high → 1.0`, `medium → 0.6`, `low → 0.3`.
+with provisional starting values `w_recency=0.10, w_priority=0.15,
+w_confidence=0.05`, a 30-day recency half-life, `priorityWeight` = `1` at
+`priority≤0` else `clamp01(1 − priority/100)`, and `confidenceWeight` =
+`high→1.0, medium→0.6, low→0.3` — all adopted from kioku as **starting
+points**, not as validated constants.
 
-The two best possible RRF terms total roughly `0.033`, while the three
-metadata terms can contribute up to `0.30` combined — so priority and
-confidence can dominate the final ordering. They do not, however, bypass
-candidate selection: an atom must still surface via the lexical or vector
-channel before priority/confidence can affect its rank. Priority `0`'s
-"always inject" label is a convention for callers, not a guarantee.
+**This is a deliberate, explicit divergence from simply copying kioku.**
+kioku intentionally lets metadata outweigh RRF, and FALDA's formula
+structurally does the same thing here — that part is a faithful adoption.
+But the specific magnitudes were not re-derived: the two best possible RRF
+terms total roughly `0.033`, while the three metadata terms can contribute
+up to `0.30` combined. At those magnitudes, **a barely-relevant
+recent/high-priority atom can outrank a strongly-relevant old/default-
+priority one**, and FALDA's candidate pools are not narrow enough to make
+this a non-issue in practice. Metadata is meant to *break ties and bias
+among relevant candidates*, not to override relevance outright — and at
+these specific constants, it can.
 
-### 5.2 Status filtering
+**Consequences for this plan:**
 
-Recall only ever returns `status = 'active'` atoms (§3.3). Superseded,
+- `w_recency`, `w_priority`, `w_confidence`, and the recency half-life are
+  **configuration**, not hardcoded, from the first implementation.
+- **These weights must not be treated as final.** Before they are frozen (or
+  even trusted as sane defaults for production use), FALDA needs a small
+  retrieval evaluation set — labeled `(query → expected atoms)` pairs across
+  a few representative store shapes — and a scoring harness to tune against.
+  Guessing at kioku's numbers a second time, even with a config knob
+  attached, is not a substitute for measuring.
+- One structural option worth evaluating (not decided here): **normalizing**
+  the fused RRF score and the metadata terms onto comparable scales (e.g.
+  both min-max'd to `[0,1]`) before combining, so weights become
+  interpretable as "metadata may contribute at most X% of a fully-relevant
+  hit's score" rather than opaque additive magnitudes.
+
+Priority and confidence never bypass candidate selection — an atom must
+still surface via the lexical or vector channel before either term can
+affect its rank (see §7.5 for the one path that *does* bypass ranking:
+pinning).
+
+### 7.3 Status filtering
+
+Recall only ever returns `status = 'active'` atoms/scenes (§3.3). Superseded,
 merged, and archived atoms are excluded, full stop — they remain in the
-table (and in the consolidation audit trail) but are invisible to recall.
+table (and in the evidence/audit trail, §5.5) but are invisible to recall.
 
-### 5.3 Character budgets
+### 7.4 Character budgets
 
-- **Per-atom cap**: 2000 characters. Longer content is truncated to 1997
+- **Per-hit cap**: 2000 characters. Longer content is truncated to 1997
   characters plus a trailing `...`.
-- **Total cap**: 12000 characters across all returned hits. Hits are added
-  in ranked order until the next one would exceed the total; the rest are
-  dropped.
+- **Total cap**: 12000 characters across all returned hits, applied in
+  ranked order after §7.2's scoring, so a high `limit` does not guarantee
+  that many hits if the budget fills first.
 
-A high `limit` therefore does not guarantee that many hits — the character
-budget can cut the list short, always after ranking, so the highest-value
-hits are kept.
+### 7.5 Pinned-first recall
 
-## 6. The distillation pipeline (T0 → T3)
+Recall for a store first fetches every **active, `pinned=true`** atom
+(§3.2) unconditionally, within a reserved slice of the total character
+budget, **before** running query-dependent ranked recall (§7.1–7.2) on the
+remainder. This is the mechanism for reliable standing instructions (e.g.
+"never modify production") — it does not depend on priority, ranking, or
+candidate selection at all. If the number of pinned atoms threatens to
+consume the whole budget, that is a caller-visible signal to prune pinning,
+not a silent truncation the caller can't see.
 
-*(Target model — see §9 Branches A and B. Today, promotion is done by two
-divergent, unauthenticated-with-current-gateway external scripts,
-`falda_distiller.py` and `src/distiller.ts`; both are retired by this plan.)*
+## 8. The distillation pipeline (T0 → T3)
+
+*(Target model — see §14 Branches A and B. Today, promotion is done by two
+divergent external scripts, `falda_distiller.py` and `src/distiller.ts`,
+both hard-deleted by this plan, §14 Branch C.)*
 
 Raw evidence is noisy. Distillation refines it upward, one tier at a time,
-per `(tenant, pool)` store.
+per store (§2).
 
-### 6.1 L0 — the evidence floor
+### 8.1 L0 — the evidence floor
 
-T0 stream turns (§4) are the raw material. A distillation pass reads new
-turns since a per-store watermark; if none, the pass is skipped before any
-LLM call.
+T0 stream turns (§4) are the raw material. A pass reads new turns since a
+per-store watermark (§8.5); if none, the pass is skipped before any LLM
+call.
 
-### 6.2 L1 — extract, then consolidate
-
-A pass over a store's new evidence has two stages:
+### 8.2 L1 — extract, then consolidate
 
 **1. Extract.** An LLM call reads a window of new turns and proposes
-candidate atoms: `{type, content, priority, confidence}` (§3). An `type` or
-`confidence` outside the allowed set fails the extraction rather than being
+candidate atoms: `{type, content, confidence}` (§3) — **not** `priority`,
+which is policy/type-derived, never extractor-assigned (§3.2). A `type` or
+`confidence` outside its allowed set fails the extraction rather than being
 coerced — a retryable failure, not silent corruption.
 
-**2. Consolidate.** For each candidate atom, a second pass looks at existing
-active atoms in the same store (candidates found via recall, §5) and decides
-one action:
+**2. Consolidate.** For each candidate atom, a second pass finds existing
+active atoms in the same store as merge/update candidates via recall (§7),
+with a **fixed candidate limit** (kioku uses 8; FALDA's default is the
+same, configurable) and a **per-pass cost ceiling** on total candidate
+comparisons / LLM decisions, so one large extraction window cannot trigger
+unbounded consolidation cost. A narrower candidate window risks missing a
+real duplicate (storing a near-dupe); a broader one costs more per pass —
+this tradeoff is exactly the kind of thing the retrieval eval set (§7.2)
+should inform, not a one-time guess.
+
+The consolidation decision, per candidate atom:
 
 | Action | Effect |
 |---|---|
-| **store** | The atom is new → record it. |
-| **update** | An existing atom should be refreshed → a *new* atom is recorded that supersedes the old one; nothing is edited in place. |
-| **merge** | Several existing atoms collapse into one → the same mechanism, every target merged into the winner. |
-| **skip** | Redundant, transient, or low-value → drop it. |
+| **store** | The atom is new → record it, with evidence = this window (§5.3). |
+| **update** | An existing atom should be refreshed → a *new* atom is recorded that supersedes the old one (§3.3); evidence = union of the old atom's evidence + this window (§5.3); confidence is re-assessed, not inherited (§3.2). |
+| **merge** | Several existing atoms collapse into one → same mechanism as update, every target merged into the winner, evidence unioned across all absorbed atoms. |
+| **skip** | Redundant, transient, or low-value → drop it; no evidence recorded. |
 
-The pass records what it **applied**, not what was requested: a merge naming
-targets that no longer exist degrades to a store; one whose only target is
-its own prior copy degrades to a skip. Every decision is written to the
-`consolidation_decisions` audit table (§3.5) with a deterministic key, so a
-re-fired pass does not duplicate rows.
+The pass records what it **applied**, not what was requested: a merge
+naming targets that no longer exist degrades to a store; one whose only
+target is its own prior copy degrades to a skip. Every applied action is
+recorded in `consolidation_decisions` (§5.5) with a deterministic key
+derived from the pass id (§8.5), so a re-fired pass does not duplicate
+audit rows.
 
-### 6.3 L2 — scenes
+### 8.3 L2 — scenes
 
-A store's active atoms are folded into a single markdown **scene**: a title
-naming the dominant topic, plus a short narrative body. Regeneration is
-**content-hashed** — the pass hashes the store's active atoms; if unchanged
-since the last regeneration, the LLM call is skipped entirely.
+Per §6.2: active atoms are clustered, clusters reconciled against existing
+scenes with hysteresis, and each **changed** cluster gets an LLM-written
+title+summary. Regeneration is **hash-gated end-to-end**: a scene's
+`content_hash` (over its member atoms' content + status) gates both the
+LLM summary call *and* the scene's own re-embedding (§6.3) — an unchanged
+scene costs nothing on a given pass, not even an embedding call. This
+extends the same discipline kioku applies to L2/L3 regeneration to the new
+scene-embedding path this design adds.
 
-### 6.4 L3 — core
+### 8.4 L3 — core
 
-A store's scene(s) are distilled into the **core** document: the durable
-profile of what this tenant/pool is — stable preferences, constraints,
-project facts, patterns. Grounded only in scene text; not invented. Also
-content-hashed and skipped when unchanged.
+A store's scene summaries — **all of them** — are distilled into the core
+document: the durable profile of what this tenant/pool store is. Grounded
+only in scene text, not invented. Also content-hashed (over the store's
+scene set) and skipped when unchanged.
 
-FALDA keeps the name **Core** for this tier (kioku calls the equivalent tier
-"Persona"). `falda_core_read`/`falda_core_write` and the `core.md` blob are
-unchanged by this alignment — only the *mechanics* producing core content
-change. See §9 "FALDA ↔ kioku crosswalk."
+**Known scale risk, accepted for now:** synthesizing across *all* scenes
+means the core-synthesis prompt grows unboundedly as a store accumulates
+scenes. This is not bounded in the initial implementation; it is noted here
+as a scale risk (cross-reference `docs/SCALE.md`) rather than solved. Future
+options include ranking/selecting a token-bounded subset of scenes
+(recency/size-weighted) or an intermediate rollup tier — neither is adopted
+now.
 
-### 6.5 Forgetting and emptying
+FALDA keeps the name **Core** for this tier (kioku's equivalent is
+"Persona"); see §12.
 
-Per §3.3: a lifecycle change to an atom (supersede/archive/merge/confidence)
-schedules scene regeneration; every scene regeneration schedules core
-regeneration. When a store's last active atom is forgotten, its scene and
-core are **deleted**, not regenerated empty.
+### 8.5 Execution semantics: pass ids, transactions, retries
 
-### 6.6 Triggers
+This section did not exist in the first version of this doc, which
+described the queue's retry/backoff/dead-lettering shape without stating
+what is atomic or when the watermark moves — leaving genuine ambiguity
+about what happens if, say, extraction succeeds, three atoms are
+consolidated, and scene generation then fails and the job retries.
+
+The rule: **execution is at-least-once; every step must be idempotent under
+replay.**
+
+- Each distillation input window gets a **stable, deterministic pass id**
+  (derived from `(store, watermark_start, watermark_end)` or a hash of the
+  window's turn ids). Audit keys (§8.2) and any pass-scoped dedup derive
+  from it, so a replayed pass cannot duplicate work.
+- **L1 is one atomic unit.** The atom mutations for a pass — every
+  store/supersede/merge, their evidence edges (§5.3), their
+  `consolidation_decisions` rows, **and the watermark advance** — commit in
+  a single SQLite transaction. Either all of it lands, or none of it does.
+  A crash before commit simply re-runs the identical window on the next
+  attempt (the watermark hasn't moved); content-hash-derived atom ids make
+  that re-run a no-op wherever an atom was already durably written by some
+  other path. A crash *after* commit cannot leave atoms written but the
+  watermark stale, because they are the same transaction — the scenario of
+  "atoms committed, watermark not advanced" cannot occur.
+- **L2 and L3 are independently retryable**, deliberately outside L1's
+  transaction, because they are **pure functions of the current active-atom
+  set / scene set** (their hash-gating, §6.2/§8.3/§8.4, is exactly what
+  makes this safe). If scene generation fails after L1 has committed, L1 is
+  not rolled back and does not re-run; the next attempt (retry or the next
+  regularly enqueued pass) recomputes scenes from the now-current atom
+  state, and hash-gating means it costs nothing extra if nothing relevant
+  changed in between.
+- Retry/backoff/dead-lettering (unchanged from the original design): 30s
+  doubling to a 900s cap, an 8-attempt ceiling, after which the job becomes
+  a visible `dead` row instead of retrying indefinitely.
+
+### 8.6 Concurrency with live writes
+
+The in-gateway worker (§8.7) distills a store while agents may concurrently
+write new turns/atoms to that same store. The pass window is defined by
+**`turn_index`/watermark boundaries** (§4.2), never by wall-clock time, so
+a turn's position relative to a pass is unambiguous. A turn arriving with an
+index at or below an already-committed watermark is a **T0 conflict**
+(§4.2) — the same idempotency/ordering guarantee that protects against
+duplicate writes also protects the distillation window from being redefined
+out from under a running pass.
+
+### 8.7 Forgetting and emptying (pipeline view)
+
+Per §3.3/§6.1: a lifecycle change to an atom dirties every scene that has
+it as a member; a scene's regeneration (including its deletion) dirties
+core. When a store's last active atom is forgotten, every now-empty scene
+is deleted, and if that empties the store, core is deleted too — see §9 for
+what "deleted" does and does not mean.
+
+### 8.8 Triggers
 
 Distillation runs off a **per-store job queue**, never inline on a write.
 Multiple surfaces can enqueue a job for a store:
@@ -340,153 +690,251 @@ Multiple surfaces can enqueue a job for a store:
 A single **in-gateway background worker** drains the queue and calls the
 distill core directly against the resolved store (`PoolManager`) — no
 self-HTTP call, no bearer token to itself. The MCP server only *enqueues*;
-it never runs extraction/consolidation/scene/core writes in-process. This
-preserves the existing rule that T2/T3 are curated by distillation, not by
-freehand agent tool calls (`docs/MCP.md`).
+it never runs extraction/consolidation/scene/core writes in-process,
+preserving the rule that T2/T3 are curated by distillation, not by freehand
+agent tool calls.
+
+`falda_distill` is **asynchronous**: it returns a job id, not a completion
+result. A companion tool, `falda_distill_status`, allows polling. There is
+no synchronous "distill now, then read the fresh core" guarantee — an agent
+that needs freshly-distilled context must poll or accept eventual
+consistency.
 
 kioku additionally fires L1 on session **ramp/idle/final** events and
 regenerates L2/L3 on every underlying change (debounced). FALDA's first
-pass uses interval + on-demand triggers only; ramp/idle/final is deferred
-until a session-lifecycle table exists (§4.3, §9).
+pass uses **interval + on-demand triggers only**; ramp/idle/final is
+deferred (§13) until a session-lifecycle table exists (§4.3).
 
-## 7. Auth and addressing (unchanged by this doc)
+## 9. Forgetting vs. erasure
+
+*(New — specified now, only the first half implemented initially; see §14
+Branch A/B and §13.)* "Forgetting propagates" (§3.3, §8.7) is correct as a
+statement about **recall**, but it is not the same claim as **data
+deletion**, and the model needs to say so explicitly rather than let the
+word "forget" carry an implicit privacy guarantee it doesn't (yet) keep.
+
+- **Logical forgetting** (what this plan implements): an atom's `status`
+  moves to `superseded | merged | archived`. It is excluded from recall
+  (§7.3) and its scenes/core regenerate without it (§8.7). Its row, its
+  `atom_evidence` edges, its `consolidation_decisions` history, its FTS/
+  vector index entries, and the T0 turns that produced it are all
+  **retained**. "Forgotten" here means *"the agent will not recall this
+  unprompted,"* not *"this data no longer exists anywhere in the store."*
+
+- **Evidence deletion / privacy erasure** (specified, **not** built in this
+  plan's initial branches): a hard-delete operation that removes an atom's
+  row, its `atom_evidence` edges, its vector and FTS index entries, and
+  optionally the T0 turns that solely supported it — with the
+  `consolidation_decisions` row tombstoned/redacted rather than left
+  pointing at data that no longer exists. This is a privileged,
+  **deliberately audited** operation: it is the one path allowed to break
+  the immutability/provenance guarantees this doc otherwise holds firm
+  everywhere else (§3.3, §5.5), and doing so must itself leave a record
+  that an erasure happened, even though the erased content does not.
+
+Anything calling itself "forget," "delete," or "remove" in the current
+implementation is logical forgetting only, until an erasure path exists and
+is explicitly invoked as such.
+
+## 10. Auth and addressing (unchanged by this doc)
 
 Every tier operation, at every tier, is addressed by `(tenant, pool)` and
 gated by the shared bearer-token `TokenStore`/`Principal` model
 (`src/mcp_auth.ts`) — see `docs/API.md` and `docs/MCP.md` "Authentication."
-This doc does not change auth; it is listed here only so the model diagram
-in §8 is complete.
+This doc does not change auth; it is listed here only so the diagram in
+§11 is complete.
 
-## 8. How the pieces fit
+## 11. How the pieces fit
 
 ```
    host / agent runtime
       │  records turns / atoms directly
       ▼
-  Falda (src/falda.ts)  ──►  SQLite (stream, atoms) + FTS5 + sqlite-vec
-      │                              │
-      │                    hybrid recall (FTS + vector + RRF + re-rank)
-      ▼                              │
-  gateway (:8078) / MCP (:8079)  ◄───┘  same PoolManager, same auth, two surfaces
+  Falda (src/falda.ts)  ──►  SQLite: stream, atoms, scenes  (+ FTS5 + sqlite-vec, all three tiers)
+      │                              │        │
+      │                    hybrid recall (FTS + vector + RRF + re-rank + pinned-first)
+      ▼                              │        │
+  gateway (:8078) / MCP (:8079)  ◄───┴────────┘  same PoolManager, same auth, two surfaces
       │
       │  enqueue                              enqueue
       ▼                                       ▼
   distill job queue (per-store)  ◄── POST /distill, falda_distill, timer, CLI
       │
       ▼
-  gateway-internal worker: L0 turns ──► L1 extract+consolidate ──► atom events
-        │  lifecycle change (supersede/archive/merge/confidence) schedules…
+  gateway-internal worker: L0 turns ──► L1 extract+consolidate ──► atom events (+ evidence edges)
+        │  lifecycle change (supersede/archive/merge/confidence) dirties scenes referencing the atom
         ▼
-  L2 regenerate (or delete) scene
-        │  every scene regeneration schedules…
+  L2 re-cluster (hysteresis) ──► regenerate (or delete) changed scenes  ──► scene embeddings
+        │  every scene regeneration/deletion dirties core
         ▼
   L3 regenerate (or delete) core
 ```
 
-## 9. FALDA ↔ kioku crosswalk
+## 12. FALDA ↔ kioku crosswalk
 
-| Concept | kioku | FALDA |
-|---|---|---|
-| Pyramid | L0 Evidence → L1 Atoms → L2 Scenes → L3 Persona | T0 Stream → T1 Atoms → T2 Scenes → **T3 Core** |
-| Atom types | `fact \| pattern \| preference \| constraint \| instruction` | same (adopted verbatim) |
-| Priority | `0` = always-inject … `100` = default | same |
-| Confidence | `high \| medium \| low` | same |
-| Status lifecycle | active/superseded/merged/archived | same |
-| Partitioning | "scope" (namespace, or namespace:kind:ref) | `(tenant, pool)` |
-| Source of truth | event-sourced aggregate; rows are projections | **row store** (`atoms`/`stream` tables are authoritative) — event-sourcing is **not** adopted |
-| Recall re-rank | RRF + recency + priority + confidence | same formula, adopted verbatim |
-| Distillation trigger | ramp/idle/final session timers + change-hash regen | **interval + on-demand enqueue** (queue + in-gateway worker); ramp/idle/final deferred |
-| Session model | full lifecycle aggregate, focus, lineage | **not adopted** this pass beyond existing `session_id` + new `turn_index`/`turn_id` (§4) |
-| LLM/embeddings | hard-coded Claude Haiku 4.5 | pluggable (`selectEmbedder`, any OpenAI-compatible chat endpoint) |
-| Workspace mirroring | `.kioku/scenes/*.md`, `.kioku/persona/*.md` | FALDA already stores scenes/core as blob files directly (no separate mirror step needed) |
+| Concept | kioku | FALDA | Divergence? |
+|---|---|---|---|
+| Pyramid | L0 Evidence → L1 Atoms → L2 Scenes → L3 Persona | T0 Stream → T1 Atoms → T2 Scenes → **T3 Core** | name only |
+| Atom types | `fact \| pattern \| preference \| constraint \| instruction` | same | none — adopted verbatim |
+| Priority `0` label | "always inject" (acknowledged non-literal) | **`critical`** — same mechanism, honest name; a separate `pinned` boolean covers true always-include | **deliberate divergence** — kioku's own wording is a wart, not copied |
+| Priority assignment | not specified | **caller/policy-set or type-derived default; never extractor-assigned** | FALDA adds this constraint |
+| Confidence | `high \| medium \| low` | same values; **explicitly defined as evidential fidelity, not truth probability**, freshness handled separately by age+supersession | FALDA makes this explicit; kioku doesn't define it against evidence this precisely |
+| Status lifecycle | active/superseded/merged/archived | same | none |
+| Atom identity / mutability | event-sourced; rows are projections | **row store is authoritative**, but **content/type are immutable post-write**; a changed proposition is always a new, superseding atom | FALDA gets kioku's immutability guarantee without adopting full event sourcing |
+| Provenance | ties memories to sessions/turns as L0 evidence | explicit **`atom_evidence`** edge table (window-level), separate from the decision audit trail | FALDA is more explicit here |
+| Scenes | one scene per scope, whole-scope summary | **zero-to-many clustered scenes per store**, each with its own atom membership, independently recallable | **FALDA diverges from and extends kioku** — kioku's one-scene-per-scope was judged too coarse to be a useful intermediate representation |
+| Partitioning | "scope" (namespace, or namespace:kind:ref) | `(tenant, pool)`; **a named pool is an independent shared resource**, not a tenant sub-namespace | clarified, not changed, from the originally merged doc |
+| Recall re-rank | RRF + recency + priority + confidence, constants fixed | same formula shape; **weights are configuration, not frozen constants**, pending a retrieval eval set | **deliberate divergence** — same structure, not the same trust in the specific numbers |
+| Distillation trigger | ramp/idle/final session timers + change-hash regen | **interval + on-demand enqueue** (queue + in-gateway worker); ramp/idle/final deferred | scoped down for now |
+| Distillation execution | not documented at this level of detail here | explicit pass-id + L1-atomic-transaction + hash-gated-L2/L3 retry semantics (§8.5) | FALDA is more explicit here |
+| Forgetting | scene/persona deletion on empty scope | same, but **explicitly named "logical forgetting,"** distinguished from a specified-but-unbuilt erasure path (§9) | FALDA is more explicit here |
+| Session model | full lifecycle aggregate, focus, lineage | **not adopted** this pass beyond `session_id` + `turn_index`/`turn_id` (§4) | deferred, not rejected |
+| LLM/embeddings | hard-coded Claude Haiku 4.5 | pluggable (`selectEmbedder`, any OpenAI-compatible chat endpoint) | intentional |
+| Workspace mirroring | `.kioku/scenes/*.md`, `.kioku/persona/*.md` | scenes/core stored as rows/blobs directly; markdown mirror is best-effort, not the source of truth | minor |
 
 FALDA deliberately does **not** adopt: full event-sourcing, session
 delegation/continuation lineage, per-turn token-count metadata, or renaming
 T3 Core to "Persona." These are judged unnecessary complexity for FALDA's
-scope (scientific-agent memory across many tenants/pools), not oversights.
+scope, not oversights. Where this doc diverges from kioku's specific
+constants or conventions (priority naming, recall weights), the divergence
+is deliberate and stated, not an oversight either — see the table above.
 
----
+## 13. Open questions and explicitly deferred work
 
-## 10. Phased implementation plan
+Carried forward rather than silently dropped. None of these block Branch A
+(§14); several should inform later branches or a dedicated design pass.
+
+**Deferred by design, revisit later:**
+- Cross-tenant **pool distillation** (§2): whose credentials run a shared
+  pool's worker, and how a pool turn's contributing tenant is attributed in
+  provenance. Initial branches distill `self` stores only.
+- Session **`focus`**, a full session-lifecycle table, and **ramp/idle/
+  final** distillation triggers (§4.3, §8.8) — natural companions, land
+  together if ever.
+- **Erasure** implementation (§9) — the model is specified; the hard-delete
+  path is not built.
+- A unified, budget-assembled **cross-tier context** endpoint (pinned +
+  ranked atoms + relevant scenes in one call, §6.3) — per-tier search tools
+  ship first.
+- **Per-turn** (rather than window-level) provenance attribution (§5.2).
+- T3's **unbounded scene-set token growth** (§8.4) — noted as a scale risk,
+  not solved.
+
+**Needs empirical / further design work before freezing:**
+- The recall re-rank weights, recency half-life, and the scene-clustering
+  match/reorg thresholds (§7.2, §6.2) all need a retrieval evaluation set
+  and a tuning pass before they should be trusted as defaults, let alone
+  frozen.
+- Whether RRF and metadata terms should be **normalized** onto comparable
+  scales before combining (§7.2) — an option, not a decision.
+- The consolidation candidate limit and per-pass cost ceiling (§8.2) are
+  provisional; the right values depend on observed atom volumes per store.
+
+## 14. Phased implementation plan
 
 > **Status: temporary.** This section describes three planned implementation
 > branches. It will be split out of this doc (to `docs/future/` or deleted)
-> once all three branches have landed, so this doc stays a timeless
-> description of the model rather than a changelog.
+> once all three have landed, so this doc stays a timeless description of
+> the model rather than a changelog.
 
 Each branch is implemented, tested, linted, and merged (`--no-ff`) to
-`master` individually — these are branches to merge in sequence, not GitHub
-PRs. Decisions locked for all three:
+`master` individually — these are sequenced branches, not GitHub PRs.
+Decisions locked for all three:
 
 - Backfill existing atoms on migration: `status=active, priority=100,
-  confidence=medium`.
-- Distillation triggers: interval + on-demand only (ramp/idle/final
-  deferred, see §6.6).
+  confidence=medium, pinned=false`.
+- Distillation triggers: interval + on-demand only (§8.8; ramp/idle/final
+  deferred, §13).
 - `falda_distiller.py` and `src/distiller.ts`: **hard-deleted** in Branch C,
   no deprecation shim.
-- New MCP tool name: `falda_distill`.
+- New MCP tool names: `falda_distill`, `falda_distill_status`.
 - Agent-written atoms via `falda_atoms_upsert` default `confidence=medium`
-  when omitted.
+  when omitted; changed `content`/`type` on an existing id is a **rejected
+  error**, never an in-place rewrite (§3.3).
+- Cross-tenant pool distillation, session lifecycle/focus, erasure, and
+  unified context assembly are **out of scope** for all three branches
+  (§13).
 
 ### Branch A — schema + recall foundation (`feature/data-model-schema`)
 
-- **T0**: add `turn_index`, `turn_id`; partial unique index on
-  `(session_id, turn_index)`; idempotent/conflict-aware `addStream`
-  (identical re-add = no-op, conflicting re-add = rejected); deterministic
-  `(session_id, turn_index)` ordering when present, falling back to `ts`.
-  New `StreamConflict`-style error → HTTP 409 (gateway) / `isError` (MCP).
-  Thread optional `turn_index`/`turn_id` through `/stream/add` and
-  `falda_stream_add` (both backward-compatible — omitted fields behave
-  exactly as today).
-- **T1**: add `priority`, `confidence`, `status`, `tags`, `supersedes`
-  columns; lifecycle methods (`supersedeAtom`, `mergeAtoms`, `archiveAtom`,
-  `updateConfidence`, `updateTags`); new `consolidation_decisions` audit
-  table.
-- **Recall**: add the blended re-rank (§5.1), `status='active'` filtering
-  (§5.2), character budgets (§5.3).
-- **Migration**: additive `ALTER TABLE` guarded by `PRAGMA table_info`
-  (existing DBs upgrade in place); backfill existing atom rows per the
-  decision above.
-- `falda_atoms_upsert`: new `type` enum (§3.1: `fact/pattern/preference/
-  constraint/instruction`); `confidence` defaults to `medium` when omitted.
-- Tests: turn idempotency + conflict rejection, deterministic ordering,
-  recall re-rank ordering, status filtering, character budgets, migration +
-  backfill. Added to CI.
-- No behavior change for existing callers — every new field is optional or
-  defaulted.
+- **T0**: add `turn_index`, `turn_id`; **both** partial unique indexes
+  (`(session_id, turn_index)` and `(session_id, turn_id)`, §4.2);
+  idempotent/conflict-aware `addStream`; deterministic ordering when
+  present, falling back to `ts`. New conflict error → HTTP 409 (gateway) /
+  `isError` (MCP). `deleteStream` returns affected atom ids (§5.4). Thread
+  optional `turn_index`/`turn_id` through `/stream/add` and
+  `falda_stream_add` (backward-compatible).
+- **T1**: add `priority`, `confidence`, `pinned`, `status`, `tags`,
+  `supersedes`, `source_turn_ids`, `source_session_ids` columns; lifecycle
+  methods (`supersedeAtom`, `mergeAtoms`, `archiveAtom`, `updateConfidence`,
+  `updateTags`, `updatePinned`); `falda_atoms_upsert` rejects
+  content/type changes to an existing id (§3.3); new `type` enum (§3.1).
+- **Provenance**: `atom_evidence` join table + `evidenceForAtom` /
+  `atomsFromTurn` / `atomsFromSession` (§5).
+- **Audit**: `consolidation_decisions` table (§8.2/§5.5), not yet populated
+  (Branch B populates it).
+- **T2 schema**: `scenes` table + `scene_atoms` join, id-addressed store
+  methods (`upsertScene`, `getScene`, `listScenes`, `removeScene`,
+  `scenesForAtom`), replacing the path-addressed API (§6.1). Scene
+  embeddings/FTS tables for `searchScenes` (§6.3). *(Clustering logic
+  itself lands in Branch B; Branch A only lands the storage shape and
+  direct read/write/search primitives.)*
+- **Recall**: parameterized blended re-rank (§7.2, config-driven weights),
+  `status='active'` filtering, character budgets, pinned-first pass (§7.5).
+- **Migration**: additive `ALTER TABLE` guarded by `PRAGMA table_info`;
+  backfill per the decision above.
+- Tests: dual turn-idempotency invariants + conflicts, deterministic
+  ordering, content/type immutability rejection, recall re-rank ordering,
+  pinned-first behavior, status filtering, character budgets, scene CRUD +
+  search, evidence union correctness, migration + backfill. Added to CI.
+- No behavior change for existing callers beyond the documented breaking
+  changes (T2 API replacement; upsert content/type rejection) — both
+  called out as intentional, not incidental.
 
 ### Branch B — distill core + queue + triggers (`feature/distill-core`)
 
 - New `src/distill/` module:
   - `core.ts` — `distillOnce(store, llm, opts)`: two-stage L1 extract +
-    consolidate (§6.2), L2/L3 hash-skip regeneration (§6.3–6.4), empty-store
-    scene/core deletion (§6.5). Pure — no env reads, no HTTP.
-  - `watermark.ts` — per-store watermark (not process-local).
+    consolidate with evidence population (§8.2, §5.3), embedding-clustered
+    L2 with hysteresis reconciliation and hash-gated regen+re-embed (§6.2,
+    §8.3), L3 hash-gated core synthesis (§8.4), empty-scene/store deletion
+    (§8.7). Pure — no env reads, no HTTP.
+  - `watermark.ts` — per-store watermark + deterministic pass-id derivation
+    (§8.5).
   - `prompts.ts` — extraction/consolidation/scene/core prompts; single
     source for `VALID_TYPES`.
   - `queue.ts` — per-store `distill_jobs` table: `enqueue` (coalesces
     duplicate pending jobs), `claimNext`, `complete`, `fail` (backoff 30s→
     900s doubling, 8-attempt ceiling → `dead`).
-  - `cli.ts` — `--once` backfill / daemon mode, replacing both retired
-    runners for standalone/cron use.
+  - `cli.ts` — `--once` backfill / daemon mode.
+- **Transaction boundary** (§8.5): L1's atom/evidence/audit/watermark
+  writes in one transaction; L2/L3 independently retryable via hash-gating.
 - **Gateway** (`src/gateway.ts`): in-process background worker draining the
   queue via `PoolManager.resolve` → `distillOnce`; self-enqueue interval
   timer; new authenticated `POST /distill` route (added to `WRITE_ROUTES`).
-- **MCP** (`src/mcp.ts`): new tool `falda_distill` — enqueues a job for the
-  request's tenant/pool, returns job status. Never distills inline; never
-  writes T2/T3 in-process.
+- **MCP** (`src/mcp.ts`): new tools `falda_distill` (enqueue, §8.8) and
+  `falda_distill_status` (poll). Never distills inline; never writes
+  T2/T3 in-process.
 - Tests: extract→consolidate action correctness (store/update/merge/skip +
-  degradation rules), audit-table idempotency, watermark skip, type/
-  confidence rejection, scene/core hash-skip, queue coalesce/backoff/dead-
-  letter, `/distill` + `falda_distill` enqueue + auth. Added to CI.
+  degradation rules) with evidence union, audit-table idempotency via pass
+  id, watermark-transaction atomicity (simulated failure between stages),
+  type/confidence rejection, scene clustering hysteresis (stable vs.
+  reorg-threshold cases), scene/core hash-gate skip (including embedding
+  skip), queue coalesce/backoff/dead-letter, concurrent-write conflict
+  (§8.6), `/distill` + `falda_distill`/`falda_distill_status` enqueue +
+  auth. Added to CI.
 
 ### Branch C — retire + reconcile + docs (`feature/distill-retire-docs`)
 
 - **Hard-delete** `src/distiller.ts` and `falda_distiller.py`.
 - Update `README.md` (distillation section + env table), `docs/API.md`
-  (document `/distill`), `docs/MCP.md` (document `falda_distill`),
-  `docs/POOLS.md` (revisit "pool-scoped distillation" note), `docs/SCALE.md`
-  (mark relevant phase-4 items delivered), `docs/HARNESS_INTEGRATION.md`
-  (remove Python-distiller setup instructions).
-- Remove the temporary §10 from this doc (move to `docs/future/` or delete,
-  per whichever is still relevant at that point).
+  (document `/distill`, the new T2 entity routes), `docs/MCP.md` (document
+  `falda_distill`, `falda_distill_status`, `falda_scenes_search`),
+  `docs/POOLS.md` (correct the pool-ownership language per §2; revisit
+  "pool-scoped distillation" as the §13 cross-tenant item), `docs/SCALE.md`
+  (mark relevant phase-4 items delivered; add the §8.4 core-token-growth
+  scale risk), `docs/HARNESS_INTEGRATION.md` (remove Python-distiller setup
+  instructions).
+- Remove §14 from this doc (move to `docs/future/` or delete, whichever is
+  still relevant at that point). Consider whether §13's still-open items
+  should migrate to `docs/future/` rather than disappear with §14.
