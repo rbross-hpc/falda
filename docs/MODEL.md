@@ -1,12 +1,17 @@
 # FALDA Data Model — Concepts
 
-Status: **design doc, v2.** Describes the target data model after aligning
+Status: **design doc, v3.** Describes the target data model after aligning
 FALDA's memory model with [`shinzui/kioku`](https://github.com/shinzui/kioku)
 (see that repo's `docs/user/concepts.md`, `docs/user/distillation.md`,
-`docs/user/recall.md`) — and after a design review that deliberately
-**diverges** from kioku in several places where copying its constants or
-conventions would have imported unresolved ambiguities. Every divergence is
-called out explicitly; see §12 for the full crosswalk.
+`docs/user/recall.md`) — and after two rounds of design review. The first
+round **diverges** from kioku in several places where copying its constants
+or conventions would have imported unresolved ambiguities (every such
+divergence is called out explicitly; see §12 for the full crosswalk). The
+second round **reframes T2** from a second summarization step into a
+distinct *organizational* layer, so that each tier does a genuinely
+different kind of work instead of three tiers repeating "summarize the
+level below" at decreasing granularity — see §1 for the reframe and §6 for
+what it means concretely.
 
 Parts of this doc describe the *current* shipped model (`src/falda.ts`,
 `src/pools.ts`); parts describe the *target* model §14's implementation plan
@@ -18,39 +23,74 @@ pinned.
 This page is the mental model behind FALDA. Read it once; the rest of the
 codebase and docs assume it.
 
-## 1. The four tiers
+## 1. The four tiers, on two axes
 
-FALDA is four strata, each a refinement of the one below:
+FALDA is four strata — but they are not four steps of the same operation
+getting progressively shorter. Reading them that way is exactly what made
+an earlier version of this design describe T2 as "a cluster of atoms,
+summarized" and T3 as "a summary of those summaries": two tiers doing the
+same kind of work (summarization) at different granularities, which made T2
+redundant in everything but size. That is a real design flaw, not a framing
+nitpick, and this section states the corrected model.
+
+There are **three distinct transformations** stacked here — evidence into
+knowledge, knowledge into organization, organization into compression — not
+one summarization operation repeated three times:
 
 ```
- T3  Core     ── one distilled persona/project profile per store
-       ▲         "who/what is this, and what's durable about it"
- T2  Scenes   ── zero-to-many clustered topical summaries over a store's atoms
-       ▲
- T1  Atoms    ── concise, durable memory sentences
-       ▲
- T0  Stream   ── raw conversation/observation turns — the floor
+ T3  Core      ── COMPRESSION: one durable persona/project profile per store
+       ▲          "who/what is this, and what's durable about it" — genuinely
+       │          compressed from structure, not "a shorter version of T2"
+       │
+ T2  Scenes    ── ORGANIZATION: kinded groupings of atoms — episodes, topics
+       ▲          "how is what I know structured?" — membership + kind is
+       │          the artifact; a narrative summary is a secondary rendering
+       │
+ T1  Atoms     ── KNOWLEDGE: concise, durable memory sentences
+       ▲          "what do I know?" — a transformation of KIND from T0, not
+       │          a shorter version of it
+       │
+ T0  Stream    ── EVIDENCE: raw conversation/observation turns — the floor
 ```
 
-| Tier | Name   | What it is                                  | Storage (target) |
-|------|--------|-----------------------------------------------|-------------------|
-| T0   | Stream | raw conversation/observation turns             | SQLite `stream` table + FTS5 + sqlite-vec |
-| T1   | Atoms  | distilled atomic memories                      | SQLite `atoms` table + FTS5 + sqlite-vec |
-| T2   | Scenes | clustered topical summaries, each over a subset of a store's atoms | SQLite `scenes` table + FTS5 + sqlite-vec, + best-effort markdown mirror |
-| T3   | Core   | one long-lived persona/project profile per store | one markdown blob file (`core.md`) |
+- **T0 → T1 is a transformation of kind: evidence → knowledge.** A turn is
+  something that was *said*; an atom is something that is *known*. This is
+  already not mere compression — it's typed, discrete, durable propositions
+  extracted from unstructured evidence (§8.1–8.2).
+- **T1 → T2 is organization, not compression.** T2's job is to answer *"how
+  is what I know structured — what episodes, topics, projects, or threads
+  does it belong to?"* Its primary artifact is **membership and kind**
+  (which atoms belong to which named grouping, and what kind of grouping
+  that is), not prose. A human-readable summary of a scene is a useful,
+  optional *rendering* of that structure — it is not the reason the scene
+  exists. See §6.
+- **T2 → T3 is genuine compression.** Core synthesizes across the
+  *structure* T2 provides (kinds, titles, and their member atoms) into one
+  durable, always-loadable profile. Because T3 compresses over organized
+  knowledge rather than over a set of prose summaries, it is not
+  "summarizing a summary" — it is doing the one genuinely compressive step
+  in the whole pipeline. See §8.4.
+
+| Tier | Name   | Kind of work | What it is | Storage (target) |
+|------|--------|--------------|------------|-------------------|
+| T0   | Stream | evidence | raw conversation/observation turns | SQLite `stream` table + FTS5 + sqlite-vec |
+| T1   | Atoms  | knowledge (evidence→kind transformation) | distilled atomic memories | SQLite `atoms` table + FTS5 + sqlite-vec |
+| T2   | Scenes | organization (structure, not summarization) | kinded groupings of atoms (episodes, topics), each with membership + an optional summary | SQLite `scenes` table + FTS5 + sqlite-vec, + best-effort markdown mirror |
+| T3   | Core   | compression | one long-lived persona/project profile per store, synthesized from T2's structure | one markdown blob file (`core.md`) |
 
 **Tiers are not the same axis as atom `type`** (§3). A tier says *where* a
-memory lives in the durability/synthesis pipeline. `type` is a label on T1
-atoms only (`fact`, `pattern`, …). T0/T2/T3 have no `type` field.
+memory lives and *what kind of transformation* produced it. `type` is a
+label on T1 atoms only (`fact`, `pattern`, …). T0/T2/T3 have no `type`
+field.
 
-**T2 is a genuine intermediate representation, not "Core, but shorter."**
-An earlier version of this design summarized a whole store's atoms into one
-scene blob per store — which made a scene nothing more than a shorter core,
-with no independent purpose. The target model instead makes each scene a
-**cluster** of topically-related atoms with its own identity, title, and
-summary (§6). T3 then synthesizes across the resulting *set* of scenes. This
-is the single largest structural change from the originally merged version
-of this doc.
+**Why this reframe, concretely:** under the two-axis model, T2 has a reason
+to exist independent of T3 — an agent can browse or recall *by episode* or
+*by topic* (§6.5, §7) whether or not a core document has ever been
+synthesized, and a scene is useful the moment its membership is known, even
+before an LLM has written a word of summary (§6.1). T3 remains the one tier
+whose entire job is compression, which is also what makes it the tier
+FALDA is comfortable leaving as an accepted scale risk for now (§8.4) —
+there is exactly one compressive step to bound, not two.
 
 ## 2. Scope: tenant + pool, and what a pool actually is
 
@@ -371,35 +411,54 @@ Neither substitutes for the other, and a future verification pass — "does
 this atom still faithfully represent its evidence?" (§3.2) — reads
 `atom_evidence`, not `consolidation_decisions`.
 
-## 6. Scenes (T2): clustered intermediate representations
+## 6. Scenes (T2): the organizational layer
 
 *(New / substantially revised — target model, see §14 Branch A/B.)* This is
-the second-largest structural change from the first version of this doc,
-which modeled T2 as one path-addressed markdown blob per store — in effect
-a shorter, redundant copy of core. The target model makes each scene a
-first-class, independently identified cluster of atoms.
+the largest structural change from the first version of this doc, in two
+stages. The first stage replaced one path-addressed markdown blob per store
+with a set of clustered summaries. That was progress, but it was still a
+*summarization* tier, one step removed from core — "a cluster of atoms,
+summarized" is only a smaller version of "a store, summarized." The second
+stage, reflected here, changes what a scene fundamentally *is*: not a
+summary at a different granularity, but a **named organizational unit** —
+membership plus a kind — of which a narrative summary is one optional,
+secondary rendering. See §1 for why this distinction is the point.
 
 ### 6.1 Schema
 
 | Field | Meaning |
 |---|---|
 | `scene_id` | Stable identifier |
-| `title` | Short label naming the cluster's dominant topic |
-| `summary` | Narrative markdown body |
-| `atom_ids` | Denormalized membership (JSON array) |
+| `scene_kind` | `episode \| topic` (§6.2) — what *kind* of organizational unit this is |
+| `title` | Short label naming the unit |
+| `atom_ids` | Membership (JSON array) — **the primary artifact of a scene** |
+| `summary` | Narrative markdown body — **secondary**, optional, hash-gated (§6.4) |
 | `content_hash` | Hash of member atoms' content + status, for hash-gated regeneration (§8.3) |
 | `created_at` / `updated_at` | Timestamps |
+
+**Membership and kind are primary; the summary is not what makes a scene
+useful or valid.** A scene with members and a `scene_kind` but no summary
+yet is a complete, recallable-by-membership, browsable-by-kind unit — "the
+episode from this session" or "the topic this atom belongs to" is a
+meaningful answer with zero LLM calls involved. The summary is a rendering
+of that structure for humans/agents who want prose, generated lazily and
+only when the structure's content hash changes (§6.4). This inversion —
+structure first, narrative second and optional — is what §1 means by T2
+being organization rather than a second round of summarization.
 
 Membership is also recorded in a `scene_atoms(scene_id, atom_id)` join
 table for efficient reverse lookup (`scenesForAtom(atom_id)`), which is what
 makes forgetting-propagation (§3.3) surgical: an atom's lifecycle change
 dirties exactly the scenes that reference it, not every scene in the store.
+This join table already supports many-to-many membership; the initial
+implementation uses it for a single partition per atom (§6.2), but nothing
+in the schema blocks an atom belonging to more than one scene later (§13).
 
 Storage is SQLite (rows are authoritative), with a **best-effort** rendered
-markdown mirror written to `blobDir/scenes/<scene_id>.md` on every
-regeneration, so a scene remains directly readable as a file. The mirror is
-a convenience cache; if the write fails, distillation still succeeds and
-the row remains the source of truth.
+markdown mirror written to `blobDir/scenes/<scene_id>.md` whenever a summary
+is (re)generated, so a scene remains directly readable as a file. The
+mirror is a convenience cache; if the write fails, distillation still
+succeeds and the row remains the source of truth.
 
 The previous path-addressed scene API
 (`/scenes/{ls,read,write,rm}` keyed by a file `path`) is **replaced**, not
@@ -408,49 +467,96 @@ change (§14 Branch A), on the grounds that the T2 surface was read-only for
 agents and lightly used, so a clean break now is cheaper than carrying two
 addressing schemes forward.
 
-### 6.2 Clustering and reconciliation
+### 6.2 Two kinds, two derivation methods
 
-L2 (§8.3) assigns a store's active atoms to scenes via **embedding
-clustering** over `atoms_vec` (which already exists for recall); an LLM
-call writes only the **title and summary** for each resulting cluster, not
-the membership decision itself. This keeps membership assignment
-deterministic-ish and cheap, and reserves the LLM for what it's good at —
-narrative synthesis — rather than clustering.
+A scene's `scene_kind` says what *kind* of organizational relationship
+groups its members — and, deliberately, different kinds are derived
+differently, because "what groups these atoms" is not one question. The
+initial model supports two kinds, chosen because each has a derivation
+method already available from data this plan already captures:
+
+- **`episode`** — a session-bounded grouping, derived from T0's
+  `session_id` / `turn_index` (§4.2). An episode is, at this stage,
+  *exactly* "the atoms whose evidence traces back to one session" — nothing
+  richer. It deliberately does **not** depend on session `focus` or a
+  session-lifecycle model (§4.3); those remain deferred (§13), and pulling
+  them in now would drag the whole deferred session model forward with
+  them. If a session model lands later, episodes can be enriched then.
+- **`topic`** — a semantic grouping, derived from **embedding clustering**
+  over `atoms_vec` (which already exists for recall). Atoms that are
+  semantically close, independent of when they were recorded, form a topic.
+
+`project` and `thread` are plausible future kinds (goal-bounded and
+cross-session-continuity groupings, respectively) but have no defined
+derivation method yet — a project isn't recoverable from embeddings or
+session boundaries alone — so they are explicitly deferred (§13) rather
+than added as labels with no real derivation behind them.
+
+Each kind is assigned/reconciled independently: episode boundaries come
+from session structure, topic boundaries from clustering, and (for now) an
+atom belongs to at most one scene overall — a **single kinded partition**,
+not simultaneous multi-dimensional membership (that generalization, and its
+interaction with the `scene_atoms` join table's existing many-to-many
+support, is deferred to §13).
+
+An LLM call is used only to write a scene's **title and, lazily, its
+summary** (§6.4) — never to decide membership. Membership derivation is
+mechanical (session structure or clustering), which keeps it
+deterministic-ish and cheap, and reserves the LLM for what it's good at:
+naming and narrating a structure that already exists.
+
+### 6.3 Reconciliation across passes: stable identity with hysteresis
 
 **Scene identity across passes is stabilized, not naively recomputed.**
-Re-clustering from scratch on every pass would reassign `scene_id`s
-constantly, defeating the content-hash-skip mechanism (§8.3) and making
-scenes useless as durable, independently-recallable targets (§6.3). Naive
-permanently-fixed identity is just as wrong the other direction — an early
-bad clustering would ossify. The rule is a **reconcile-with-hysteresis**
-step run every pass:
+Re-deriving membership from scratch on every pass would reassign
+`scene_id`s constantly, defeating hash-gated regeneration (§6.4, §8.3) and
+making scenes useless as durable, independently-recallable targets (§6.5).
+Naive permanently-fixed identity is just as wrong the other direction — an
+early bad grouping would ossify. The rule is a **reconcile-with-hysteresis**
+step run every pass, per kind:
 
-1. Re-cluster the store's current active atoms fresh.
-2. Match each new cluster against existing scenes by membership overlap; a
-   match above a **match threshold** keeps the prior `scene_id`
-   (atoms may have joined or left, but it is judged "the same scene," and
-   only regenerates if `content_hash` changed).
+1. Re-derive the store's current groupings fresh for each kind (session
+   boundaries for episodes, embedding clusters for topics).
+2. Match each new grouping against existing scenes of the *same kind* by
+   membership overlap; a match above a **match threshold** keeps the prior
+   `scene_id` (atoms may have joined or left, but it is judged "the same
+   scene," and only regenerates its summary if `content_hash` changed).
 3. A proposed reorganization of existing scenes (a split, a merge, or a
    reassignment) only takes effect if it clears a separate, higher **reorg
-   threshold** — enough net membership churn, or a new cluster large/cohesive
-   enough to justify disruption. Below that bar, the prior scene structure
-   wins even if the fresh clustering would have drawn slightly different
-   lines.
-4. A new cluster with no adequate match spawns a new `scene_id`; an existing
-   scene with no matching cluster is retired (§3.3's emptying rule applies
-   if that leaves it with zero members).
+   threshold** — enough net membership churn, or a new grouping
+   large/cohesive enough to justify disruption. Below that bar, the prior
+   scene structure wins even if the fresh derivation would have drawn
+   slightly different lines.
+4. A new grouping with no adequate match spawns a new `scene_id`; an
+   existing scene with no matching grouping is retired (§3.3's emptying
+   rule applies if that leaves it with zero members).
 
 Both thresholds are configuration, not fixed constants — see §13 (they
 belong in the same eval-driven tuning pass as the recall weights, §7.2).
 
-### 6.3 Scene recall
+### 6.4 Summary generation is a separate, lazy, hash-gated step
 
-Scenes are independently recallable, not just a T3 feeder: each scene's
-`title`+`summary` is embedded (and FTS-indexed) on write, exactly like
-atoms, giving a `searchScenes` / `falda_scenes_search` hybrid-recall path
-(§7.1's fusion applies equally here). A per-tier search tool per tier
-(stream/atoms/scenes) is the interim recall surface; a unified
-budget-assembled cross-tier context call is deferred (§13).
+Because membership is primary (§6.1), summary generation is decoupled from
+reconciliation: a scene's structure (membership, kind, title) can update on
+every pass, while its `summary` only regenerates when `content_hash`
+changes — and a brand-new scene can exist, be recalled by membership, and
+be browsed by kind before its first summary is ever written, if the worker
+hasn't reached that step yet. This is the same hash-gating discipline as
+L3 (§8.4), now applied as an *optional, separable* pass rather than a
+mandatory part of forming a scene.
+
+### 6.5 Scene recall
+
+Scenes are independently recallable, not just a T3 input: each scene's
+`title` (+ `summary`, once generated) is embedded and FTS-indexed on write,
+giving a `searchScenes` / `falda_scenes_search` hybrid-recall path (§7.1's
+fusion applies equally here). Because scenes are kinded, recall can also be
+**scoped by kind or by specific episode/topic** — "what happened in this
+session" or "what does this store know about topic X" are now answerable
+directly against T2's structure, not just as a byproduct of reading T3. A
+per-tier search tool per tier (stream/atoms/scenes) is the interim recall
+surface; a unified budget-assembled cross-tier context call is deferred
+(§13).
 
 ## 7. Recall
 
@@ -459,7 +565,7 @@ everything past fusion below is new, and — per design review — explicitly
 **not frozen**; see §7.2's caveat.)*
 
 Recall answers "what does this store know that's relevant to this query?"
-for atoms, and (§6.3) for scenes.
+for atoms, and (§6.5) for scenes.
 
 ### 7.1 Hybrid fusion
 
@@ -592,31 +698,40 @@ recorded in `consolidation_decisions` (§5.5) with a deterministic key
 derived from the pass id (§8.5), so a re-fired pass does not duplicate
 audit rows.
 
-### 8.3 L2 — scenes
+### 8.3 L2 — organize into scenes
 
-Per §6.2: active atoms are clustered, clusters reconciled against existing
-scenes with hysteresis, and each **changed** cluster gets an LLM-written
-title+summary. Regeneration is **hash-gated end-to-end**: a scene's
-`content_hash` (over its member atoms' content + status) gates both the
-LLM summary call *and* the scene's own re-embedding (§6.3) — an unchanged
-scene costs nothing on a given pass, not even an embedding call. This
-extends the same discipline kioku applies to L2/L3 regeneration to the new
-scene-embedding path this design adds.
+Per §6.2–§6.3: active atoms are grouped **per kind** — episodes from T0
+session structure, topics from embedding clustering — and each kind's
+groupings are reconciled against existing scenes with hysteresis. This step
+produces or updates scene **structure** (membership, kind, title) for every
+store with new/changed atoms; it does not, by itself, require an LLM call
+for narrative summary. **Summary generation is a separate, lazy step**
+(§6.4): only a scene whose `content_hash` has changed gets an LLM-written
+summary, and only when the worker performs that pass. Regeneration is
+**hash-gated end-to-end**: `content_hash` gates both the LLM summary call
+*and* the scene's own re-embedding (§6.5) — an unchanged scene costs
+nothing on a given pass, not even an embedding call.
 
-### 8.4 L3 — core
+### 8.4 L3 — compress into core
 
-A store's scene summaries — **all of them** — are distilled into the core
-document: the durable profile of what this tenant/pool store is. Grounded
-only in scene text, not invented. Also content-hashed (over the store's
-scene set) and skipped when unchanged.
+A store's scene **structure** — its kinds, titles, and member atoms —
+across **all** of a store's scenes, is synthesized into the core document:
+the durable profile of what this tenant/pool store is. This is the one
+genuinely compressive step in the pipeline (§1): T3 is built from organized
+knowledge (kind + title + the atoms each unit actually contains), not from
+a set of independently-written prose summaries stacked on top of each
+other, which is what made an earlier version of T2/T3 feel redundant.
+Grounded only in scene structure and its member atoms, not invented. Also
+content-hashed (over the store's scene set) and skipped when unchanged.
 
 **Known scale risk, accepted for now:** synthesizing across *all* scenes
-means the core-synthesis prompt grows unboundedly as a store accumulates
-scenes. This is not bounded in the initial implementation; it is noted here
-as a scale risk (cross-reference `docs/SCALE.md`) rather than solved. Future
-options include ranking/selecting a token-bounded subset of scenes
-(recency/size-weighted) or an intermediate rollup tier — neither is adopted
-now.
+means the core-synthesis prompt still grows as a store accumulates scenes,
+even though structured input is more compact per scene than N independent
+prose summaries would have been. This is not bounded in the initial
+implementation; it is noted here as a scale risk (cross-reference
+`docs/SCALE.md`) rather than solved. Future options include ranking/
+selecting a token-bounded subset of scenes (recency/size-weighted) or an
+intermediate rollup tier — neither is adopted now.
 
 FALDA keeps the name **Core** for this tier (kioku's equivalent is
 "Persona"); see §12.
@@ -764,17 +879,17 @@ This doc does not change auth; it is listed here only so the diagram in
   gateway-internal worker: L0 turns ──► L1 extract+consolidate ──► atom events (+ evidence edges)
         │  lifecycle change (supersede/archive/merge/confidence) dirties scenes referencing the atom
         ▼
-  L2 re-cluster (hysteresis) ──► regenerate (or delete) changed scenes  ──► scene embeddings
-        │  every scene regeneration/deletion dirties core
+  L2 organize (per kind, hysteresis): episodes ← session structure, topics ← embedding clusters
+        │  reconcile membership/kind ──► (lazily) regenerate changed summaries ──► scene embeddings
         ▼
-  L3 regenerate (or delete) core
+  L3 compress: synthesize core from scene structure (kind+title+member atoms) ──► (or delete) core
 ```
 
 ## 12. FALDA ↔ kioku crosswalk
 
 | Concept | kioku | FALDA | Divergence? |
 |---|---|---|---|
-| Pyramid | L0 Evidence → L1 Atoms → L2 Scenes → L3 Persona | T0 Stream → T1 Atoms → T2 Scenes → **T3 Core** | name only |
+| Pyramid | L0 Evidence → L1 Atoms → L2 Scenes → L3 Persona, four steps of the same summarization operation at decreasing granularity | T0 Stream → T1 Atoms → T2 Scenes → **T3 Core**, but **two distinct transformations** (knowledge, then organization, then compression — §1), not one operation repeated | **structural divergence** — kioku's `scope.kind` (`intention/repo/group/agent`) is partial prior art for *kinded* grouping, but applied at the scope level, not as T2's defining property |
 | Atom types | `fact \| pattern \| preference \| constraint \| instruction` | same | none — adopted verbatim |
 | Priority `0` label | "always inject" (acknowledged non-literal) | **`critical`** — same mechanism, honest name; a separate `pinned` boolean covers true always-include | **deliberate divergence** — kioku's own wording is a wart, not copied |
 | Priority assignment | not specified | **caller/policy-set or type-derived default; never extractor-assigned** | FALDA adds this constraint |
@@ -782,7 +897,7 @@ This doc does not change auth; it is listed here only so the diagram in
 | Status lifecycle | active/superseded/merged/archived | same | none |
 | Atom identity / mutability | event-sourced; rows are projections | **row store is authoritative**, but **content/type are immutable post-write**; a changed proposition is always a new, superseding atom | FALDA gets kioku's immutability guarantee without adopting full event sourcing |
 | Provenance | ties memories to sessions/turns as L0 evidence | explicit **`atom_evidence`** edge table (window-level), separate from the decision audit trail | FALDA is more explicit here |
-| Scenes | one scene per scope, whole-scope summary | **zero-to-many clustered scenes per store**, each with its own atom membership, independently recallable | **FALDA diverges from and extends kioku** — kioku's one-scene-per-scope was judged too coarse to be a useful intermediate representation |
+| Scenes | one scene per scope, whole-scope summary; scenes are a summarization tier | **zero-to-many kinded organizational units per store** (`episode`, `topic`); membership is the primary artifact, summary is a secondary/lazy rendering; independently recallable and browsable by kind | **FALDA diverges from and extends kioku** — kioku's one-scene-per-scope was judged too coarse *and* the wrong kind of tier: FALDA makes T2 organizational (§1) rather than a second summarization pass, which kioku's design doesn't distinguish |
 | Partitioning | "scope" (namespace, or namespace:kind:ref) | `(tenant, pool)`; **a named pool is an independent shared resource**, not a tenant sub-namespace | clarified, not changed, from the originally merged doc |
 | Recall re-rank | RRF + recency + priority + confidence, constants fixed | same formula shape; **weights are configuration, not frozen constants**, pending a retrieval eval set | **deliberate divergence** — same structure, not the same trust in the specific numbers |
 | Distillation trigger | ramp/idle/final session timers + change-hash regen | **interval + on-demand enqueue** (queue + in-gateway worker); ramp/idle/final deferred | scoped down for now |
@@ -810,19 +925,31 @@ Carried forward rather than silently dropped. None of these block Branch A
   provenance. Initial branches distill `self` stores only.
 - Session **`focus`**, a full session-lifecycle table, and **ramp/idle/
   final** distillation triggers (§4.3, §8.8) — natural companions, land
-  together if ever.
+  together if ever. Note: episodes (§6.2) use only `session_id`/
+  `turn_index` and deliberately do **not** wait on this.
+- **Richer episode semantics** — episodes bounded by more than raw session
+  structure (e.g. incorporating `focus`, sub-session boundaries) once a
+  session model exists (§6.2).
+- **`project` and `thread` scene kinds** (§6.2) — plausible future
+  organizational dimensions with no defined derivation method yet
+  (goal-boundedness and cross-session continuity aren't recoverable from
+  embeddings or session structure alone).
+- **Multi-dimensional scene membership** (§6.1, §6.2) — an atom belonging
+  to more than one scene at once (e.g. both an episode *and* a topic). The
+  `scene_atoms` join table already supports this structurally; only the
+  single-partition reconciliation logic (§6.3) would need to generalize.
 - **Erasure** implementation (§9) — the model is specified; the hard-delete
   path is not built.
 - A unified, budget-assembled **cross-tier context** endpoint (pinned +
-  ranked atoms + relevant scenes in one call, §6.3) — per-tier search tools
+  ranked atoms + relevant scenes in one call, §6.5) — per-tier search tools
   ship first.
 - **Per-turn** (rather than window-level) provenance attribution (§5.2).
 - T3's **unbounded scene-set token growth** (§8.4) — noted as a scale risk,
   not solved.
 
 **Needs empirical / further design work before freezing:**
-- The recall re-rank weights, recency half-life, and the scene-clustering
-  match/reorg thresholds (§7.2, §6.2) all need a retrieval evaluation set
+- The recall re-rank weights, recency half-life, and the scene-reconciliation
+  match/reorg thresholds (§7.2, §6.3) all need a retrieval evaluation set
   and a tuning pass before they should be trusted as defaults, let alone
   frozen.
 - Whether RRF and metadata terms should be **normalized** onto comparable
@@ -873,12 +1000,15 @@ Decisions locked for all three:
   `atomsFromTurn` / `atomsFromSession` (§5).
 - **Audit**: `consolidation_decisions` table (§8.2/§5.5), not yet populated
   (Branch B populates it).
-- **T2 schema**: `scenes` table + `scene_atoms` join, id-addressed store
-  methods (`upsertScene`, `getScene`, `listScenes`, `removeScene`,
-  `scenesForAtom`), replacing the path-addressed API (§6.1). Scene
-  embeddings/FTS tables for `searchScenes` (§6.3). *(Clustering logic
-  itself lands in Branch B; Branch A only lands the storage shape and
-  direct read/write/search primitives.)*
+- **T2 schema**: `scenes` table (including `scene_kind: episode|topic`,
+  §6.1–6.2) + `scene_atoms` join, id-addressed store methods
+  (`upsertScene`, `getScene`, `listScenes`, `removeScene`, `scenesForAtom`,
+  filterable by `scene_kind`), replacing the path-addressed API (§6.1).
+  Scene embeddings/FTS tables for `searchScenes` (§6.5). *(Membership
+  derivation — session-boundary episodes, embedding-clustered topics,
+  hysteresis reconciliation, and lazy summary generation — lands in Branch
+  B; Branch A only lands the storage shape and direct read/write/search
+  primitives.)*
 - **Recall**: parameterized blended re-rank (§7.2, config-driven weights),
   `status='active'` filtering, character budgets, pinned-first pass (§7.5).
 - **Migration**: additive `ALTER TABLE` guarded by `PRAGMA table_info`;
@@ -895,9 +1025,11 @@ Decisions locked for all three:
 
 - New `src/distill/` module:
   - `core.ts` — `distillOnce(store, llm, opts)`: two-stage L1 extract +
-    consolidate with evidence population (§8.2, §5.3), embedding-clustered
-    L2 with hysteresis reconciliation and hash-gated regen+re-embed (§6.2,
-    §8.3), L3 hash-gated core synthesis (§8.4), empty-scene/store deletion
+    consolidate with evidence population (§8.2, §5.3); L2 organization —
+    session-boundary episode derivation + embedding-clustered topic
+    derivation, per-kind hysteresis reconciliation, and a separate lazy
+    hash-gated summary+re-embed pass (§6.2–§6.4, §8.3); L3 hash-gated core
+    synthesis over scene structure (§8.4); empty-scene/store deletion
     (§8.7). Pure — no env reads, no HTTP.
   - `watermark.ts` — per-store watermark + deterministic pass-id derivation
     (§8.5).
@@ -918,11 +1050,13 @@ Decisions locked for all three:
 - Tests: extract→consolidate action correctness (store/update/merge/skip +
   degradation rules) with evidence union, audit-table idempotency via pass
   id, watermark-transaction atomicity (simulated failure between stages),
-  type/confidence rejection, scene clustering hysteresis (stable vs.
-  reorg-threshold cases), scene/core hash-gate skip (including embedding
-  skip), queue coalesce/backoff/dead-letter, concurrent-write conflict
-  (§8.6), `/distill` + `falda_distill`/`falda_distill_status` enqueue +
-  auth. Added to CI.
+  type/confidence rejection, episode derivation from session structure,
+  topic derivation from embedding clusters, per-kind reconciliation
+  hysteresis (stable vs. reorg-threshold cases), lazy summary generation
+  (scene usable pre-summary), scene/core hash-gate skip (including
+  embedding skip), queue coalesce/backoff/dead-letter, concurrent-write
+  conflict (§8.6), `/distill` + `falda_distill`/`falda_distill_status`
+  enqueue + auth. Added to CI.
 
 ### Branch C — retire + reconcile + docs (`feature/distill-retire-docs`)
 
