@@ -4,7 +4,15 @@
  */
 export { Falda } from "./falda.js";
 export type {
-  FaldaOptions, Embedder, StreamItem, StreamHit, Atom, AtomHit, SceneEntry,
+  FaldaOptions, Embedder, RecallWeights,
+  StreamItem, StreamHit, AddStreamResult,
+  Atom, AtomHit, AtomType, AtomStatus, AtomConfidence,
+  Scene, SceneHit, SceneKind, SceneStatus,
+  EvidenceEdge,
+} from "./falda.js";
+export {
+  VALID_ATOM_TYPES, VALID_CONFIDENCE,
+  StreamConflictError, AtomImmutabilityError, AtomTypeError,
 } from "./falda.js";
 export { makeEmbedder, makeLocalEmbedder } from "./embedder.js";
 export type { EmbedderConfig } from "./embedder.js";
