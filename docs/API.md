@@ -35,62 +35,147 @@ listens.
 
 ### `POST /stream/add`
 ```json
-{ "session_id": "sess-1", "messages": [ { "role": "user", "content": "..." } ] }
+{
+  "session_id": "sess-1",
+  "messages": [
+    { "role": "user", "content": "...", "turn_index": 1, "turn_id": "optional-idempotency-token" }
+  ]
+}
 ```
 → `{ "accepted_ids": ["..."], "total_count": 1 }`
+
+`turn_index` and `turn_id` are optional. When supplied, two partial unique
+indexes enforce idempotency:
+- Identical `(session_id, turn_index, content)` → no-op, returns existing id.
+- Same `turn_index` with different content → `409 Conflict` (`index_conflict`).
+- Same `turn_id` at a different `turn_index` → `409 Conflict` (`turn_id_conflict`).
 
 ### `POST /stream/query`
 ```json
 { "session_id": "sess-1", "limit": 50, "offset": 0, "time_start": "...", "time_end": "..." }
 ```
-→ `{ "messages": [ { "id", "role", "content", "timestamp" } ], "total": 42 }`
+→ `{ "messages": [ { "id", "session_id", "role", "content", "timestamp", "turn_index", "turn_id" } ], "total": 42 }`
+
+Ordering: `(session_id, turn_index)` when `turn_index` is present, else `ts`.
 
 ### `POST /stream/search`  (hybrid dense + lexical)
 ```json
 { "query": "neutron detector energy", "limit": 10 }
 ```
-→ `{ "messages": [ { "id", "role", "content", "timestamp", "score" } ] }`
+→ `{ "messages": [ { ...turn fields, "score" } ] }`
 
 ### `POST /stream/delete`
 ```json
 { "ids": ["..."] }            // or { "session_id": "sess-1" }
 ```
-→ `{ "deleted_count": 3 }`
+→ `{ "deleted_count": 3, "affected_atom_ids": ["..."] }`
+
+Returns the atom ids whose provenance evidence was affected by the deletion.
+The atoms themselves are not auto-deleted; the caller may choose to
+re-evaluate or archive them.
 
 ## Tier T1 — Atoms
 
+Atom types: `fact | pattern | preference | constraint | instruction`.
+Out-of-set types are rejected with `400`. Content and type are **immutable**
+once written — changing either on an existing id is rejected with `409`
+(`AtomImmutabilityError`). To update a proposition, record a new atom.
+
 ### `POST /atoms/upsert`
 ```json
-{ "id": "optional", "type": "fact", "content": "...", "background": "optional" }
+{
+  "id": "optional",
+  "type": "fact",
+  "content": "...",
+  "background": "optional free-text context",
+  "priority": 50,
+  "confidence": "high",
+  "pinned": false,
+  "tags": ["verified"]
+}
 ```
-→ `{ "id", "type", "content", "background", "created_at", "updated_at" }`
+→ full Atom object (all fields)
 
 ### `POST /atoms/query`
 ```json
-{ "type": "fact", "limit": 50, "offset": 0 }
+{ "type": "fact", "status": "active", "limit": 50, "offset": 0 }
 ```
-→ `{ "items": [ Atom ], "total": 10 }`
+→ `{ "items": [ Atom ], "total": 10 }` (default: `status=active` only)
 
-### `POST /atoms/search`  (hybrid dense + lexical)
+### `POST /atoms/search`  (hybrid dense + lexical, with re-rank)
 ```json
 { "query": "what temperature is the cryostat?", "limit": 10 }
 ```
-→ `{ "items": [ { ...Atom, "score" } ] }`
+→ `{ "items": [ { ...Atom, "score" } ] }` (active atoms only; blended re-rank)
 
 ### `POST /atoms/delete`
 ```json
 { "ids": ["..."] }
 ```
-→ `{ "deleted_count": 1 }`
+→ `{ "deleted_count": 1 }` (deprecated — prefer lifecycle methods below)
 
-## Tier T2 — Scenes  (markdown blobs on local FS)
+### Lifecycle
 
-| Route | Body | Returns |
-|-------|------|---------|
-| `POST /scenes/ls`    | `{ "prefix": "projects/" }` | `{ "entries": [ { "path", "created_at", "updated_at" } ], "total" }` |
-| `POST /scenes/read`  | `{ "path": "a/b.md" }`      | `{ "path", "content" }` |
-| `POST /scenes/write` | `{ "path": "a/b.md", "content": "..." }` | `{ "path" }` |
-| `POST /scenes/rm`    | `{ "path": "a/b.md" }`      | `{ "path" }` |
+| Route | Body | Effect |
+|---|---|---|
+| `POST /atoms/supersede` | `{ "old_id": "...", "new_id": "..." }` | Marks `old_id` as `superseded`. |
+| `POST /atoms/merge` | `{ "loser_ids": ["..."], "winner_id": "..." }` | Marks losers as `merged`. |
+| `POST /atoms/archive` | `{ "id": "..." }` | Marks atom as `archived` (no replacement). |
+
+## Tier T2 — Scenes  (id-addressed, SQLite-backed)
+
+Scenes are organizational units (episodes, topics) populated by the
+distillation pipeline. Agents can read/search scenes; only the in-process
+distill worker writes them. A best-effort markdown mirror is written to
+`blobDir/scenes/<scene_id>.md` whenever a summary is generated.
+
+Scene kinds: `episode | topic`. Scene status: `active | retired`.
+
+### `POST /scenes/upsert`  (distill worker use — not for agent freehand edits)
+```json
+{
+  "scene_id": "optional-stable-id",
+  "scene_kind": "episode",
+  "title": "Session 2026-07-01",
+  "atom_ids": ["atom-1", "atom-2"],
+  "summary": "optional narrative",
+  "content_hash": "optional hash for regeneration gating",
+  "status": "active",
+  "derived_from": null,
+  "superseded_by": null
+}
+```
+→ full Scene object
+
+### `POST /scenes/get`
+```json
+{ "scene_id": "..." }
+```
+→ Scene object or `null`
+
+### `POST /scenes/list`
+```json
+{ "scene_kind": "episode", "status": "active", "limit": 50, "offset": 0 }
+```
+→ `{ "items": [ Scene ], "total": N }` (default: `status=active`)
+
+### `POST /scenes/search`  (hybrid dense + lexical)
+```json
+{ "query": "cryostat calibration run", "limit": 10 }
+```
+→ `{ "items": [ { ...Scene, "score" } ] }`
+
+### `POST /scenes/for-atom`
+```json
+{ "atom_id": "...", "scene_kind": "episode" }
+```
+→ `{ "items": [ Scene ] }` (all active scenes containing this atom, optionally filtered by kind)
+
+### `POST /scenes/remove`  (distill worker use)
+```json
+{ "scene_id": "..." }
+```
+→ `{ "ok": true }`
 
 ## Tier T3 — Core  (single markdown document)
 
@@ -99,7 +184,40 @@ listens.
 | `POST /core/read`  | `{}`                  | `{ "content" }` |
 | `POST /core/write` | `{ "content": "..." }`| `{ "ok": true }` |
 
+## Distillation
+
+### `POST /distill`
+```json
+{ "store_key": "optional-explicit-key" }
+```
+→ `{ "job_id": "...", "store_key": "..." }`
+
+Enqueues a distillation job for the addressed store. Duplicate pending jobs
+for the same store are coalesced (returns existing job id). Asynchronous —
+does not wait for distillation to complete.
+
+### `POST /distill/status`
+```json
+{ "job_id": "..." }
+```
+→ DistillJob object (`{ id, store_key, status, attempts, next_attempt_at, error, ... }`)
+
+Status values: `pending | running | done | dead`.
+
+## Pool admin
+
+| Route | Body | Returns |
+|-------|------|---------|
+| `POST /pools/declare` | `{ "name", "members": { "tenant": "readwrite\|read" }, "description"? }` | PoolDecl |
+| `POST /pools/update`  | `{ "name", "members"?, "description"? }` | PoolDecl |
+| `POST /pools/grant`   | `{ "name", "tenant", "access": "readwrite\|read\|none" }` | PoolDecl |
+| `POST /pools/get`     | `{ "name" }` | `{ "pool": PoolDecl }` |
+| `POST /pools/list`    | `{}` | `{ "pools": PoolDecl[] }` |
+| `POST /pools/mine`    | `{ "tenant" }` | `{ "pools": [...] }` |
+
+All pool-admin routes require a fully-trusted principal (`tenants: ["*"]`).
+
 ## Health
 
 ### `GET /healthz`
-→ `{ "ok": true, "tiers": ["stream", "atoms", "scenes", "core"] }`
+→ `{ "ok": true, "tiers": ["stream", "atoms", "scenes", "core"], "pools": true }`

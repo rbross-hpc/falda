@@ -33,7 +33,9 @@ sharing a tenant.
 > snippets in this guide predate that requirement and, where they show a bare
 > `POST` or a body `{tenant: ...}`, still need a bearer token added and the
 > tenant moved to the header to work against a current gateway.
-> `falda_distiller.py` already sends both (`FALDA_TOKEN` env var).
+> Distillation is now handled by the in-process gateway worker — see the
+> `POST /distill` route and `falda_distill` MCP tool (`docs/API.md`,
+> `docs/MCP.md`). The Python sidecar (`falda_distiller.py`) has been removed.
 
 Health check, harness-independent:
 

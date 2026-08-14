@@ -16,7 +16,7 @@ Both the gateway (`src/gateway.ts`) and this MCP server share the same
 `GET /healthz`. The MCP server exists as a separate process because it speaks
 the MCP protocol (Streamable HTTP, tool schemas) for MCP clients like
 opencode, while the gateway is a small JSON/HTTP surface for direct
-programmatic callers (e.g. the distiller) — same auth story, different
+programmatic callers — same auth story, different
 transport and tool surface (the gateway also exposes pool-admin routes the
 MCP server intentionally omits, see "Tools" below).
 
@@ -106,14 +106,20 @@ allow-list; omit for the tenant's private `self` store).
 |---|---|---|---|
 | `falda_stream_search` | T0 Stream | read | Hybrid dense+lexical search over raw turns |
 | `falda_stream_query` | T0 Stream | read | List turns by session/time window |
-| `falda_stream_add` | T0 Stream | write | Append raw turns |
-| `falda_atoms_search` | T1 Atoms | read | Hybrid dense+lexical search over distilled facts/prefs/rules |
-| `falda_atoms_query` | T1 Atoms | read | List atoms by type/time window |
-| `falda_atoms_upsert` | T1 Atoms | write | Create/update a distilled atom (`content`, not `text`) |
+| `falda_stream_add` | T0 Stream | write | Append raw turns (supports `turn_index`/`turn_id` for idempotency) |
+| `falda_atoms_search` | T1 Atoms | read | Hybrid dense+lexical search over distilled atoms (active only, blended re-rank) |
+| `falda_atoms_query` | T1 Atoms | read | List atoms by type/time window (active by default) |
+| `falda_atoms_upsert` | T1 Atoms | write | Create or update metadata of a distilled atom. Content/type are immutable post-write. |
+| `falda_scenes_search` | T2 Scenes | read | Hybrid dense+lexical search over scenes (episodes + topics) |
+| `falda_scenes_query` | T2 Scenes | read | List scenes by kind/status |
+| `falda_scenes_get` | T2 Scenes | read | Get a single scene by id |
 | `falda_core_read` | T3 Core | read | Read the persona/project core document |
-| `falda_scenes_ls` | T2 Scenes | read | List episodic scene summaries |
-| `falda_scenes_read` | T2 Scenes | read | Read a scene summary by path |
+| `falda_distill` | — | write | Enqueue a distillation job; returns `{job_id, store_key}`. Async. |
+| `falda_distill_status` | — | read | Poll a distillation job by `job_id`. |
 | `falda_whoami` | — | read | Return the tenant this connection resolves to |
+
+**Atom type enum:** `fact | pattern | preference | constraint | instruction`.
+Out-of-set values are rejected as errors (no coercion).
 
 `falda_whoami` takes no arguments (not even `pool`) and discloses **only**
 the resolved tenant — never the bearer token, and never the principal's
@@ -121,9 +127,10 @@ full `tenants`/`pools` allow-lists. Use it to confirm which tenant a given
 connection actually addresses (e.g. after changing a project's
 `opencode.json`), not to enumerate what a token can reach.
 
-**T2 Scenes and T3 Core are intentionally read-only over MCP.** Those tiers
-are maintained by the distillation pipeline (`falda_distiller.py` /
-`src/distiller.ts`), not by freehand agent edits. Pool administration
+**T2 Scenes and T3 Core are intentionally read-only over MCP for agents.**
+Those tiers are populated by the in-process distillation pipeline (triggered
+via `falda_distill` / `POST /distill` / an interval timer inside the
+gateway), not by freehand agent edits. Pool administration
 (`/pools/declare`, `/pools/grant`, ...) is likewise **not** exposed over
 MCP — use the gateway's `/pools/*` routes from an internal/admin context.
 

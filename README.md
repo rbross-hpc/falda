@@ -95,37 +95,40 @@ FALDA — shadow or live, single-tenant or shared-pool — see
 
 ### Distillation (T0 → T1 → T2 → T3)
 
-The gateway provides the storage primitives; promotion between tiers is driven
-by a standalone sidecar, [`falda_distiller.py`](falda_distiller.py). It
-polls the Stream over the HTTP API and uses any OpenAI-compatible chat model to:
+Distillation runs **in-process inside the gateway** as a background worker
+(`src/distill/core.ts`). It uses any OpenAI-compatible chat model to:
 
-- **T0 → T1**: extract typed atoms (`persona` / `episodic` / `instruction`)
-  from new turns, in small windows (defaults to 12-turn chunks — large blobs
-  cause under-extraction).
-- **T1 → T2**: synthesize periodic scene summaries (`L2_INTERVAL_S`, default 1h).
-- **T2 → T3**: synthesize a stable core/persona (`L3_INTERVAL_S`, default 6h).
+- **T0 → T1**: extract typed atoms (`fact | pattern | preference | constraint |
+  instruction`) from new turns, consolidate against existing atoms (merge/update/
+  store/skip), and record evidence edges.
+- **T1 → T2**: organize atoms into episode and topic scenes (episode membership
+  is a direct projection of provenance; topics are clustered by embedding with
+  hysteresis).
+- **T2 → T3**: synthesize a core document from the active scene structure.
 
-It touches only the documented HTTP API plus your LLM endpoint, and keeps a
-restart-safe checkpoint in `~/.falda/distiller_state.json`.
+Distillation is triggered by: an interval timer inside the gateway, a `POST
+/distill` HTTP call, or the `falda_distill` MCP tool. Each trigger enqueues a
+job; a single in-process worker drains the queue.
 
 ```bash
-export LLM_BASE_URL=http://localhost:8000/v1   # any OpenAI-compatible chat endpoint
-export LLM_API_KEY=...                          # required, no default
-export FALDA_TOKEN=...                          # required, no default — gateway bearer token
-export DISTILLER_MODEL=gpt-4o-mini
-python3 falda_distiller.py --once             # one backfill pass
-python3 falda_distiller.py                    # continuous loop
+# Trigger a distillation pass from the CLI (one-shot, requires gateway running):
+curl -s -X POST http://localhost:8077/distill \
+  -H "Authorization: Bearer <token>" \
+  -H "X-Falda-Tenant: my-agent" \
+  -H "Content-Type: application/json" \
+  -d '{}' | jq
+
+# Or via the CLI entrypoint (standalone, no gateway needed):
+FALDA_TENANT=my-agent FALDA_LLM_BASE_URL=http://localhost:8000/v1 \
+  tsx src/distill/cli.ts --once
 ```
 
-| Env var          | Default            | Notes                              |
-|------------------|--------------------|------------------------------------|
-| `LLM_BASE_URL`   | `localhost:8000/v1`| chat-completions endpoint          |
-| `LLM_API_KEY`    | _(required)_       | bearer token for the chat endpoint |
-| `FALDA_TOKEN`    | _(required)_       | gateway bearer token (must be authorized for `FALDA_TENANT`) |
-| `DISTILLER_MODEL`| `gpt-4o-mini`      | extraction/synthesis model id      |
-| `L1_EVERY_N`     | `10`               | new turns before an atom pass      |
-| `L2_INTERVAL_S`  | `3600`             | scene synthesis cadence            |
-| `L3_INTERVAL_S`  | `21600`            | core synthesis cadence             |
+| Env var                 | Default                     | Notes |
+|-------------------------|-----------------------------|-------|
+| `FALDA_LLM_BASE_URL`    | `http://localhost:11434/v1` | chat-completions endpoint |
+| `FALDA_LLM_API_KEY`     | `x`                         | bearer token for chat endpoint |
+| `FALDA_LLM_MODEL`       | `gpt-4o-mini`               | extraction/synthesis model id |
+| `FALDA_WORKER_INTERVAL_MS` | `60000`                  | gateway worker poll interval |
 
 ---
 
