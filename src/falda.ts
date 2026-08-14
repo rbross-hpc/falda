@@ -599,7 +599,8 @@ export class Falda {
   supersedeAtom(oldId: string, newId: string): void {
     this.db.prepare("UPDATE atoms SET status='superseded',updated_at=? WHERE id=?")
       .run(new Date().toISOString(), oldId);
-    this.markScenesDirty(oldId);
+    // Scene/core regeneration is handled lazily by the next distillOnce() pass
+    // via hash-gating (docs/MODEL.md §3.3, §8.3) — not eagerly here.
   }
 
   /** Merge multiple atoms into a winner (losers become 'merged'). */
@@ -608,7 +609,7 @@ export class Falda {
     const stmt = this.db.prepare("UPDATE atoms SET status='merged',updated_at=? WHERE id=?");
     for (const id of loserIds) {
       stmt.run(now, id);
-      this.markScenesDirty(id);
+      // Scene/core regeneration handled lazily by next distillOnce() pass.
     }
   }
 
@@ -616,7 +617,7 @@ export class Falda {
   archiveAtom(id: string): void {
     this.db.prepare("UPDATE atoms SET status='archived',updated_at=? WHERE id=?")
       .run(new Date().toISOString(), id);
-    this.markScenesDirty(id);
+    // Scene/core regeneration handled lazily by next distillOnce() pass.
   }
 
   updateConfidence(id: string, confidence: AtomConfidence): void {
@@ -634,13 +635,6 @@ export class Falda {
   updatePinned(id: string, pinned: boolean): void {
     this.db.prepare("UPDATE atoms SET pinned=?,updated_at=? WHERE id=?")
       .run(pinned ? 1 : 0, new Date().toISOString(), id);
-  }
-
-  /** Mark every scene that contains this atom as needing re-derivation. */
-  private markScenesDirty(_atomId: string): void {
-    // In Branch A the scenes table exists but derivation runs in Branch B.
-    // When B writes scene_atoms rows, this path will cascade correctly because
-    // scenesForAtom() and the hash-gated passes read scene_atoms. No-op here.
   }
 
   queryAtoms(p: {
@@ -664,8 +658,14 @@ export class Falda {
     return this.hybridAtoms(query, limit);
   }
 
-  /** @deprecated use supersedeAtom/mergeAtoms/archiveAtom for lifecycle management. */
-  deleteAtoms(ids: string[]): number {
+  /**
+   * Hard-delete atoms by id — physically removes rows, evidence edges, index
+   * entries, and scene membership. NOT the same as logical forgetting
+   * (supersedeAtom/archiveAtom). Does NOT produce an audit record. NOT safe
+   * to call on atoms that should be traceable. Use only in tests or internal
+   * tooling. For audited erasure see docs/future/open-questions.md.
+   */
+  hardDeleteAtomsUnsafe(ids: string[]): number {
     let n = 0;
     for (const id of ids) {
       this.db.prepare("DELETE FROM atom_evidence WHERE atom_id=?").run(id);

@@ -12,24 +12,33 @@ no managed database, no cloud lock-in.
 
 ## The four tiers
 
-| Tier | Name   | Holds                                              | Backing store            |
-|------|--------|----------------------------------------------------|--------------------------|
-| T0   | Stream | raw conversation / observation log                 | SQLite + vec + FTS5      |
-| T1   | Atoms  | distilled atomic memories (facts, prefs, rules)    | SQLite + vec + FTS5      |
-| T2   | Scenes | synthesized episodic scene blocks (markdown)       | local filesystem         |
-| T3   | Core   | long-lived persona / project core (markdown)       | local filesystem         |
+| Tier | Name   | Holds                                                       | Backing store              |
+|------|--------|-------------------------------------------------------------|----------------------------|
+| T0   | Stream | raw conversation / observation log                          | SQLite + vec + FTS5        |
+| T1   | Atoms  | distilled atomic memories (facts, patterns, instructions…)  | SQLite + vec + FTS5        |
+| T2   | Scenes | organizational units — episodes (by session) + topics (by semantic cluster) | SQLite + vec + FTS5 (best-effort markdown mirror) |
+| T3   | Core   | long-lived persona / project core                           | markdown blob (`core.md`)  |
 
 Lower tiers are high-volume and queryable; higher tiers are curated and stable.
-An agent writes raw turns to **Stream**, distills durable facts into **Atoms**,
-periodically synthesizes episodes into **Scenes**, and maintains a single
-**Core** document describing who/what it is and the project it serves.
+An agent writes raw turns to **Stream**; the distillation pipeline extracts
+durable facts into **Atoms**, organises them into **Scenes** (episodes derived
+from provenance, topics derived from embedding clustering), and synthesises a
+single **Core** document describing who/what the agent is and the project it
+serves.
+
+T2 Scenes are stored in SQLite with FTS5 and vector indexes — they are
+id-addressed, independently recallable, and browsable by kind (episode/topic).
+The markdown files under `blobDir/scenes/` are a best-effort rendering cache,
+not the source of truth.
 
 ## Recall
 
-Both vectorized tiers (Stream, Atoms) support **hybrid recall**: a dense nearest-
-neighbor search (`sqlite-vec`, cosine) and a lexical BM25 search (FTS5) are fused
-via reciprocal-rank fusion. You get semantic recall *and* exact-term recall in a
-single call, with no separate search service.
+All three queryable tiers (Stream, Atoms, Scenes) support **hybrid recall**:
+dense nearest-neighbor search (`sqlite-vec`, cosine) and lexical BM25 search
+(SQLite FTS5) are fused via reciprocal-rank fusion. You get semantic recall
+*and* exact-term recall in a single call, with no separate search service.
+Atom recall additionally applies a parameterised blended re-rank (recency,
+priority, confidence) and a pinned-first pass for standing instructions.
 
 ---
 

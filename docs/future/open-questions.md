@@ -33,9 +33,13 @@ Episode membership is already many-to-many by construction; this item is
 specifically about relaxing topic's one-per-atom rule.
 
 **Erasure implementation (§9):**
-The model is specified (hard-delete with tombstoned audit rows). The hard-
-delete path is not built. Anything currently calling itself "forget" or
-"delete" is logical forgetting only.
+The model is specified (hard-delete with tombstoned audit rows). The full
+audited erasure path is not built. `Falda.hardDeleteAtomsUnsafe()` exists
+as an interim physical-delete method (reachable via gateway `/atoms/delete`)
+but it produces no audit record, so it is not safe for privacy erasure — it
+is named to make this obvious. The production erasure path should tombstone
+`consolidation_decisions`, sweep FTS/vec indexes, and optionally remove T0
+turns that solely supported the deleted atom(s).
 
 **Public cross-tier context endpoint (§6.5, §8.9):**
 A public, budget-assembled cross-tier context call (pinned + ranked atoms +
