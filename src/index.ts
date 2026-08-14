@@ -5,7 +5,7 @@
 export { Falda } from "./falda.js";
 export type {
   FaldaOptions, Embedder, RecallWeights,
-  StreamItem, StreamHit, AddStreamResult,
+  StreamItem, StreamHit, StreamTurn, AddStreamResult,
   Atom, AtomHit, AtomType, AtomStatus, AtomConfidence,
   Scene, SceneHit, SceneKind, SceneStatus,
   EvidenceEdge,
