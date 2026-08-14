@@ -172,8 +172,8 @@ Recommended open embedding models: `nomic-embed-text` (768), `BAAI/bge-base-en-v
             ▼                    ▼                     ▼
      ┌─────────────┐    ┌────────────────┐    ┌────────────────┐
      │ SQLite      │    │ SQLite FTS5    │    │ local FS       │
-     │ + sqlite-vec│    │ (BM25 lexical) │    │ scenes + core  │
-     │ (T0,T1 vec) │    │ (T0,T1 lexical)│    │ (T2,T3)        │
+     │ + sqlite-vec│    │ (BM25 lexical) │    │ core.md (T3)   │
+     │ (T0–T2 vec) │    │ (T0–T2 lexical)│    │ + scene mirror │
      └─────────────┘    └────────────────┘    └────────────────┘
                           embeddings via OpenAI-compatible endpoint
 ```
