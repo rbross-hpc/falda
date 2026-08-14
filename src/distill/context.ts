@@ -33,19 +33,35 @@ export interface TierBudgets {
   core: number;
 }
 
-const DEFAULT_TIER_BUDGETS: TierBudgets = {
+export const DEFAULT_TIER_BUDGETS: TierBudgets = {
   pinned: 0.20,
   atoms:  0.40,
   scenes: 0.25,
   core:   0.15,
 };
 
-export interface ContextHit {
+/** Where an admitted item came from within the assembly pipeline. */
+export type RecallItemSource = "pinned" | "ranked" | "scene" | "core";
+/** What kind of underlying object an admitted item is. */
+export type RecallItemKind = "atom" | "scene" | "core";
+
+/**
+ * Structured provenance for one item actually admitted into the assembled
+ * context — survives rendering to text, and is what recall traces
+ * (src/recall/) persist for later usage-reporting and evaluation.
+ */
+export interface RecallItem {
   tier: "T1" | "T2" | "T3";
   id: string;
+  kind: RecallItemKind;
+  source: RecallItemSource;
+  /** Characters this item contributed to the rendered context. */
+  chars: number;
   score?: number;
-  pinned?: boolean;
 }
+
+/** @deprecated renamed to RecallItem (kept as an alias during migration). */
+export type ContextHit = RecallItem;
 
 export interface AssembledContext {
   pinned_atoms: string[];
@@ -56,8 +72,8 @@ export interface AssembledContext {
   budget_chars: number;
   /** Chars actually used per tier (for eval assertions). */
   per_tier_chars: { pinned: number; atoms: number; scenes: number; core: number };
-  /** Structured provenance for each item actually admitted into the context. */
-  hits: ContextHit[];
+  /** Structured provenance for each item actually admitted into the context, in admission/rank order. */
+  items: RecallItem[];
   /** True if any tier had a candidate that didn't fit its budget. */
   truncated: boolean;
 }
@@ -91,7 +107,7 @@ export async function assembleContext(
     total_chars: 0,
     budget_chars: budget,
     per_tier_chars: { pinned: 0, atoms: 0, scenes: 0, core: 0 },
-    hits: [],
+    items: [],
     truncated: false,
   };
 
@@ -103,7 +119,7 @@ export async function assembleContext(
     if (ctx.per_tier_chars.pinned + t.length > pinnedCap) { truncated = true; break; }
     ctx.pinned_atoms.push(t);
     ctx.per_tier_chars.pinned += t.length;
-    ctx.hits.push({ tier: "T1", id: a.id, pinned: true });
+    ctx.items.push({ tier: "T1", id: a.id, kind: "atom", source: "pinned", chars: t.length });
   }
   spillover = pinnedAllowance - ctx.per_tier_chars.pinned;
 
@@ -119,7 +135,7 @@ export async function assembleContext(
     if (ctx.per_tier_chars.atoms + t.length > atomsCap) { truncated = true; break; }
     ctx.ranked_atoms.push(t);
     ctx.per_tier_chars.atoms += t.length;
-    ctx.hits.push({ tier: "T1", id: atom.id, score: atom.score });
+    ctx.items.push({ tier: "T1", id: atom.id, kind: "atom", source: "ranked", chars: t.length, score: atom.score });
   }
   spillover = atomsCap - ctx.per_tier_chars.atoms;
 
@@ -136,7 +152,7 @@ export async function assembleContext(
     if (ctx.per_tier_chars.scenes + t.length > scenesCap) { truncated = true; break; }
     ctx.scenes.push(t);
     ctx.per_tier_chars.scenes += t.length;
-    ctx.hits.push({ tier: "T2", id: sc.scene_id, score: sc.score });
+    ctx.items.push({ tier: "T2", id: sc.scene_id, kind: "scene", source: "scene", chars: t.length, score: sc.score });
   }
   spillover = scenesCap - ctx.per_tier_chars.scenes;
 
@@ -147,7 +163,7 @@ export async function assembleContext(
     const t = truncate(core, coreCap);
     ctx.core = t;
     ctx.per_tier_chars.core = t.length;
-    ctx.hits.push({ tier: "T3", id: "core" });
+    ctx.items.push({ tier: "T3", id: "core", kind: "core", source: "core", chars: t.length });
     if (t.length < core.length) truncated = true;
   } else if (core) {
     truncated = true;

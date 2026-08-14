@@ -995,6 +995,14 @@ export class Falda {
 
   // ─── Recall: pinned-first + hybrid re-rank ────────────────────────────────────
 
+  /** Effective recall re-rank weights (defaults merged with any FaldaOptions
+   *  override at construction). Exposed read-only so callers (e.g. recall
+   *  trace policy snapshots) can record what was actually applied without
+   *  duplicating the defaults. */
+  getRecallWeights(): RecallWeights {
+    return { ...this.weights };
+  }
+
   /** Return all active pinned atoms. Public primitive — avoids callers reaching into .db. */
   getPinnedAtoms(): Atom[] {
     return (this.db.prepare(

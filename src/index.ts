@@ -26,6 +26,22 @@ export type { Principal } from "./mcp_auth.js";
 export { distillOnce } from "./distill/core.js";
 export type { LLMFn, DistillOptions, DistillResult } from "./distill/core.js";
 export { assembleContext } from "./distill/context.js";
-export type { AssembledContext, TierBudgets, ContextHit } from "./distill/context.js";
+export type {
+  AssembledContext, TierBudgets, RecallItem, RecallItemSource, RecallItemKind,
+  /** @deprecated use RecallItem */
+  ContextHit,
+} from "./distill/context.js";
 export { enqueue, getJob, getJobAuthorized, storeKeyFor, listJobs } from "./distill/queue.js";
 export type { DistillJob, JobStatus } from "./distill/queue.js";
+export { initRecallTraceSchema } from "./recall/schema.js";
+export { createRecallTrace, getRecallTraceAuthorized } from "./recall/traces.js";
+export { reportRecallUsage } from "./recall/usage.js";
+export { computeRecallMetrics } from "./recall/metrics.js";
+export { pruneRecallTraces, resolveRetentionDays, DEFAULT_RETENTION_DAYS } from "./recall/retention.js";
+export { buildPolicySnapshot, RETRIEVAL_POLICY_VERSION } from "./recall/policy.js";
+export { RecallTraceError } from "./recall/types.js";
+export type {
+  UsageState, PolicySnapshot, RecallTrace, RecallTraceItemRow, ItemRef,
+  CreateRecallTraceInput, RecallTraceView, ReportUsageResult,
+} from "./recall/types.js";
+export type { RecallMetrics, UsageRate } from "./recall/metrics.js";

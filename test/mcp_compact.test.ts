@@ -12,10 +12,14 @@
  *      never physical delete); it reports whether an atom actually matched
  *      and is idempotent-safe (second call reports archived:0).
  *   5. falda_recall assembles context across tiers (pinned atom + scene +
- *      core) and returns {context, hits, truncated}.
+ *      core) and returns {recall_id, context, items, truncated}.
  *   6. Cross-tenant isolation holds through the compact tools too.
  *   7. falda_distill / falda_distill_status / falda_whoami still work on
  *      the default surface.
+ *   8. falda_recall persists an inspectable recall trace (src/recall/) —
+ *      full usage-reporting/trace-inspection coverage lives in
+ *      test/recall_traces.test.ts; this file only proves the MCP tool
+ *      actually wires a recall_id through end to end.
  */
 import { test, describe, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -31,14 +35,16 @@ import { makeLocalEmbedder } from "../src/embedder.js";
 import { TokenStore } from "../src/mcp_auth.js";
 import { handleFaldaMcpRequest } from "../src/mcp.js";
 import { initQueueSchema } from "../src/distill/queue.js";
+import { initRecallTraceSchema } from "../src/recall/schema.js";
+import { getRecallTraceAuthorized } from "../src/recall/traces.js";
 import type { ToolsetName } from "../src/mcp/registry.js";
 
 function startTestServer(
-  pools: PoolManager, tokenStore: TokenStore, queueDb: Database.Database, toolset?: ToolsetName,
+  pools: PoolManager, tokenStore: TokenStore, queueDb: Database.Database, recallTraceDb: Database.Database, toolset?: ToolsetName,
 ): Promise<{ server: Server; port: number }> {
   return new Promise((resolve) => {
     const httpServer = createServer((req, res) => {
-      handleFaldaMcpRequest(pools, tokenStore, req, res, queueDb, { toolset }).catch((e) => {
+      handleFaldaMcpRequest(pools, tokenStore, req, res, queueDb, { toolset, recallTraceDb }).catch((e) => {
         console.error(e);
         if (!res.headersSent) { res.writeHead(500); res.end(JSON.stringify({ error: String(e) })); }
       });
@@ -65,6 +71,7 @@ let root: string;
 let pools: PoolManager;
 let tokenStore: TokenStore;
 let queueDb: Database.Database;
+let recallTraceDb: Database.Database;
 let defaultServer: Server, defaultPort: number;
 let fullServer: Server, fullPort: number;
 
@@ -82,13 +89,17 @@ before(async () => {
   queueDb = new Database(path.join(root, "queue.db"));
   queueDb.pragma("busy_timeout = 5000");
   initQueueSchema(queueDb);
-  ({ server: defaultServer, port: defaultPort } = await startTestServer(pools, tokenStore, queueDb, "default"));
-  ({ server: fullServer, port: fullPort } = await startTestServer(pools, tokenStore, queueDb, "full"));
+  recallTraceDb = new Database(path.join(root, "recall_traces.db"));
+  recallTraceDb.pragma("busy_timeout = 5000");
+  initRecallTraceSchema(recallTraceDb);
+  ({ server: defaultServer, port: defaultPort } = await startTestServer(pools, tokenStore, queueDb, recallTraceDb, "default"));
+  ({ server: fullServer, port: fullPort } = await startTestServer(pools, tokenStore, queueDb, recallTraceDb, "full"));
 });
 
 after(() => {
   pools.closeAll();
   queueDb.close();
+  recallTraceDb.close();
   defaultServer.close();
   fullServer.close();
   fs.rmSync(root, { recursive: true, force: true });
@@ -156,7 +167,7 @@ test("4. falda_forget archives, does not delete, and reports match count", async
       name: "falda_recall", arguments: { query: "forget-me fact" },
     }));
     assert.ok(
-      recallBefore.hits.some((h: any) => h.id === saved.id),
+      recallBefore.items.some((h: any) => h.id === saved.id),
       "atom is recallable before forgetting",
     );
 
@@ -169,7 +180,7 @@ test("4. falda_forget archives, does not delete, and reports match count", async
       name: "falda_recall", arguments: { query: "forget-me fact" },
     }));
     assert.ok(
-      !recallAfter.hits.some((h: any) => h.id === saved.id),
+      !recallAfter.items.some((h: any) => h.id === saved.id),
       "forgotten atom no longer surfaces in recall",
     );
 
@@ -180,7 +191,7 @@ test("4. falda_forget archives, does not delete, and reports match count", async
   });
 });
 
-test("5. falda_recall assembles cross-tier context with structured hits", async () => {
+test("5. falda_recall assembles cross-tier context with structured items", async () => {
   await withClient(fullPort, "tok-a", "proj-a", async (client) => {
     // Seed a pinned atom, a scene (T2), and core (T3) directly via advanced tools.
     await client.callTool({
@@ -196,12 +207,27 @@ test("5. falda_recall assembles cross-tier context with structured hits", async 
     const recall = textOf(await client.callTool({
       name: "falda_recall", arguments: { query: "cryostat units" },
     }));
+    assert.equal(typeof recall.recall_id, "string", "falda_recall returns a recall_id");
     assert.equal(typeof recall.context, "string");
-    assert.ok(Array.isArray(recall.hits));
+    assert.ok(Array.isArray(recall.items));
     assert.equal(typeof recall.truncated, "boolean");
+
+    // The trace was actually persisted (src/recall/) and is inspectable —
+    // full coverage of usage reporting/inspection is in
+    // test/recall_traces.test.ts; here we only prove the MCP tool wires
+    // recall_id through to a real, ownership-scoped trace.
+    const trace = getRecallTraceAuthorized(recallTraceDb, recall.recall_id, "proj-a:self");
+    assert.ok(trace, "recall_id corresponds to a persisted trace");
+    assert.equal(trace!.query, "cryostat units");
+    assert.equal(trace!.items.length, recall.items.length);
     assert.ok(
-      recall.hits.some((h: any) => h.tier === "T1" && h.pinned === true),
-      "pinned instruction surfaces as a T1 hit",
+      getRecallTraceAuthorized(recallTraceDb, recall.recall_id, "proj-b:self") === null,
+      "trace is not visible under another tenant's store_key (no oracle)",
+    );
+
+    assert.ok(
+      recall.items.some((h: any) => h.tier === "T1" && h.source === "pinned"),
+      "pinned instruction surfaces as a T1 item",
     );
     assert.ok(recall.context.includes("SI units"), "pinned content appears in rendered context");
   });

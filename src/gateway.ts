@@ -45,6 +45,17 @@
  *   /core/write      {content}                           -> {ok}
  *   /distill         {}                                  -> {job_id, store_key}
  *   /distill/status  {job_id}                             -> DistillJob | {error}
+ *   /recall          {query, budget?}                     -> {recall_id?, items, truncated, total_chars}
+ *                       Cross-tier context assembly (assembleContext(), src/distill/context.ts).
+ *                       Best-effort persists a recall_traces.db trace (src/recall/) — recall_id
+ *                       is omitted, never errors, if trace persistence fails.
+ *
+ * Recall-trace routes (POST) — telemetry attached to a prior /recall, not memory
+ * mutation (see src/recall/ and docs/RECALL_TRACES.md):
+ *   /recall/usage    {recall_id, used?:[{tier,id}], unused?:[{tier,id}]}
+ *                                                        -> {updated:[{tier,id}], unchanged:[{tier,id}]}
+ *   /recalls/get     {recall_id}                          -> RecallTraceView | 404
+ *   /recalls/metrics {}                                   -> RecallMetrics for the caller's store_key
  *
  * Pool admin routes (POST) — cross-tenant management, restricted to
  * fully-trusted (`tenants: ["*"]`) principals regardless of X-Falda-Tenant:
@@ -77,6 +88,12 @@ import { StreamConflictError, AtomImmutabilityError, AtomTypeError } from "./fal
 import { enqueue, storeKeyFor, getJobAuthorized } from "./distill/queue.js";
 import { buildRuntime } from "./runtime.js";
 import { startDistiller } from "./distill/worker.js";
+import { assembleContext, DEFAULT_TIER_BUDGETS } from "./distill/context.js";
+import { buildPolicySnapshot } from "./recall/policy.js";
+import { createRecallTrace, getRecallTraceAuthorized } from "./recall/traces.js";
+import { reportRecallUsage } from "./recall/usage.js";
+import { computeRecallMetrics } from "./recall/metrics.js";
+import { RecallTraceError } from "./recall/types.js";
 
 /** Routes that mutate the addressed store (need readwrite on a shared pool). */
 const WRITE_ROUTES = new Set([
@@ -101,11 +118,56 @@ async function handleData(
   route: string,
   b: any,
   queueDb: Database.Database | undefined,
+  recallTraceDb: Database.Database | undefined,
 ) {
   const tenant = TokenStore.requireTenant(principal, headerValue(headers, "x-falda-tenant"));
   const pool = TokenStore.requirePool(principal, b.pool);
+  const storeKey = storeKeyFor(tenant, pool ?? undefined);
+
+  // /recall* routes address the recall_traces store, not the tenant's
+  // memory store directly for usage/inspection/metrics (only /recall
+  // itself also reads the memory store, to run assembleContext).
+  if (route === "/recall/usage") {
+    if (!recallTraceDb) return { error: "recall trace store not initialized" };
+    return reportRecallUsage(recallTraceDb, b.recall_id, storeKey, b.used ?? [], b.unused ?? []);
+  }
+  if (route === "/recalls/get") {
+    if (!recallTraceDb) return { error: "recall trace store not initialized" };
+    const trace = getRecallTraceAuthorized(recallTraceDb, b.recall_id, storeKey);
+    if (!trace) throw new RecallTraceError("not_found", `recall trace not found: ${b.recall_id}`);
+    return trace;
+  }
+  if (route === "/recalls/metrics") {
+    if (!recallTraceDb) return { error: "recall trace store not initialized" };
+    return computeRecallMetrics(recallTraceDb, storeKey);
+  }
+
   const store = pools.resolve(tenant, pool, WRITE_ROUTES.has(route));
   switch (route) {
+    case "/recall": {
+      const budget = b.budget ?? 6000;
+      const assembled = await assembleContext(store, b.query, budget);
+      let recall_id: string | undefined;
+      if (recallTraceDb) {
+        try {
+          recall_id = createRecallTrace(recallTraceDb, {
+            store_key: storeKey,
+            tenant,
+            pool: pool ?? null,
+            query: b.query,
+            requested_budget: budget,
+            used_budget: assembled.total_chars,
+            policy_snapshot: buildPolicySnapshot(store.getRecallWeights(), DEFAULT_TIER_BUDGETS),
+            items: assembled.items,
+          });
+        } catch (e) {
+          // Best-effort telemetry — a trace-write failure must never fail
+          // the recall itself. recall_id is simply omitted.
+          console.error("[gateway] /recall trace persistence failed (non-fatal):", e);
+        }
+      }
+      return { recall_id, items: assembled.items, truncated: assembled.truncated, total_chars: assembled.total_chars };
+    }
     case "/stream/add":
       return store.addStream(b.session_id, b.messages ?? []).then((ids) => ({
         accepted_ids: ids, total_count: (b.messages ?? []).length,
@@ -180,6 +242,7 @@ export async function handleRequest(
   route: string,
   b: any,
   queueDb?: Database.Database,
+  recallTraceDb?: Database.Database,
 ): Promise<{ status: number; body: any }> {
   try {
     const principal = tokenStore.authenticate(parseBearer(headers["authorization"]));
@@ -188,7 +251,7 @@ export async function handleRequest(
       if (out === undefined) return { status: 404, body: { error: "unknown route" } };
       return { status: 200, body: out };
     }
-    const out = await handleData(pools, principal, headers, route, b, queueDb);
+    const out = await handleData(pools, principal, headers, route, b, queueDb, recallTraceDb);
     if (out === undefined) return { status: 404, body: { error: "unknown route" } };
     return { status: 200, body: out };
   } catch (e: any) {
@@ -209,6 +272,10 @@ export async function handleRequest(
     }
     if (e instanceof AtomTypeError) {
       return { status: 400, body: { error: e.message } };
+    }
+    if (e instanceof RecallTraceError) {
+      const status = e.code === "not_found" ? 404 : e.code === "conflict" ? 409 : 400;
+      return { status, body: { error: e.message, code: e.code } };
     }
     return { status: 500, body: { error: String(e?.message ?? e) } };
   }
@@ -235,7 +302,9 @@ if (IS_MAIN) {
   const WORKER_INTERVAL_MS = Number(process.env.FALDA_WORKER_INTERVAL_MS ?? 60_000);
 
   const runtime = buildRuntime({ label: "FALDA gateway" });
-  startDistiller(runtime.queueDb, runtime.pools, runtime.llm, WORKER_INTERVAL_MS);
+  startDistiller(runtime.queueDb, runtime.pools, runtime.llm, WORKER_INTERVAL_MS, {
+    recallTraceDb: runtime.recallTraceDb,
+  });
 
   createServer((req, res) => {
     if (req.method === "GET" && req.url === "/healthz") {
@@ -249,7 +318,7 @@ if (IS_MAIN) {
       try {
         const parsed = body ? JSON.parse(body) : {};
         const { status, body: out } = await handleRequest(
-          runtime.pools, runtime.tokenStore, req.headers, req.url ?? "", parsed, runtime.queueDb,
+          runtime.pools, runtime.tokenStore, req.headers, req.url ?? "", parsed, runtime.queueDb, runtime.recallTraceDb,
         );
         res.writeHead(status, { "content-type": "application/json" });
         res.end(JSON.stringify(out));

@@ -56,14 +56,21 @@ import { TokenStore, AuthError, parseBearer } from "../mcp_auth.js";
 import { toolsFor, resolveToolset, type ToolsetName } from "./registry.js";
 import type { ToolDeps } from "./context.js";
 
+export interface McpServerOpts {
+  toolset?: ToolsetName;
+  /** Recall-trace store (src/recall/). Omit to disable trace capture for
+   *  this server instance — falda_recall still works, just untraced. */
+  recallTraceDb?: Database.Database;
+}
+
 export function makeFaldaMcpServer(
   pools: PoolManager,
   tokenStore: TokenStore,
   queueDb?: Database.Database,
-  opts?: { toolset?: ToolsetName },
+  opts?: McpServerOpts,
 ): McpServer {
   const server = new McpServer({ name: "falda", version: "0.1.0" });
-  const deps: ToolDeps = { pools, tokenStore, queueDb };
+  const deps: ToolDeps = { pools, tokenStore, queueDb, recallTraceDb: opts?.recallTraceDb };
   const toolset = resolveToolset(opts?.toolset);
   for (const register of toolsFor(toolset)) register(server, deps);
   return server;
@@ -75,7 +82,7 @@ export async function handleFaldaMcpRequest(
   req: IncomingMessage,
   res: ServerResponse,
   queueDb?: Database.Database,
-  opts?: { toolset?: ToolsetName },
+  opts?: McpServerOpts,
 ): Promise<void> {
   try {
     const bearer = parseBearer(req.headers["authorization"]);
