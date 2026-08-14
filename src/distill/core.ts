@@ -120,6 +120,15 @@ function atomIdFromContent(type: string, content: string): string {
   return "l1-" + createHash("sha256").update(`${type}:${content}`).digest("hex").slice(0, 24);
 }
 
+/**
+ * Deterministic episode scene_id for a given session.
+ * Keyed by session identity, never by title — the title is pure presentation
+ * and may be replaced by the LLM summary pass on every run (§6.2/§6.3).
+ */
+function episodeSceneId(sessionId: string): string {
+  return "episode:" + createHash("sha256").update(sessionId).digest("hex").slice(0, 24);
+}
+
 // ─── Topic clustering (embedding-based cosine similarity) ─────────────────────
 
 function cosineSimilarity(a: number[], b: number[]): number {
@@ -352,11 +361,13 @@ export async function distillOnce(
       return row?.status === "active";
     });
 
-    // Find or create the episode scene for this session.
+    // Deterministic episode scene_id keyed by session identity (§6.2/§6.3).
+    // Never look up by title — the title is presentation-only and may be
+    // replaced by the LLM summary pass, which must not break identity.
+    const sceneId = episodeSceneId(session_id);
     const existingEp = db.prepare(
-      `SELECT sc.* FROM scenes sc
-       WHERE sc.scene_kind='episode' AND sc.title LIKE ?`
-    ).get(`Session ${session_id}%`) as any;
+      "SELECT * FROM scenes WHERE scene_id=?"
+    ).get(sceneId) as any;
 
     const provisional = `Session ${session_id}`;
 
@@ -364,7 +375,7 @@ export async function distillOnce(
       // No active atoms trace to this session — retire the scene if it exists.
       if (existingEp) {
         await store.upsertScene({
-          scene_id: existingEp.scene_id,
+          scene_id: sceneId,
           scene_kind: "episode",
           title: existingEp.title,
           atom_ids: [],
@@ -374,7 +385,6 @@ export async function distillOnce(
       continue;
     }
 
-    const sceneId = existingEp?.scene_id;
     await store.upsertScene({
       scene_id: sceneId,
       scene_kind: "episode",
