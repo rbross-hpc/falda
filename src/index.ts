@@ -25,5 +25,5 @@ export { distillOnce } from "./distill/core.js";
 export type { LLMFn, DistillOptions, DistillResult } from "./distill/core.js";
 export { assembleContext } from "./distill/context.js";
 export type { AssembledContext, TierBudgets } from "./distill/context.js";
-export { enqueue, getJob, listJobs } from "./distill/queue.js";
+export { enqueue, getJob, getJobAuthorized, storeKeyFor, listJobs } from "./distill/queue.js";
 export type { DistillJob, JobStatus } from "./distill/queue.js";

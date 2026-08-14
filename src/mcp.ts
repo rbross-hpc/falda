@@ -43,7 +43,7 @@ import { z } from "zod";
 import { PoolManager, PoolError } from "./pools.js";
 import { selectEmbedder, enforceEmbeddingLock } from "./boot.js";
 import { TokenStore, AuthError, parseBearer, requireTokenFile, type Principal } from "./mcp_auth.js";
-import { initQueueSchema, enqueue, getJob } from "./distill/queue.js";
+import { initQueueSchema, enqueue, storeKeyFor, getJobAuthorized } from "./distill/queue.js";
 
 interface RequestCtx { tenant: string; principal: Principal; }
 
@@ -268,10 +268,10 @@ export function makeFaldaMcpServer(pools: PoolManager, tokenStore: TokenStore, q
       try {
         const ctx = ctxFromExtra(extra);
         const checkedPool = TokenStore.requirePool(ctx.principal, pool);
-        const storeKey = `${ctx.tenant}:${checkedPool ?? "self"}`;
+        const callerKey = storeKeyFor(ctx.tenant, checkedPool ?? undefined);
         if (!queueDb) return errorResult(new Error("distillation queue not available on this server"));
-        const jobId = enqueue(queueDb, storeKey);
-        return textResult({ job_id: jobId, store_key: storeKey });
+        const jobId = enqueue(queueDb, callerKey);
+        return textResult({ job_id: jobId, store_key: callerKey });
       } catch (e) { return errorResult(e); }
     },
   );
@@ -282,12 +282,16 @@ export function makeFaldaMcpServer(pools: PoolManager, tokenStore: TokenStore, q
       description: "Poll the status of a distillation job by job_id (returned by falda_distill).",
       inputSchema: { job_id: z.string(), pool: poolArg },
     },
-    async ({ job_id }, extra) => {
+    async ({ job_id, pool }, extra) => {
       try {
-        ctxFromExtra(extra); // validates auth
+        const ctx = ctxFromExtra(extra);
+        const checkedPool = TokenStore.requirePool(ctx.principal, pool);
+        const callerKey = storeKeyFor(ctx.tenant, checkedPool ?? undefined);
         if (!queueDb) return errorResult(new Error("distillation queue not available on this server"));
-        const job = getJob(queueDb, job_id);
-        if (!job) return errorResult(new Error(`job not found: ${job_id}`));
+        // getJobAuthorized returns null for both missing and unauthorized jobs —
+        // the caller cannot distinguish the two (no existence oracle).
+        const job = getJobAuthorized(queueDb, job_id, callerKey);
+        if (!job) return errorResult(new Error("job not found"));
         return textResult(job);
       } catch (e) { return errorResult(e); }
     },
