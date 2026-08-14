@@ -600,3 +600,93 @@ test("T2: retired scene preserves derived_from lineage", async () => {
     assert.deepEqual(newScene!.derived_from, [old.scene_id]);
   } finally { cleanup(s, blobDir); }
 });
+
+// ─── 15. render_hash: embed-gating separates membership from title/summary ────
+
+test("render_hash: membership-only upsert does NOT trigger re-embed", async () => {
+  const { s, blobDir } = makeStore();
+  try {
+    let embedCalls = 0;
+    const countingEmbed = async (text: string): Promise<number[]> => {
+      embedCalls++;
+      return makeLocalEmbedder(32)(text);
+    };
+    // Wrap the store with a counting embedder via a fresh store instance.
+    const blobDir2 = fs.mkdtempSync(path.join(os.tmpdir(), "falda-rh-"));
+    const s2 = new Falda({ dbPath: ":memory:", blobDir: blobDir2, embed: countingEmbed, dim: 32 });
+    try {
+      const a1 = await s2.upsertAtom({ type: "fact", content: "first atom" });
+      const a2 = await s2.upsertAtom({ type: "fact", content: "second atom" });
+
+      // First upsertScene: creates the scene, embeds title.
+      const sc = await s2.upsertScene({
+        scene_kind: "topic",
+        title: "My Topic",
+        summary: "About topics.",
+        atom_ids: [a1.id],
+      });
+      const embedsAfterCreate = embedCalls;
+      assert.ok(embedsAfterCreate > 0, "embed called on scene create");
+
+      // Second upsertScene: membership changes (a2 added), but title/summary unchanged.
+      // Must pass scene_id so this is an update, not a new scene creation.
+      await s2.upsertScene({
+        scene_id: sc.scene_id,
+        scene_kind: "topic",
+        title: "My Topic",
+        summary: "About topics.",
+        atom_ids: [a1.id, a2.id],
+      });
+      assert.equal(embedCalls, embedsAfterCreate, "no additional embed call for membership-only change");
+    } finally { s2.close(); fs.rmSync(blobDir2, { recursive: true, force: true }); }
+  } finally { cleanup(s, blobDir); }
+});
+
+test("render_hash: title change DOES trigger re-embed", async () => {
+  const { s, blobDir } = makeStore();
+  try {
+    let embedCalls = 0;
+    const countingEmbed = async (text: string): Promise<number[]> => {
+      embedCalls++;
+      return makeLocalEmbedder(32)(text);
+    };
+    const blobDir2 = fs.mkdtempSync(path.join(os.tmpdir(), "falda-rh2-"));
+    const s2 = new Falda({ dbPath: ":memory:", blobDir: blobDir2, embed: countingEmbed, dim: 32 });
+    try {
+      const a1 = await s2.upsertAtom({ type: "fact", content: "some fact" });
+      const sc = await s2.upsertScene({
+        scene_kind: "topic",
+        title: "Initial Title",
+        summary: "Initial summary.",
+        atom_ids: [a1.id],
+      });
+      const embedsAfterCreate = embedCalls;
+
+      // Upsert with same membership but different title — must re-embed.
+      await s2.upsertScene({
+        scene_id: sc.scene_id,
+        scene_kind: "topic",
+        title: "Revised Title",
+        summary: "Initial summary.",
+        atom_ids: [a1.id],
+      });
+      assert.ok(embedCalls > embedsAfterCreate, "embed called again when title changes");
+    } finally { s2.close(); fs.rmSync(blobDir2, { recursive: true, force: true }); }
+  } finally { cleanup(s, blobDir); }
+});
+
+test("render_hash: persisted on scene row after first embed", async () => {
+  const { s, blobDir } = makeStore();
+  try {
+    const a = await s.upsertAtom({ type: "fact", content: "persistent fact" });
+    const sc = await s.upsertScene({
+      scene_kind: "episode",
+      title: "My Episode",
+      summary: "Episode about things.",
+      atom_ids: [a.id],
+    });
+    const fromDb = s.getScene(sc.scene_id);
+    assert.ok(fromDb?.render_hash != null, "render_hash persisted after scene creation");
+    assert.ok(typeof fromDb!.render_hash === "string" && fromDb!.render_hash.length > 0);
+  } finally { cleanup(s, blobDir); }
+});
