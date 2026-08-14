@@ -136,6 +136,8 @@ test("5. scenes/core write tools not registered (checked against real server)", 
     assert.ok(!names.includes("falda_scenes_write"), "no falda_scenes_write tool");
     assert.ok(!names.includes("falda_scenes_rm"), "no falda_scenes_rm tool");
     assert.ok(!names.includes("falda_core_write"), "no falda_core_write tool");
+    assert.ok(names.includes("falda_scenes_search"), "has falda_scenes_search tool");
+    assert.ok(names.includes("falda_scenes_query"), "has falda_scenes_query tool");
   });
 });
 

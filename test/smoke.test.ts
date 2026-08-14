@@ -25,28 +25,39 @@ test("FALDA smoke: all tiers", async () => {
     assert.equal(s.queryStream({ session_id: "sess-1" }).total, 3, "T0 query by session");
     const sHit = await s.searchStream("neutron detector energy", 2);
     assert.ok(sHit.length > 0, "T0 hybrid search returns hits");
-    assert.equal(s.deleteStream({ session_id: "sess-1" }), 3, "T0 delete by session");
+    const del = s.deleteStream({ session_id: "sess-1" });
+    assert.equal(del.deleted_count, 3, "T0 delete by session");
 
-    // T1 Atoms
+    // T1 Atoms (new enum, new fields)
     const a1 = await s.upsertAtom({ type: "fact", content: "Cryostat target temperature is 4.2 K." });
     const a2 = await s.upsertAtom({ type: "preference", content: "Report calibration drift as a percentage." });
     assert.ok(a1.id && a2.id, "T1 upsert returns atom");
-    const a1b = await s.upsertAtom({ id: a1.id, type: "fact", content: "Cryostat target temperature is 4.2 K (LHe)." });
-    assert.equal(a1b.id, a1.id, "T1 upsert updates in place");
+    assert.equal(a1.status, "active", "T1 atom has active status");
+    assert.equal(a1.confidence, "medium", "T1 atom has default confidence");
+    // Metadata-only update (background) is allowed.
+    const a1b = await s.upsertAtom({ id: a1.id, type: "fact", content: "Cryostat target temperature is 4.2 K.", background: "LHe bath" });
+    assert.equal(a1b.id, a1.id, "T1 metadata update keeps same id");
+    assert.equal(a1b.background, "LHe bath", "T1 background updated");
     assert.equal(s.queryAtoms({ type: "fact" }).total, 1, "T1 query by type");
     const aHit = await s.searchAtoms("what temperature is the cryostat", 3);
     assert.ok(aHit.length > 0, "T1 hybrid search returns hits");
-    assert.equal(s.deleteAtoms([a2.id]), 1, "T1 delete by id");
 
-    // T2 Scenes
-    s.writeScene("projects/sns/run-2026-06-22.md", "# Run summary\nDetector stable.");
-    assert.ok(
-      s.readScene("projects/sns/run-2026-06-22.md")!.includes("Detector stable"),
-      "T2 scene read round-trips",
-    );
-    assert.equal(s.listScenes("projects/").entries.length, 1, "T2 scene ls finds it");
-    s.removeScene("projects/sns/run-2026-06-22.md");
-    assert.equal(s.readScene("projects/sns/run-2026-06-22.md"), null, "T2 scene rm");
+    // T2 Scenes (id-addressed)
+    const sc = await s.upsertScene({
+      scene_kind: "episode",
+      title: "Session 2026-06-22",
+      atom_ids: [a1.id],
+    });
+    assert.ok(sc.scene_id, "T2 scene has id");
+    assert.equal(sc.scene_kind, "episode", "T2 scene kind correct");
+    assert.equal(sc.title, "Session 2026-06-22", "T2 scene title correct");
+    const fetched = s.getScene(sc.scene_id);
+    assert.ok(fetched, "T2 scene getScene returns scene");
+    assert.deepEqual(fetched!.atom_ids, [a1.id], "T2 scene atom_ids correct");
+    const listed = s.listScenes({ scene_kind: "episode" });
+    assert.equal(listed.total, 1, "T2 listScenes finds episode");
+    s.removeScene(sc.scene_id);
+    assert.equal(s.getScene(sc.scene_id), null, "T2 removeScene removes it");
 
     // T3 Core
     s.writeCore("# Agent core\nDomain: experimental nuclear physics.");

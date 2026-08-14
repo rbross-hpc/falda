@@ -21,20 +21,29 @@
  *              token is authorized for (`self` always implicitly allowed).
  *
  * Data routes (all POST, JSON in/out) — each also accepts {pool?} in the body:
- *   /stream/add      {session_id, messages[]}            -> {accepted_ids, total_count}
+ *   /stream/add      {session_id, messages[{role,content,id?,timestamp?,turn_index?,turn_id?}]}
+ *                                                        -> {accepted_ids, total_count}
  *   /stream/query    {session_id?, limit?, ...}          -> {messages, total}
  *   /stream/search   {query, limit?}                     -> {messages: hits}
- *   /stream/delete   {ids?|session_id}                   -> {deleted_count}
- *   /atoms/upsert    {id?, type?, content, background?}  -> Atom
+ *   /stream/delete   {ids?|session_id}                   -> {deleted_count, affected_atom_ids}
+ *   /atoms/upsert    {id?, type, content, background?, priority?, confidence?, pinned?, tags?}
+ *                                                        -> Atom
  *   /atoms/query     {type?, limit?, ...}                -> {items, total}
  *   /atoms/search    {query, limit?}                     -> {items: hits}
  *   /atoms/delete    {ids[]}                             -> {deleted_count}
- *   /scenes/ls       {prefix?}                           -> {entries, total}
- *   /scenes/read     {path}                              -> {path, content}
- *   /scenes/write    {path, content}                     -> {path}
- *   /scenes/rm       {path}                              -> {path}
+ *   /atoms/supersede {old_id, new_id}                   -> {ok}
+ *   /atoms/merge     {loser_ids[], winner_id}            -> {ok}
+ *   /atoms/archive   {id}                               -> {ok}
+ *   /scenes/upsert   {scene_id?,scene_kind,title,atom_ids?,summary?,content_hash?,status?,
+ *                     derived_from?,superseded_by?}      -> Scene
+ *   /scenes/get      {scene_id}                          -> Scene | null
+ *   /scenes/list     {scene_kind?,status?,limit?,offset?}-> {items, total}
+ *   /scenes/remove   {scene_id}                          -> {ok}
+ *   /scenes/search   {query, limit?}                     -> {items: hits}
+ *   /scenes/for-atom {atom_id, scene_kind?}              -> {items}
  *   /core/read       {}                                  -> {content}
  *   /core/write      {content}                           -> {ok}
+ *   /distill         (reserved for Branch B)
  *
  * Pool admin routes (POST) — cross-tenant management, restricted to
  * fully-trusted (`tenants: ["*"]`) principals regardless of X-Falda-Tenant:
@@ -43,25 +52,29 @@
  *   /pools/grant     {name, tenant, access}                        -> PoolDecl
  *   /pools/get       {name}                                        -> {pool}
  *   /pools/list      {}                                            -> {pools}
- *   /pools/mine      {tenant}                                      -> {pools}  (reachable by tenant)
+ *   /pools/mine      {tenant}                                      -> {pools}
  *
  *   /healthz         (GET, unauthenticated)                        -> {ok, tiers}
  *
  * Env:
- *   FALDA_TOKENS       Path to token file, same shape as the MCP server's
- *                      FALDA_MCP_TOKENS (default ./falda_gateway_tokens.json).
- *                      Required — the gateway refuses to boot without a valid,
- *                      non-empty token file (see mcp_auth.ts requireTokenFile).
+ *   FALDA_PORT         Port to listen on (default 8077).
+ *   FALDA_TOKENS       Path to token file (default ./falda_gateway_tokens.json).
+ *   FALDA_ROOT         Pool root dir (default ./falda-data).
+ *   FALDA_DIM          Embedding dimensionality (default 768).
  */
 import { createServer } from "node:http";
 import { PoolManager, PoolError } from "./pools.js";
 import { selectEmbedder, enforceEmbeddingLock } from "./boot.js";
 import { TokenStore, AuthError, parseBearer, requireTokenFile, type Principal } from "./mcp_auth.js";
+import { StreamConflictError, AtomImmutabilityError, AtomTypeError } from "./falda.js";
 
 /** Routes that mutate the addressed store (need readwrite on a shared pool). */
 const WRITE_ROUTES = new Set([
-  "/stream/add", "/stream/delete", "/atoms/upsert", "/atoms/delete",
-  "/scenes/write", "/scenes/rm", "/core/write",
+  "/stream/add", "/stream/delete",
+  "/atoms/upsert", "/atoms/delete", "/atoms/supersede", "/atoms/merge", "/atoms/archive",
+  "/scenes/upsert", "/scenes/remove",
+  "/core/write",
+  "/distill",
 ]);
 
 type Headers = Record<string, string | string[] | undefined>;
@@ -73,34 +86,41 @@ function headerValue(headers: Headers, name: string): string | undefined {
 
 async function handleData(pools: PoolManager, principal: Principal, headers: Headers, route: string, b: any) {
   const tenant = TokenStore.requireTenant(principal, headerValue(headers, "x-falda-tenant"));
-  const pool = TokenStore.requirePool(principal, b.pool); // undefined => "self"
+  const pool = TokenStore.requirePool(principal, b.pool);
   const store = pools.resolve(tenant, pool, WRITE_ROUTES.has(route));
   switch (route) {
-    case "/stream/add":    return { accepted_ids: await store.addStream(b.session_id, b.messages ?? []), total_count: (b.messages ?? []).length };
-    case "/stream/query":  return store.queryStream(b);
-    case "/stream/search": return { messages: await store.searchStream(b.query, b.limit) };
-    case "/stream/delete": return { deleted_count: store.deleteStream(b) };
+    case "/stream/add":
+      return store.addStream(b.session_id, b.messages ?? []).then((ids) => ({
+        accepted_ids: ids, total_count: (b.messages ?? []).length,
+      }));
+    case "/stream/query":    return store.queryStream(b);
+    case "/stream/search":   return { messages: await store.searchStream(b.query, b.limit) };
+    case "/stream/delete":   return store.deleteStream(b);
     case "/atoms/upsert":
       if (Array.isArray(b.atoms)) {
         const items = [];
         for (const atom of b.atoms) items.push(await store.upsertAtom(atom));
         return { items, total_count: items.length };
       }
-      return await store.upsertAtom(b);
-    case "/atoms/query":   return store.queryAtoms(b);
-    case "/atoms/search":  return { items: await store.searchAtoms(b.query, b.limit) };
-    case "/atoms/delete":  return { deleted_count: store.deleteAtoms(b.ids ?? []) };
-    case "/scenes/ls":     return store.listScenes(b.prefix ?? "");
-    case "/scenes/read":   return { path: b.path, content: store.readScene(b.path) };
-    case "/scenes/write":  return (store.writeScene(b.path, b.content ?? ""), { path: b.path });
-    case "/scenes/rm":     return (store.removeScene(b.path), { path: b.path });
-    case "/core/read":     return { content: store.readCore() };
-    case "/core/write":    return (store.writeCore(b.content ?? ""), { ok: true });
+      return store.upsertAtom(b);
+    case "/atoms/query":     return store.queryAtoms(b);
+    case "/atoms/search":    return { items: await store.searchAtoms(b.query, b.limit) };
+    case "/atoms/delete":    return { deleted_count: store.deleteAtoms(b.ids ?? []) };
+    case "/atoms/supersede": return (store.supersedeAtom(b.old_id, b.new_id), { ok: true });
+    case "/atoms/merge":     return (store.mergeAtoms(b.loser_ids ?? [], b.winner_id), { ok: true });
+    case "/atoms/archive":   return (store.archiveAtom(b.id), { ok: true });
+    case "/scenes/upsert":   return store.upsertScene(b);
+    case "/scenes/get":      return store.getScene(b.scene_id);
+    case "/scenes/list":     return store.listScenes(b);
+    case "/scenes/remove":   return (store.removeScene(b.scene_id), { ok: true });
+    case "/scenes/search":   return { items: await store.searchScenes(b.query, b.limit) };
+    case "/scenes/for-atom": return { items: store.scenesForAtom(b.atom_id, b.scene_kind) };
+    case "/core/read":       return { content: store.readCore() };
+    case "/core/write":      return (store.writeCore(b.content ?? ""), { ok: true });
     default: return undefined;
   }
 }
 
-/** Pool admin routes are cross-tenant management, restricted to fully-trusted principals. */
 function requireAdmin(principal: Principal) {
   if (!principal.tenants.includes("*")) {
     throw new AuthError(403, "pool admin routes require a fully-trusted (tenants: [\"*\"]) token");
@@ -120,11 +140,6 @@ function handlePool(pools: PoolManager, principal: Principal, route: string, b: 
   }
 }
 
-/**
- * Handle one gateway request end-to-end: authenticate, then dispatch.
- * Exported (rather than only wired at module scope) so it can be exercised
- * directly in tests without booting a real HTTP server/socket.
- */
 export async function handleRequest(
   pools: PoolManager,
   tokenStore: TokenStore,
@@ -147,11 +162,19 @@ export async function handleRequest(
       return { status: e.status, body: { error: e.message } };
     }
     if (e instanceof PoolError) {
-      // 404 for missing pool, 403 for access denial, 400 for malformed input.
       const status = e.code === "no_such_pool" ? 404
         : (e.code === "not_a_member" || e.code === "read_only") ? 403
         : 400;
       return { status, body: { error: e.message, code: e.code } };
+    }
+    if (e instanceof StreamConflictError) {
+      return { status: 409, body: { error: e.message, kind: e.kind } };
+    }
+    if (e instanceof AtomImmutabilityError) {
+      return { status: 409, body: { error: e.message } };
+    }
+    if (e instanceof AtomTypeError) {
+      return { status: 400, body: { error: e.message } };
     }
     return { status: 500, body: { error: String(e?.message ?? e) } };
   }
