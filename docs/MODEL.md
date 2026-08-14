@@ -979,11 +979,44 @@ That function is now also the implementation behind the public
 the compact agent-facing default tool set exposes recall/remember/forget/
 distill/whoami instead of per-tier tools, and `falda_recall` is the single
 retrieval entry point built directly on `assembleContext`, extended with
-structured per-hit provenance (`{tier, id, score?}`) and a `truncated` flag
-so a caller can tell tier/identity apart from the rendered text without the
-model needing to choose which tier to query. The per-tier tools
-(`falda_atoms_search`, `falda_scenes_search`, ...) remain available under
-`FALDA_MCP_TOOLSET=full` for diagnostics/admin use — see `docs/MCP.md`.
+structured per-item provenance (`RecallItem = {tier, id, kind, source, chars,
+score?}`) and a `truncated` flag so a caller can tell tier/identity apart
+from the rendered text without the model needing to choose which tier to
+query. The per-tier tools (`falda_atoms_search`, `falda_scenes_search`,
+...) remain available under `FALDA_MCP_TOOLSET=full` for diagnostics/admin
+use — see `docs/MCP.md`.
+
+### 8.10 Recall traces and usage feedback (§ recall-feedback-loop)
+
+Every `assembleContext()` call made through `falda_recall` / `POST
+/recall` is, best-effort, recorded as a **trace**: a `recall_id`, the
+query, the effective retrieval policy (recall weights + tier budgets,
+`policy_snapshot`), and one row per admitted `RecallItem` in rank order
+(`recall_traces` / `recall_trace_items`, `src/recall/`, own SQLite file —
+`recall_traces.db`, not the tenant's `falda.db`). This is telemetry about
+retrieval, not memory: a trace never mutates the atoms/scenes it
+references, and trace-persistence failure never fails the recall that
+produced it.
+
+Usage feedback (`POST /recall/usage`, `used | unused`, defaulting to
+`unknown` until reported) attaches to the trace, keyed by `recall_id` —
+not to the memory item itself, and not exposed as an MCP tool (the model
+is not prompted to self-report after every recall; that's a harness/
+plugin responsibility). `unknown` is kept distinct from `unused`: absence
+of a report is not evidence a memory was useless.
+
+**This is instrumentation, not a closed loop.** Nothing in FALDA currently
+reads usage data back into ranking, priority, tier budgets, or clustering.
+That is intentional — the goal of shipping this now is to describe the
+current retrieval system's behavior (which tiers/ranks actually get used,
+whether Core is earning its budget share) before any part of the system
+starts adapting to its own — necessarily noisy — usage signal. Whether
+repeated usage should ever feed back into `priority`/ranking is future
+work (§13), to be decided from the data this produces, not designed in
+advance of having any.
+
+Full schema, transition rules, and evaluation queries:
+`docs/RECALL_TRACES.md`.
 
 ## 9. Forgetting vs. erasure
 

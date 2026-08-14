@@ -189,6 +189,86 @@ Scene kinds: `episode | topic`. Scene status: `active | retired`.
 | `POST /core/read`  | `{}`                  | `{ "content" }` |
 | `POST /core/write` | `{ "content": "..." }`| `{ "ok": true }` |
 
+## Cross-tier recall
+
+### `POST /recall`
+```json
+{ "query": "...", "budget": 6000, "pool": "optional-pool-name" }
+```
+→ `{ "recall_id": "...", "items": [...], "truncated": false, "total_chars": 1234 }`
+
+Assembles context across all four tiers in one call (pinned atoms first,
+then query-ranked atoms, relevant scenes, a core excerpt — see
+`src/distill/context.ts` and `docs/MODEL.md` §8.9), trimmed to `budget`
+characters (default 6000). Each entry in `items` is
+`{ tier: "T1"|"T2"|"T3", id, kind, source, chars, score? }` in the order it
+was admitted (rank order). This is the same machinery behind the MCP
+`falda_recall` tool — HTTP callers get one extra field, `total_chars`, that
+the MCP tool folds into `truncated` instead.
+
+`recall_id` identifies this specific invocation for later usage feedback
+(see "Recall traces" below). It is **best-effort**: if trace persistence
+fails for any reason, `recall_id` is simply omitted from the response —
+the recall itself always succeeds or fails independently of telemetry.
+
+## Recall traces
+
+Telemetry attached to a prior `/recall` call — never memory mutation. See
+`docs/RECALL_TRACES.md` for the full model (schema, usage-state machine,
+retention, evaluation queries). Not exposed as an MCP tool: usage
+reporting is a harness/runtime responsibility, not something a model
+should be prompted to call after every recall.
+
+### `POST /recall/usage`
+```json
+{
+  "recall_id": "...",
+  "used":   [{ "tier": "T1", "id": "atom-123" }],
+  "unused": [{ "tier": "T2", "id": "scene-88" }]
+}
+```
+→ `{ "updated": [{tier,id}], "unchanged": [{tier,id}] }`
+
+Both `used` and `unused` are optional — report only what you know.
+Anything not listed keeps its current state (`unknown` if never reported).
+Transitions: `unknown → used` and `unknown → unused` are always allowed;
+re-reporting the same state is an idempotent no-op; a request that
+contradicts an item's already-stored terminal state (`used → unused` or
+vice versa), or that lists the same item in both `used` and `unused` in
+one call, is rejected with `409` and **no items in that call are changed**.
+An unrecognized `{tier,id}` (not part of this recall) → `400`. A
+`recall_id` that doesn't exist, or belongs to a different tenant/pool, →
+`404` (no existence oracle — the two cases are indistinguishable).
+
+### `POST /recalls/get`
+```json
+{ "recall_id": "..." }
+```
+→
+```json
+{
+  "recall_id": "...", "query": "...", "policy_snapshot": {...},
+  "requested_budget": 6000, "used_budget": 4210, "created_at": "...",
+  "items": [
+    { "tier": "T1", "id": "atom-123", "rank": 0, "source": "pinned", "score": null, "chars": 88, "usage": "used" }
+  ]
+}
+```
+Single-trace inspection — admin/debug, not part of the compact MCP surface.
+Ownership-scoped like `/distill/status`; `404` for missing or cross-store ids.
+
+### `POST /recalls/metrics`
+```json
+{}
+```
+→ `RecallMetrics` for the caller's own store_key: trace/item counts, usage
+rate by tier (T1/T2/T3) and by `source` (pinned/ranked/scene/core), usage
+rate by rank position, and a `chars.unused_ratio` context-efficiency
+measure. Usage rate is `used / (used + unused)` — items still `unknown`
+(no report received) are excluded from the denominator, since silence is
+not evidence of non-use. See `docs/RECALL_TRACES.md` for the full field
+list and example queries.
+
 ## Distillation
 
 ### `POST /distill`

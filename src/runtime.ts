@@ -29,6 +29,10 @@
  *   FALDA_TOKENS         Path to the token file (default ./falda_tokens.json)
  *   FALDA_MCP_TOKENS     Deprecated fallback for FALDA_TOKENS (warns if used)
  *   FALDA_LLM_*          Distillation LLM client — see src/distill/llm.ts
+ *   FALDA_RECALL_TRACE_RETENTION_DAYS
+ *                        Days to retain recall_traces.db rows before the
+ *                        distillation worker prunes them (default 90; <=0
+ *                        disables pruning — see src/recall/retention.ts).
  */
 import { join as pathJoin } from "node:path";
 import { mkdirSync } from "node:fs";
@@ -38,6 +42,7 @@ import { selectEmbedder, enforceEmbeddingLock } from "./boot.js";
 import { TokenStore, requireTokenFile } from "./mcp_auth.js";
 import { initQueueSchema } from "./distill/queue.js";
 import { makeLLM, type LLMFn } from "./distill/llm.js";
+import { initRecallTraceSchema } from "./recall/schema.js";
 
 export interface RuntimeConfig {
   root?: string;
@@ -52,6 +57,7 @@ export interface FaldaRuntime {
   pools: PoolManager;
   tokenStore: TokenStore;
   queueDb: Database.Database;
+  recallTraceDb: Database.Database;
   llm: LLMFn;
   close(): void;
 }
@@ -97,6 +103,11 @@ export function buildRuntime(cfg: RuntimeConfig = {}): FaldaRuntime {
   queueDb.pragma("busy_timeout = 5000");
   initQueueSchema(queueDb);
 
+  const recallTraceDbPath = pathJoin(root, "recall_traces.db");
+  const recallTraceDb = new Database(recallTraceDbPath);
+  recallTraceDb.pragma("busy_timeout = 5000");
+  initRecallTraceSchema(recallTraceDb);
+
   const llm = makeLLM();
 
   return {
@@ -105,10 +116,12 @@ export function buildRuntime(cfg: RuntimeConfig = {}): FaldaRuntime {
     pools,
     tokenStore,
     queueDb,
+    recallTraceDb,
     llm,
     close() {
       pools.closeAll();
       queueDb.close();
+      recallTraceDb.close();
     },
   };
 }

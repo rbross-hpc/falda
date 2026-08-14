@@ -79,7 +79,7 @@ export function startHttpApi(runtime: FaldaRuntime, port: number): Server {
       try {
         const parsed = body ? JSON.parse(body) : {};
         const { status, body: out } = await handleRequest(
-          runtime.pools, runtime.tokenStore, req.headers, req.url ?? "", parsed, runtime.queueDb,
+          runtime.pools, runtime.tokenStore, req.headers, req.url ?? "", parsed, runtime.queueDb, runtime.recallTraceDb,
         );
         res.writeHead(status, { "content-type": "application/json" });
         res.end(JSON.stringify(out));
@@ -106,7 +106,9 @@ export function startMcp(runtime: FaldaRuntime, port: number, toolset?: ToolsetN
       res.end(JSON.stringify({ error: "not found" }));
       return;
     }
-    handleFaldaMcpRequest(runtime.pools, runtime.tokenStore, req, res, runtime.queueDb, { toolset }).catch((e) => {
+    handleFaldaMcpRequest(runtime.pools, runtime.tokenStore, req, res, runtime.queueDb, {
+      toolset, recallTraceDb: runtime.recallTraceDb,
+    }).catch((e) => {
       console.error("[falda-mcp] fatal:", e);
       if (!res.headersSent) {
         res.writeHead(e instanceof PoolError ? 400 : 500, { "content-type": "application/json" });
@@ -132,7 +134,9 @@ export function serve(opts: ServeOptions = {}): ServeHandle {
 
   const httpServer = startHttpApi(runtime, httpPort);
   const mcpServer = opts.noMcp ? null : startMcp(runtime, mcpPort, opts.mcpToolset);
-  const distiller = startDistiller(runtime.queueDb, runtime.pools, runtime.llm, workerIntervalMs);
+  const distiller = startDistiller(runtime.queueDb, runtime.pools, runtime.llm, workerIntervalMs, {
+    recallTraceDb: runtime.recallTraceDb,
+  });
 
   return {
     runtime,

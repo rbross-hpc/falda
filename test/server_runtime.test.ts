@@ -53,12 +53,13 @@ function cleanupRuntime(runtime: FaldaRuntime, root: string) {
 // ─── 1. buildRuntime: single shared resources ─────────────────────────────────
 
 describe("buildRuntime", () => {
-  test("builds one PoolManager, one queueDb, one LLM client, one TokenStore", () => {
+  test("builds one PoolManager, one queueDb, one recallTraceDb, one LLM client, one TokenStore", () => {
     const { runtime, root } = makeTestRuntime();
     try {
       assert.ok(runtime.pools, "pools present");
       assert.ok(runtime.tokenStore, "tokenStore present");
       assert.ok(runtime.queueDb, "queueDb present");
+      assert.ok(runtime.recallTraceDb, "recallTraceDb present");
       assert.equal(typeof runtime.llm, "function", "llm is a callable client");
       // Identity check: calling buildRuntime again produces distinct instances
       // (proving each call is a fresh, independent bootstrap — no hidden
@@ -72,6 +73,7 @@ describe("buildRuntime", () => {
     try {
       assert.notEqual(a.runtime.pools, b.runtime.pools);
       assert.notEqual(a.runtime.queueDb, b.runtime.queueDb);
+      assert.notEqual(a.runtime.recallTraceDb, b.runtime.recallTraceDb);
     } finally {
       cleanupRuntime(a.runtime, a.root);
       cleanupRuntime(b.runtime, b.root);
@@ -137,6 +139,26 @@ describe("HTTP and MCP share one runtime", () => {
       parsed.items.some((i: any) => i.content.includes("unified runtime")),
       "the specific atom is present",
     );
+  });
+
+  test("POST /recall persists a recall trace against the shared runtime's recallTraceDb", async () => {
+    await handleRequest(
+      runtime.pools, runtime.tokenStore,
+      { authorization: "Bearer tok-shared", "x-falda-tenant": "proj-x" },
+      "/atoms/upsert", { type: "fact", content: "unified server recall trace target" }, runtime.queueDb,
+    );
+    const recallRes = await handleRequest(
+      runtime.pools, runtime.tokenStore,
+      { authorization: "Bearer tok-shared", "x-falda-tenant": "proj-x" },
+      "/recall", { query: "unified server recall trace target" }, runtime.queueDb, runtime.recallTraceDb,
+    );
+    assert.equal(recallRes.status, 200);
+    assert.ok(recallRes.body.recall_id);
+
+    const { getRecallTraceAuthorized } = await import("../src/recall/traces.js");
+    const trace = getRecallTraceAuthorized(runtime.recallTraceDb, recallRes.body.recall_id, "proj-x:self");
+    assert.ok(trace, "trace persisted against the runtime's own recallTraceDb");
+    assert.equal(trace!.query, "unified server recall trace target");
   });
 
   test("both surfaces authenticate against the same TokenStore", async () => {

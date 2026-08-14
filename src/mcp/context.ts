@@ -15,6 +15,7 @@ export interface ToolDeps {
   pools: PoolManager;
   tokenStore: TokenStore;
   queueDb?: import("better-sqlite3").Database;
+  recallTraceDb?: import("better-sqlite3").Database;
 }
 
 export const poolArg = z.string().optional().describe(

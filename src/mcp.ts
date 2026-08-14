@@ -31,7 +31,9 @@ if (IS_MAIN) {
       res.end(JSON.stringify({ error: "not found" }));
       return;
     }
-    handleFaldaMcpRequest(runtime.pools, runtime.tokenStore, req, res, runtime.queueDb).catch((e) => {
+    handleFaldaMcpRequest(runtime.pools, runtime.tokenStore, req, res, runtime.queueDb, {
+      recallTraceDb: runtime.recallTraceDb,
+    }).catch((e) => {
       console.error("[falda-mcp] fatal:", e);
       if (!res.headersSent) {
         res.writeHead(e instanceof PoolError ? 400 : 500, { "content-type": "application/json" });
