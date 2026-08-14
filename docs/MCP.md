@@ -5,39 +5,51 @@ server exposing FALDA's recall + write tools to any MCP client (opencode and
 others) over a network — for deployments where **one FALDA instance serves
 many agents**, potentially each working across several projects.
 
-For the JSON/HTTP gateway (a lower-level surface with the same bearer-token
+For the JSON/HTTP surface (a lower-level surface with the same bearer-token
 auth model, typically run on a trusted loopback/tailnet), see `docs/API.md`.
 
-## Why a separate server from the gateway
+## One process, two protocol surfaces
 
-Both the gateway (`src/gateway.ts`) and this MCP server share the same
-`TokenStore`/`Principal` auth model (`src/mcp_auth.ts`) and both require
-`Authorization: Bearer <token>` + `X-Falda-Tenant` on every request except
-`GET /healthz`. The MCP server exists as a separate process because it speaks
-the MCP protocol (Streamable HTTP, tool schemas) for MCP clients like
-opencode, while the gateway is a small JSON/HTTP surface for direct
-programmatic callers — same auth story, different
-transport and tool surface (the gateway also exposes pool-admin routes the
-MCP server intentionally omits, see "Tools" below).
+`falda serve` runs the MCP endpoint and the JSON/HTTP API in one process,
+against one shared runtime (`src/runtime.ts`): one `PoolManager`, one
+`TokenStore`, one distillation queue, one distillation worker. Both
+surfaces share the same `TokenStore`/`Principal` auth model
+(`src/mcp_auth.ts`) and both require `Authorization: Bearer <token>` +
+`X-Falda-Tenant` on every request except `GET /healthz` — but each is its
+own listener (separate ports) and its own protocol adapter with its own
+allowed operations: MCP speaks the MCP protocol (Streamable HTTP, tool
+schemas) and intentionally exposes only the restricted agent-facing tool
+set below; the HTTP API additionally exposes pool-admin routes MCP omits
+by design. Merging the daemon does not merge or broaden either surface's
+capabilities.
+
+A standalone `falda mcp` (MCP only, `src/mcp.ts`'s own entry point) remains
+available for compatibility, but it starts no distillation worker — nothing
+drains the shared queue unless some other process (`falda serve` or `falda
+gateway`) owns it. Prefer `falda serve` for new deployments.
 
 ## Run it
 
 ```bash
-cp falda_mcp_tokens.example.json falda_mcp_tokens.json
+cp falda_tokens.example.json falda_tokens.json
 # fill in real tokens (openssl rand -hex 24), each with a tenants[] allow-list
+# this file is canonical — shared by the HTTP API and the MCP endpoint
 
 FALDA_ROOT=~/.falda/data \
-FALDA_MCP_PORT=8079 \
-FALDA_MCP_TOKENS=./falda_mcp_tokens.json \
+FALDA_TOKENS=./falda_tokens.json \
 FALDA_EMBED=local \
-node --import tsx src/mcp.ts
-# or: npm run mcp
+node --import tsx src/server.ts
+# or: npm run serve
 
+curl -s localhost:8077/healthz   # HTTP API
 curl -s localhost:8079/healthz   # {"ok":true,"mcp":true}
 ```
 
 MCP endpoint: `POST/GET/DELETE http://<host>:8079/mcp` (Streamable HTTP
-transport, stateless — a fresh session per connection).
+transport, stateless — a fresh session per connection). Standalone
+(`falda mcp` / `node dist/mcp.js`) still works and still honors
+`FALDA_MCP_PORT` (default `8079`), for existing deployments that haven't
+migrated to `falda serve`.
 
 ## Auth model
 
@@ -129,19 +141,25 @@ connection actually addresses (e.g. after changing a project's
 
 **T2 Scenes and T3 Core are intentionally read-only over MCP for agents.**
 Those tiers are populated by the in-process distillation pipeline (triggered
-via `falda_distill` / `POST /distill` / an interval timer inside the
-gateway), not by freehand agent edits. Pool administration
-(`/pools/declare`, `/pools/grant`, ...) is likewise **not** exposed over
-MCP — use the gateway's `/pools/*` routes from an internal/admin context.
+via `falda_distill` / `POST /distill` / an interval timer inside
+`falda serve`, and always drained by that same process's worker — see
+`docs/API.md` "Distillation"), not by freehand agent edits. Pool
+administration (`/pools/declare`, `/pools/grant`, ...) is likewise **not**
+exposed over MCP — use the HTTP API's `/pools/*` routes from an
+internal/admin context.
 
 ## Environment
+
+See `src/runtime.ts` for the full canonical config (shared with the HTTP
+API when run via `falda serve`). MCP-specific:
 
 | var | meaning | default |
 |---|---|---|
 | `FALDA_MCP_PORT` | port to listen on | `8079` |
-| `FALDA_ROOT` | pool root dir (shared with the gateway) | `./falda-data` |
-| `FALDA_MCP_TOKENS` | path to token file | `./falda_mcp_tokens.json` |
-| `FALDA_DIM` / `FALDA_EMBED*` | as in the gateway | — |
+| `FALDA_ROOT` | pool root dir (shared with the HTTP API) | `./falda-data` |
+| `FALDA_TOKENS` | canonical token file, shared by HTTP and MCP | `./falda_tokens.json` |
+| `FALDA_MCP_TOKENS` | **deprecated** fallback for `FALDA_TOKENS`, honored with a startup warning for the standalone `falda mcp` entry point only | — |
+| `FALDA_DIM` / `FALDA_EMBED*` | embedder selection, as in the HTTP API | — |
 
 ## opencode integration
 

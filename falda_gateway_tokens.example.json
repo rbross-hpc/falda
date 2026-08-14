@@ -1,5 +1,5 @@
 {
-  "_comment": "Gateway bearer tokens — same shape/semantics as falda_mcp_tokens.example.json (see docs/API.md 'Authentication' and docs/MCP.md 'Auth model'). Copy to falda_gateway_tokens.json, replace the placeholder tokens (openssl rand -hex 24), and point FALDA_TOKENS at it. Pool-admin routes (/pools/*) require a tenants: [\"*\"] token.",
+  "_comment": "DEPRECATED: prefer falda_tokens.example.json (the canonical file, shared by HTTP and MCP when run via `falda serve`). This file remains only for the standalone `falda gateway` legacy entry point. Same shape/semantics — see docs/API.md 'Authentication' and docs/MCP.md 'Auth model'. Copy to falda_gateway_tokens.json, replace the placeholder tokens (openssl rand -hex 24), and point FALDA_TOKENS at it. Pool-admin routes (/pools/*) require a tenants: [\"*\"] token.",
   "tokens": {
     "REPLACE_WITH_openssl_rand_hex_24": {
       "tenants": ["proj-a", "proj-b"],

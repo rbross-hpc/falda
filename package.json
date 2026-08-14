@@ -14,6 +14,7 @@
   },
   "bin": {
     "falda": "bin/falda",
+    "falda-serve": "dist/server.js",
     "falda-gateway": "dist/gateway.js",
     "falda-mcp": "dist/mcp.js"
   },
@@ -28,6 +29,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "tsx --test test/*.test.ts",
+    "serve": "tsx src/server.ts",
     "gateway": "tsx src/gateway.ts",
     "mcp": "tsx src/mcp.ts",
     "example": "tsx examples/basic.ts",
