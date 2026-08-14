@@ -102,7 +102,7 @@ the same shared open-model inference tier the rest of the lab already runs.
 1. **Phase 1 — Store pool + sharding.** Lazy per-agent DBs, LRU eviction, deterministic agent→shard mapping. *Unblocks 100s of agents on one node.*
 2. **Phase 2 — Gateway fleet + router.** K stateless replicas, consistent-hash routing, health checks. *Unblocks 1,000s across a few nodes.*
 3. **Phase 3 — Embedding tier.** Batched GPU embedding service + queue. *Removes the write-path embed bottleneck.*
-4. **Phase 4 — Pipeline workers.** Async T0→T1→T2 distillation off the hot path. *Keeps memory quality high without blocking writes.*
+4. **Phase 4 — Pipeline workers.** Async T0→T1→T2→T3 distillation off the hot path via the in-process gateway background worker and per-store job queue (`src/distill/queue.ts`, `src/distill/core.ts`). *Delivered.* *Keeps memory quality high without blocking writes.*
 5. **Phase 5 — ANN + aggregation.** Per-hot-agent ANN index, cross-agent rollups, federation across collections. *Handles the largest individual agents and multi-collection deployments.*
 
 ---
@@ -182,7 +182,20 @@ comparison. Plan GPU first, fast disk second, CPU last.
 
 ---
 
-## 6. Summary
+## 6. Known scale risk: T3 core-synthesis prompt growth
+
+The in-process L3 core synthesis (`src/distill/core.ts`) reads **all** active
+scenes and their member atoms to construct the core-synthesis prompt. This means
+the prompt grows linearly as a store accumulates scenes — there is no current
+bound. For stores with many scenes this will eventually exceed context-window
+limits of the LLM and fail. This is a known, accepted limitation noted in
+`docs/MODEL.md` §8.4. Future options include ranking/selecting a token-bounded
+subset of scenes (recency/size-weighted) or an intermediate rollup tier. Neither
+is implemented; both are deferred.
+
+---
+
+## 7. Summary
 
 Getting FALDA from one agent to thousands is four moves — **store pool +
 sharding, a stateless gateway fleet, a batched embedding tier, and async pipeline

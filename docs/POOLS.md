@@ -149,8 +149,12 @@ exactly the old data.
 ## What this contract does NOT yet include (next deltas)
 
 - **Cross-pool union recall** (`/recall/union`) — explicit multi-target fan-out.
-- **Pool-scoped distillation** — the distiller currently runs per single store;
-  a pool with shared T0 should distill into shared T1/T2/T3 under a named owner.
+- **Cross-tenant pool distillation** — the in-process distillation pipeline
+  (see `docs/MODEL.md` §2, §13) currently distills `self` stores only. Distilling
+  a shared pool raises an open question: whose LLM/embedder credentials run the
+  pool's worker, and how does a pool turn's contributing tenant get attributed in
+  provenance? These are explicitly deferred until the session-lifecycle table
+  lands (§13).
 - **Audit log** of pool writes (who wrote what, when) for shared-pool governance.
 - **Quota / retention** per pool.
 

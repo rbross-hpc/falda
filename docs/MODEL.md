@@ -1,6 +1,6 @@
 # FALDA Data Model — Concepts
 
-Status: **design doc, v4.** Describes the target data model after aligning
+Status: **shipped.** Describes the FALDA data model as implemented.
 FALDA's memory model with [`shinzui/kioku`](https://github.com/shinzui/kioku)
 (see that repo's `docs/user/concepts.md`, `docs/user/distillation.md`,
 `docs/user/recall.md`) — and after three rounds of design review. The first
@@ -20,12 +20,11 @@ inconsistency (§3.3), defines the T2/T3 content hashes precisely (§6.1,
 private cross-tier context-assembly function forward into Branch B so the
 model can be evaluated as a whole, not just atom-by-atom (§8.9, §13).
 
-Parts of this doc describe the *current* shipped model (`src/falda.ts`,
-`src/pools.ts`); parts describe the *target* model §14's implementation plan
-builds. Each section says which. A few points are explicitly **not yet
-resolved** — see §13 — because they need empirical work (a retrieval eval
-set) or further design (context assembly, erasure) before they can be
-pinned.
+This doc describes the FALDA data model as shipped in `src/falda.ts`,
+`src/pools.ts`, `src/distill/`, and related files. A few points are
+explicitly **not yet resolved** — see §13 — because they need empirical work
+(a retrieval eval set) or further design (context assembly, erasure) before
+they can be pinned.
 
 This page is the mental model behind FALDA. Read it once; the rest of the
 codebase and docs assume it.
@@ -143,7 +142,7 @@ provenance (§5) attributes a pool turn to the tenant that contributed it.
 
 ## 3. Memory (T1 Atom)
 
-*(Target model — see §14 Branch A.)*
+*(Implemented — `src/falda.ts`.)**
 
 An atom is one durable thing an agent has learned.
 
@@ -172,7 +171,7 @@ An atom is one durable thing an agent has learned.
 
 Adopted verbatim from kioku, replacing FALDA's three prior divergent
 vocabularies (the shipped MCP enum, the Python sidecar's, and
-`src/distiller.ts`'s — see §12 for the mapping). `type` outside this set is
+the now-deleted `src/distiller.ts` — see §12 for the mapping). `type` outside this set is
 **rejected**, not silently coerced.
 
 ### 3.2 Priority, confidence, and pinning
@@ -313,7 +312,7 @@ path.
 
 ## 4. Evidence (T0 Stream)
 
-*(§4.1 is current; §4.2 is target — see §14 Branch A.)*
+*(Implemented — `src/falda.ts`.)**
 
 ### 4.1 Current fields
 
@@ -368,7 +367,7 @@ delegation/continuation lineage between sessions, and per-turn tool-summary
 
 ## 5. Provenance: the atom → evidence edge
 
-*(New — target model, see §14 Branch A/B.)* This section did not exist in
+*(Implemented in `src/falda.ts` and `src/distill/core.ts`.)* This section did not exist in
 the first version of this doc. T1 atoms carry `type`, `content`,
 `background`, `priority`, `confidence`, `status`, `tags`, and supersession
 — but nothing that says *what evidence supports this specific memory*. The
@@ -455,7 +454,7 @@ membership many-to-many rather than to constrain provenance union.
 
 ## 6. Scenes (T2): the organizational layer
 
-*(New / substantially revised — target model, see §14 Branch A/B.)* This is
+*(Implemented in `src/falda.ts`.)** This is
 the largest structural change from the first version of this doc, in two
 stages. The first stage replaced one path-addressed markdown blob per store
 with a set of clustered summaries. That was progress, but it was still a
@@ -519,7 +518,7 @@ succeeds and the row remains the source of truth.
 The previous path-addressed scene API
 (`/scenes/{ls,read,write,rm}` keyed by a file `path`) is **replaced**, not
 extended, by an id-addressed entity API — this is a deliberate breaking
-change (§14 Branch A), on the grounds that the T2 surface was read-only for
+change, on the grounds that the T2 surface was read-only for
 agents and lightly used, so a clean break now is cheaper than carrying two
 addressing schemes forward.
 
@@ -678,7 +677,7 @@ version of exactly that assembly, pulled forward into Branch B.
 
 ## 7. Recall
 
-*(Target model — see §14 Branch A. FALDA already has hybrid FTS+vector+RRF;
+*(Implemented in `src/falda.ts`. FALDA has hybrid FTS+vector+RRF;
 everything past fusion below is new, and — per design review — explicitly
 **not frozen**; see §7.2's caveat.)*
 
@@ -769,9 +768,8 @@ not a silent truncation the caller can't see.
 
 ## 8. The distillation pipeline (T0 → T3)
 
-*(Target model — see §14 Branches A and B. Today, promotion is done by two
-divergent external scripts, `falda_distiller.py` and `src/distiller.ts`,
-both hard-deleted by this plan, §14 Branch C.)*
+*(Implemented in `src/distill/core.ts`. The two prior external distillers,
+`falda_distiller.py` and `src/distiller.ts`, have been hard-deleted.)*
 
 Raw evidence is noisy. Distillation refines it upward, one tier at a time,
 per store (§2).
@@ -978,8 +976,7 @@ public API.
 
 ## 9. Forgetting vs. erasure
 
-*(New — specified now, only the first half implemented initially; see §14
-Branch A/B and §13.)* "Forgetting propagates" (§3.3, §8.7) is correct as a
+*(Logical forgetting is implemented; erasure is specified but not yet built — see §13.)* "Forgetting propagates" (§3.3, §8.7) is correct as a
 statement about **recall**, but it is not the same claim as **data
 deletion**, and the model needs to say so explicitly rather than let the
 word "forget" carry an implicit privacy guarantee it doesn't (yet) keep.
@@ -1078,7 +1075,7 @@ is deliberate and stated, not an oversight either — see the table above.
 ## 13. Open questions and explicitly deferred work
 
 Carried forward rather than silently dropped. None of these block Branch A
-(§14); several should inform later branches or a dedicated design pass.
+(§13); several should inform a future design pass.
 
 **Deferred by design, revisit later:**
 - Cross-tenant **pool distillation** (§2): whose credentials run a shared
@@ -1107,7 +1104,7 @@ Carried forward rather than silently dropped. None of these block Branch A
 - A **public**, budget-assembled **cross-tier context** endpoint (pinned +
   ranked atoms + relevant scenes in one call, §6.5) — per-tier search tools
   ship first. A **private, evaluation-only** version of this assembly is no
-  longer deferred: it lands in Branch B (§8.9, §14) specifically to make
+  longer deferred: it is implemented in `src/distill/context.ts` specifically to make
   the retrieval eval set meaningful before any public surface is designed.
 - **Per-turn** (rather than window-level) provenance attribution (§5.2).
 - T3's **unbounded scene-set token growth** (§8.4) — noted as a scale risk,
@@ -1128,14 +1125,4 @@ Carried forward rather than silently dropped. None of these block Branch A
   scales before combining (§7.2) — an option, not a decision.
 - The consolidation candidate limit and per-pass cost ceiling (§8.2) are
   provisional; the right values depend on observed atom volumes per store.
-
-## 14. Phased implementation plan
-
-> **Status: temporary.** See top-level `PLAN.md` for the fleshed-out,
-> sequenced branch plan (Branch 0 test-infra migration, then Branches 1–3
-> covering schema, distillation, and retirement/docs) that implements
-> everything above. This section is a pointer, not a duplicate — `PLAN.md`
-> is deleted, and this section removed, once all branches have landed and
-> the model described above is the shipped system rather than a plan for
-> one.
 
