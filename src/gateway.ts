@@ -63,10 +63,18 @@
  *   FALDA_DIM          Embedding dimensionality (default 768).
  */
 import { createServer } from "node:http";
+import { join as pathJoin } from "node:path";
+import { mkdirSync } from "node:fs";
+import Database from "better-sqlite3";
 import { PoolManager, PoolError } from "./pools.js";
 import { selectEmbedder, enforceEmbeddingLock } from "./boot.js";
 import { TokenStore, AuthError, parseBearer, requireTokenFile, type Principal } from "./mcp_auth.js";
 import { StreamConflictError, AtomImmutabilityError, AtomTypeError } from "./falda.js";
+import { initQueueSchema, enqueue, claimNext, completeJob, failJob, getJob } from "./distill/queue.js";
+import { distillOnce } from "./distill/core.js";
+
+/** Module-level gateway queue database (set when IS_MAIN). */
+let gatewayQueueDb: Database.Database | null = null;
 
 /** Routes that mutate the addressed store (need readwrite on a shared pool). */
 const WRITE_ROUTES = new Set([
@@ -117,6 +125,19 @@ async function handleData(pools: PoolManager, principal: Principal, headers: Hea
     case "/scenes/for-atom": return { items: store.scenesForAtom(b.atom_id, b.scene_kind) };
     case "/core/read":       return { content: store.readCore() };
     case "/core/write":      return (store.writeCore(b.content ?? ""), { ok: true });
+    case "/distill": {
+      // Enqueue a distillation job. Queue db is the gateway-level queue db (passed via closure).
+      // The body may optionally specify a store_key; otherwise derived from tenant+pool.
+      const storeKey = b.store_key ?? `${tenant}:${pool ?? "self"}`;
+      if (!gatewayQueueDb) return { error: "distillation queue not initialized" };
+      const jobId = enqueue(gatewayQueueDb, storeKey);
+      return { job_id: jobId, store_key: storeKey };
+    }
+    case "/distill/status": {
+      if (!gatewayQueueDb) return { error: "distillation queue not initialized" };
+      const job = getJob(gatewayQueueDb, b.job_id);
+      return job ?? { error: "job not found" };
+    }
     default: return undefined;
   }
 }
@@ -180,18 +201,69 @@ export async function handleRequest(
   }
 }
 
+/** Start the in-process background distillation worker. Drains the queue
+ *  by calling distillOnce() directly against the store via PoolManager.
+ *  Only distills 'self' stores in this initial implementation (§2, §13). */
+function startWorker(
+  queueDb: Database.Database,
+  pools: PoolManager,
+  llm: (prompt: string) => Promise<string>,
+  intervalMs = 60_000,
+) {
+  const tick = async () => {
+    const job = claimNext(queueDb);
+    if (!job) return;
+    const [tenant, poolName] = job.store_key.split(":", 2);
+    try {
+      const store = pools.resolve(tenant, poolName === "self" ? undefined : poolName, true);
+      await distillOnce(store, llm, { storeKey: job.store_key, verbose: false });
+      completeJob(queueDb, job.id);
+    } catch (e: any) {
+      failJob(queueDb, job.id, String(e?.message ?? e));
+    }
+  };
+  setInterval(() => { tick().catch(console.error); }, intervalMs);
+  // Also self-enqueue an interval trigger for self stores (operator enqueues, or timer fires).
+  setInterval(() => {
+    // Placeholder: actual tenant enumeration comes when pool distillation lands (§13).
+  }, intervalMs * 5);
+}
+
 const IS_MAIN = process.argv[1]?.endsWith("gateway.js") || process.argv[1]?.endsWith("gateway.ts");
 if (IS_MAIN) {
   const PORT = Number(process.env.FALDA_PORT ?? 8077);
   const DIM = Number(process.env.FALDA_DIM ?? 768);
   const ROOT = process.env.FALDA_ROOT ?? "./falda-data";
   const TOKENS_PATH = process.env.FALDA_TOKENS ?? "./falda_gateway_tokens.json";
+  const WORKER_INTERVAL_MS = Number(process.env.FALDA_WORKER_INTERVAL_MS ?? 60_000);
+  const LLM_BASE = process.env.FALDA_LLM_BASE_URL ?? "http://localhost:11434/v1";
+  const LLM_KEY = process.env.FALDA_LLM_API_KEY ?? "x";
+  const LLM_MODEL = process.env.FALDA_LLM_MODEL ?? "gpt-4o-mini";
 
   enforceEmbeddingLock(ROOT, DIM, "FALDA gateway");
   requireTokenFile(TOKENS_PATH, "FALDA gateway");
 
   const pools = new PoolManager({ root: ROOT, embed: selectEmbedder(DIM, "FALDA gateway"), dim: DIM });
   const tokenStore = new TokenStore(TOKENS_PATH);
+
+  // Gateway-level queue db (separate from per-store dbs).
+  const queueDbPath = pathJoin(ROOT, "distill_queue.db");
+  mkdirSync(ROOT, { recursive: true });
+  gatewayQueueDb = new Database(queueDbPath);
+  initQueueSchema(gatewayQueueDb);
+
+  const llm = async (prompt: string): Promise<string> => {
+    const resp = await fetch(`${LLM_BASE}/chat/completions`, {
+      method: "POST",
+      headers: { "content-type": "application/json", authorization: `Bearer ${LLM_KEY}` },
+      body: JSON.stringify({ model: LLM_MODEL, messages: [{ role: "user", content: prompt }], temperature: 0 }),
+    });
+    if (!resp.ok) throw new Error(`LLM ${resp.status}: ${await resp.text()}`);
+    const j = (await resp.json()) as any;
+    return j.choices[0].message.content as string;
+  };
+
+  startWorker(gatewayQueueDb, pools, llm, WORKER_INTERVAL_MS);
 
   createServer((req, res) => {
     if (req.method === "GET" && req.url === "/healthz") {
