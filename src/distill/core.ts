@@ -32,8 +32,18 @@ export interface DistillOptions {
   storeKey?: string;
   windowSize?: number;
   candidateLimit?: number;
-  matchThreshold?: number;
-  reorgThreshold?: number;
+  /** Cosine-similarity threshold for assigning an atom to a topic cluster.
+   *  Controls how similar an atom must be to a cluster's founding centroid
+   *  to be considered part of that topic. */
+  topicSimilarityThreshold?: number;
+  /** Jaccard-overlap threshold for matching a freshly derived cluster to an
+   *  existing topic scene (preserves scene identity across passes).
+   *  Statistically distinct from topicSimilarityThreshold — 0.5 Jaccard
+   *  and 0.5 cosine happen to share a number but mean different things. */
+  sceneMatchThreshold?: number;
+  /** Jaccard-churn threshold above which an existing topic scene is retired
+   *  and a new one created (reorganization). */
+  sceneReorgThreshold?: number;
   verbose?: boolean;
 }
 
@@ -50,8 +60,9 @@ export interface DistillResult {
 
 const DEFAULT_WINDOW_SIZE = 20;
 const DEFAULT_CANDIDATE_LIMIT = 8;
-const DEFAULT_MATCH_THRESHOLD = 0.5;
-const DEFAULT_REORG_THRESHOLD = 0.7;
+const DEFAULT_TOPIC_SIMILARITY_THRESHOLD = 0.5;
+const DEFAULT_SCENE_MATCH_THRESHOLD = 0.5;
+const DEFAULT_SCENE_REORG_THRESHOLD = 0.7;
 
 // ─── LLM response parsers ─────────────────────────────────────────────────────
 
@@ -142,20 +153,26 @@ function cosineSimilarity(a: number[], b: number[]): number {
 
 interface AtomVec { id: string; vec: number[] }
 
-function clusterAtoms(atoms: AtomVec[], matchThreshold: number): Map<string, string[]> {
+/**
+ * Greedy centroid clustering: atoms are assigned to the cluster whose founding
+ * atom has the highest cosine similarity above topicSimilarityThreshold.
+ * Input must be sorted deterministically (by id) to ensure insertion-order
+ * independence — callers must guarantee this.
+ */
+function clusterAtoms(atoms: AtomVec[], topicSimilarityThreshold: number): Map<string, string[]> {
   const clusters = new Map<string, string[]>();
   const assigned = new Map<string, string>();
 
   for (const atom of atoms) {
     let bestCluster: string | null = null;
     let bestSim = -1;
-    for (const [centroidId, members] of clusters) {
+    for (const [centroidId] of clusters) {
       const centroidAtom = atoms.find((a) => a.id === centroidId);
       if (!centroidAtom) continue;
       const sim = cosineSimilarity(atom.vec, centroidAtom.vec);
       if (sim > bestSim) { bestSim = sim; bestCluster = centroidId; }
     }
-    if (bestCluster && bestSim >= matchThreshold) {
+    if (bestCluster && bestSim >= topicSimilarityThreshold) {
       clusters.get(bestCluster)!.push(atom.id);
       assigned.set(atom.id, bestCluster);
     } else {
@@ -176,8 +193,9 @@ export async function distillOnce(
   const storeKey = opts.storeKey ?? "default";
   const windowSize = opts.windowSize ?? DEFAULT_WINDOW_SIZE;
   const candidateLimit = opts.candidateLimit ?? DEFAULT_CANDIDATE_LIMIT;
-  const matchThreshold = opts.matchThreshold ?? DEFAULT_MATCH_THRESHOLD;
-  const reorgThreshold = opts.reorgThreshold ?? DEFAULT_REORG_THRESHOLD;
+  const topicSimilarityThreshold = opts.topicSimilarityThreshold ?? DEFAULT_TOPIC_SIMILARITY_THRESHOLD;
+  const sceneMatchThreshold = opts.sceneMatchThreshold ?? DEFAULT_SCENE_MATCH_THRESHOLD;
+  const sceneReorgThreshold = opts.sceneReorgThreshold ?? DEFAULT_SCENE_REORG_THRESHOLD;
   const verbose = opts.verbose ?? false;
   const log = verbose ? console.log : () => {};
 
@@ -400,8 +418,9 @@ export async function distillOnce(
   }
 
   // Topic scenes: embedding clustering + hysteresis reconciliation.
+  // ORDER BY id ensures deterministic clustering regardless of DB insertion order.
   const allAtomRows = db.prepare(
-    "SELECT id FROM atoms WHERE status='active'"
+    "SELECT id FROM atoms WHERE status='active' ORDER BY id"
   ).all() as Array<{ id: string }>;
 
   if (allAtomRows.length > 0) {
@@ -417,7 +436,7 @@ export async function distillOnce(
       }
     }
 
-    const clusters = clusterAtoms(atomVecs, matchThreshold);
+    const clusters = clusterAtoms(atomVecs, topicSimilarityThreshold);
 
     // Get existing topic scenes.
     const existingTopics = db.prepare(
@@ -439,7 +458,7 @@ export async function distillOnce(
         if (jaccard > bestOverlap) { bestOverlap = jaccard; bestMatch = et; }
       }
 
-      if (bestMatch && bestOverlap >= matchThreshold) {
+      if (bestMatch && bestOverlap >= sceneMatchThreshold) {
         // Same topic — keep the existing scene_id, just update membership.
         matchedExistingIds.add(bestMatch.scene_id);
         const prevAtoms: string[] = JSON.parse(bestMatch.atom_ids ?? "[]");
@@ -447,7 +466,7 @@ export async function distillOnce(
           + prevAtoms.filter((id) => !memberIds.includes(id)).length;
         const churnFraction = prevAtoms.length > 0 ? churn / prevAtoms.length : 1;
 
-        if (churnFraction < reorgThreshold) {
+        if (churnFraction < sceneReorgThreshold) {
           // Below reorg threshold: update membership, keep scene.
           await store.upsertScene({
             scene_id: bestMatch.scene_id,

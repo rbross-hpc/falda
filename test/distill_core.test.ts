@@ -431,6 +431,85 @@ describe("distillOnce", () => {
       assert.equal(r2.core_regenerated, false, "core NOT regenerated when input structure unchanged");
     } finally { cleanup(s, blobDir); }
   });
+
+  test("topic clustering: topicSimilarityThreshold=0 clusters all atoms together", async () => {
+    const { s, blobDir } = makeStore();
+    try {
+      // Add 3 turns with very different content — at threshold=0 everything clusters into 1.
+      await s.addStream("sess-cluster", [
+        { role: "user", content: "physics kinematics" },
+        { role: "user", content: "biology cell mitosis" },
+        { role: "user", content: "chemistry periodic table" },
+      ]);
+      const llm = async (prompt: string): Promise<string> => {
+        if (prompt.includes('"type"') || prompt.includes("Extract")) {
+          // Return 3 atoms (one per extraction call; extraction is one call for all turns)
+          return [
+            `{"type":"fact","content":"Physics fact.","confidence":"high"}`,
+            `{"type":"fact","content":"Biology fact.","confidence":"high"}`,
+            `{"type":"fact","content":"Chemistry fact.","confidence":"high"}`,
+          ].join("\n");
+        }
+        if (prompt.includes("action") || prompt.includes("consolidat") || prompt.includes("Consolidat")) {
+          return `{"action":"store","target_ids":[],"rationale":"New."}`;
+        }
+        return "Label\nSummary text.";
+      };
+
+      await distillOnce(s, llm, {
+        storeKey: "cluster-zero:self",
+        topicSimilarityThreshold: 0,
+      });
+
+      const db = (s as any).db;
+      const topics = db.prepare(
+        "SELECT * FROM scenes WHERE scene_kind='topic' AND status='active'"
+      ).all() as any[];
+      assert.equal(topics.length, 1, "all atoms cluster into one topic at threshold=0");
+      const members: string[] = JSON.parse((topics[0] as any).atom_ids);
+      assert.equal(members.length, 3, "all 3 atoms in the single cluster");
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("topic clustering: sceneMatchThreshold=0 always matches existing scene", async () => {
+    const { s, blobDir } = makeStore();
+    try {
+      await s.addStream("sess-match", [
+        { role: "user", content: "particle physics" },
+      ]);
+      const llmPass1 = makeMockLLM([
+        `{"type":"fact","content":"Particle physics fact.","confidence":"high"}`,
+        `{"action":"store","target_ids":[],"rationale":"New."}`,
+        "Particle session", "Particle physics discussed.",
+        "Physics topic", "Particle physics.",
+        "# Core\nParticle physics.",
+      ]);
+      await distillOnce(s, llmPass1, { storeKey: "match-test:self" });
+
+      // Add a new turn for pass 2.
+      await s.addStream("sess-match", [{ role: "user", content: "quantum field theory" }]);
+
+      const llmPass2 = makeMockLLM([
+        `{"type":"fact","content":"Quantum field theory.","confidence":"high"}`,
+        `{"action":"store","target_ids":[],"rationale":"New."}`,
+        // L2: episode (membership updated, no title change)
+        "Particle session", "Updated.",
+        // L3: core regenerated
+        "# Core\nParticle + QFT.",
+      ]);
+      // sceneMatchThreshold=0 means any Jaccard overlap ≥ 0 matches existing topic.
+      const r2 = await distillOnce(s, llmPass2, {
+        storeKey: "match-test:self",
+        sceneMatchThreshold: 0,
+      });
+
+      const db = (s as any).db;
+      const topics = db.prepare(
+        "SELECT * FROM scenes WHERE scene_kind='topic' AND status='active'"
+      ).all() as any[];
+      assert.equal(topics.length, 1, "existing topic scene matched and updated, not duplicated");
+    } finally { cleanup(s, blobDir); }
+  });
 });
 
 // ─── 4. assembleContext ────────────────────────────────────────────────────────
