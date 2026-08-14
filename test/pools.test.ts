@@ -10,83 +10,90 @@
  *   5. A readwrite member's write is visible to another (read) member — and ONLY
  *      through the pool, never through either member's private self store.
  */
+import { test, before, after } from "node:test";
+import assert from "node:assert/strict";
 import { PoolManager, PoolError } from "../src/pools.js";
 import { makeLocalEmbedder } from "../src/embedder.js";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-let pass = 0, fail = 0;
-function check(name: string, ok: boolean) {
-  if (ok) { pass++; console.log(`  ok   ${name}`); }
-  else    { fail++; console.log(`  FAIL ${name}`); }
-}
-async function throws(name: string, fn: () => Promise<any> | any, code: string) {
-  try { await fn(); check(`${name} (expected ${code})`, false); }
-  catch (e: any) { check(name, e instanceof PoolError && e.code === code); }
+let root: string;
+let pm: PoolManager;
+
+async function throwsCode(fn: () => Promise<any> | any, code: string) {
+  await assert.rejects(async () => fn(), (e: any) => e instanceof PoolError && e.code === code);
 }
 
-async function main() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "falda-pools-"));
-  const pm = new PoolManager({ root, embed: makeLocalEmbedder(768), dim: 768 });
+before(() => {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), "falda-pools-"));
+  pm = new PoolManager({ root, embed: makeLocalEmbedder(768), dim: 768 });
+});
 
-  // ── 1. Private self isolation ────────────────────────────────────────────
+after(() => {
+  pm.closeAll();
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test("1. private self isolation", async () => {
   const kSelf = pm.resolve("kukla", undefined, true);
   const oSelf = pm.resolve("ollie", undefined, true);
   await kSelf.upsertAtom({ id: "k1", type: "fact", content: "kukla private: OSTI corpus is 278,645 papers." });
   await oSelf.upsertAtom({ id: "o1", type: "fact", content: "ollie private: LUCID-100 is 91 of 91 parsed." });
-  check("1a self stores are distinct objects", kSelf !== oSelf);
-  check("1b kukla self sees only its own atom", pm.resolve("kukla", undefined, false).queryAtoms({}).total === 1);
-  check("1c ollie self sees only its own atom", pm.resolve("ollie", undefined, false).queryAtoms({}).total === 1);
+  assert.notEqual(kSelf, oSelf, "self stores are distinct objects");
+  assert.equal(pm.resolve("kukla", undefined, false).queryAtoms({}).total, 1, "kukla self sees only its own atom");
+  assert.equal(pm.resolve("ollie", undefined, false).queryAtoms({}).total, 1, "ollie self sees only its own atom");
   const kHasO = await pm.resolve("kukla", undefined, false).searchAtoms("LUCID-100 parsed", 5);
-  check("1d kukla self search cannot find ollie private", !kHasO.some((h) => h.id === "o1"));
+  assert.ok(!kHasO.some((h) => h.id === "o1"), "kukla self search cannot find ollie private");
+});
 
-  // ── 2. Sharing is opt-in: undeclared pool errors ─────────────────────────
-  await throws("2a write to undeclared pool errors", () => pm.resolve("kukla", "ghost", true), "no_such_pool");
-  await throws("2b read from undeclared pool errors", () => pm.resolve("kukla", "ghost", false), "no_such_pool");
-  check("2c reserved name 'self' cannot be declared",
-    (() => { try { pm.declarePool("self", {}); return false; } catch (e: any) { return e.code === "reserved"; } })());
+test("2. sharing is opt-in: undeclared pool errors", async () => {
+  await throwsCode(() => pm.resolve("kukla", "ghost", true), "no_such_pool");
+  await throwsCode(() => pm.resolve("kukla", "ghost", false), "no_such_pool");
+  assert.throws(
+    () => pm.declarePool("self", {}),
+    (e: any) => e.code === "reserved",
+    "reserved name 'self' cannot be declared",
+  );
+});
 
-  // ── 3. Declare a shared pool with explicit roster ────────────────────────
+test("3. declare a shared pool with explicit roster", () => {
   const decl = pm.declarePool("corpus", { kukla: "readwrite", ollie: "read" }, "shared corpus facts");
-  check("3a pool declared with members", decl.members.kukla === "readwrite" && decl.members.ollie === "read");
-  check("3b pool appears in kukla's reachable set", pm.poolsForTenant("kukla").some((p) => p.name === "corpus"));
-  check("3c pool appears in ollie's reachable set (read)",
-    pm.poolsForTenant("ollie").some((p) => p.name === "corpus" && p.access === "read"));
-  check("3d non-member sees no reachable pools", pm.poolsForTenant("piago").length === 0);
+  assert.ok(decl.members.kukla === "readwrite" && decl.members.ollie === "read", "pool declared with members");
+  assert.ok(pm.poolsForTenant("kukla").some((p) => p.name === "corpus"), "pool appears in kukla's reachable set");
+  assert.ok(
+    pm.poolsForTenant("ollie").some((p) => p.name === "corpus" && p.access === "read"),
+    "pool appears in ollie's reachable set (read)",
+  );
+  assert.equal(pm.poolsForTenant("piago").length, 0, "non-member sees no reachable pools");
+});
 
-  // ── 4. Access enforcement ────────────────────────────────────────────────
-  await throws("4a non-member denied", () => pm.resolve("piago", "corpus", false), "not_a_member");
-  await throws("4b read-only member denied write", () => pm.resolve("ollie", "corpus", true), "read_only");
+test("4. access enforcement", async () => {
+  await throwsCode(() => pm.resolve("piago", "corpus", false), "not_a_member");
+  await throwsCode(() => pm.resolve("ollie", "corpus", true), "read_only");
+});
 
-  // ── 5. Shared write visible to other member, isolated from self ──────────
+test("5. shared write visible to other member, isolated from self", async () => {
   const kPool = pm.resolve("kukla", "corpus", true);
   await kPool.upsertAtom({ id: "shared1", type: "fact", content: "shared: Genesis Mission has 21 challenge areas." });
-  check("5a readwrite member wrote to pool", pm.resolve("kukla", "corpus", false).queryAtoms({}).total === 1);
+  assert.equal(pm.resolve("kukla", "corpus", false).queryAtoms({}).total, 1, "readwrite member wrote to pool");
   const oPoolView = pm.resolve("ollie", "corpus", false);
-  check("5b read member sees the shared atom", oPoolView.queryAtoms({}).total === 1);
+  assert.equal(oPoolView.queryAtoms({}).total, 1, "read member sees the shared atom");
   const oFind = await oPoolView.searchAtoms("how many challenge areas Genesis", 5);
-  check("5c read member can search the shared atom", oFind.some((h) => h.id === "shared1"));
+  assert.ok(oFind.some((h) => h.id === "shared1"), "read member can search the shared atom");
   // Strict-clean: the shared atom must NOT appear in anyone's private self store.
-  check("5d shared atom absent from kukla self", pm.resolve("kukla", undefined, false).queryAtoms({}).total === 1);
-  check("5e shared atom absent from ollie self", pm.resolve("ollie", undefined, false).queryAtoms({}).total === 1);
+  assert.equal(pm.resolve("kukla", undefined, false).queryAtoms({}).total, 1, "shared atom absent from kukla self");
+  assert.equal(pm.resolve("ollie", undefined, false).queryAtoms({}).total, 1, "shared atom absent from ollie self");
   // And private atoms must NOT appear in the pool.
   const poolIds = pm.resolve("kukla", "corpus", false).queryAtoms({}).items.map((a: any) => a.id);
-  check("5f pool contains only shared atom", poolIds.length === 1 && poolIds[0] === "shared1");
+  assert.ok(poolIds.length === 1 && poolIds[0] === "shared1", "pool contains only shared atom");
+});
 
-  // ── 6. grant() flips access live ─────────────────────────────────────────
+test("6. grant() flips access live", async () => {
   pm.grant("corpus", "ollie", "readwrite");
   const oPoolW = pm.resolve("ollie", "corpus", true); // must not throw now
   await oPoolW.upsertAtom({ id: "shared2", type: "fact", content: "shared: topics 18-21 are cross-cutting platforms." });
-  check("6a granted member can now write", pm.resolve("kukla", "corpus", false).queryAtoms({}).total === 2);
+  assert.equal(pm.resolve("kukla", "corpus", false).queryAtoms({}).total, 2, "granted member can now write");
   pm.grant("corpus", "piago", "none"); // no-op removal, must not throw
-  check("6b revoking a non-member is a safe no-op", pm.getPool("corpus")!.members.piago === undefined);
-
-  pm.closeAll();
-  fs.rmSync(root, { recursive: true, force: true });
-
-  console.log(`\nFALDA pools: ${pass} passed, ${fail} failed`);
-  if (fail) process.exit(1);
-  console.log("POOL SEMANTICS GREEN");
-}
-main().catch((e) => { console.error(e); process.exit(1); });
+  assert.equal(pm.getPool("corpus")!.members.piago, undefined, "revoking a non-member is a safe no-op");
+});

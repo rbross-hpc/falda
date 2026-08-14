@@ -11,6 +11,8 @@
  *   4. A `pool` argument outside the token's `pools` allow-list is denied.
  *   5. Scenes/core write tools are not registered (read-only tiers).
  */
+import { test, before, after } from "node:test";
+import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -21,12 +23,6 @@ import { PoolManager } from "../src/pools.js";
 import { makeLocalEmbedder } from "../src/embedder.js";
 import { TokenStore } from "../src/mcp_auth.js";
 import { handleFaldaMcpRequest } from "../src/mcp.js";
-
-let pass = 0, fail = 0;
-function check(name: string, ok: boolean) {
-  if (ok) { pass++; console.log(`  ok   ${name}`); }
-  else    { fail++; console.log(`  FAIL ${name}`); }
-}
 
 function startTestServer(pools: PoolManager, tokenStore: TokenStore): Promise<{ server: Server; port: number }> {
   return new Promise((resolve) => {
@@ -54,8 +50,14 @@ async function withClient<T>(port: number, token: string, tenant: string, fn: (c
 }
 function textOf(result: any) { return JSON.parse(result.content[0].text); }
 
-async function main() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "falda-mcp-"));
+let root: string;
+let pools: PoolManager;
+let tokenStore: TokenStore;
+let server: Server;
+let port: number;
+
+before(async () => {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), "falda-mcp-"));
   const tokensPath = path.join(root, "tokens.json");
   fs.writeFileSync(tokensPath, JSON.stringify({
     tokens: {
@@ -64,81 +66,89 @@ async function main() {
       "tok-star": { tenants: ["*"], pools: [], label: "star" },
     },
   }));
+  pools = new PoolManager({ root: path.join(root, "data"), embed: makeLocalEmbedder(32), dim: 32 });
+  tokenStore = new TokenStore(tokensPath);
+  ({ server, port } = await startTestServer(pools, tokenStore));
+});
 
-  const pools = new PoolManager({ root: path.join(root, "data"), embed: makeLocalEmbedder(32), dim: 32 });
-  const tokenStore = new TokenStore(tokensPath);
-  const { server, port } = await startTestServer(pools, tokenStore);
-
-  // ── 1. auth ───────────────────────────────────────────────────────────────
-  await withClient(port, "no-such-token", "proj-a", async () => {}).then(
-    () => check("1a unknown token rejected", false),
-    (e) => check("1a unknown token rejected", /unauthorized/.test(String(e))),
-  );
-
-  // ── 2. tenant allow-list ─────────────────────────────────────────────────
-  await withClient(port, "tok-a", "proj-a", async (client) => {
-    const up = await client.callTool({ name: "falda_atoms_upsert", arguments: { content: "cryostat target 4.2K", type: "fact" } });
-    check("2a allowed tenant can upsert", !(up as any).isError);
-  });
-  await withClient(port, "tok-a", "proj-b", async (client) => {
-    const r: any = await client.callTool({ name: "falda_atoms_search", arguments: { query: "x" } });
-    check("2b token denied tenant outside its allow-list", r.isError === true && /not authorized for tenant/.test(r.content[0].text));
-  });
-  await withClient(port, "tok-star", "proj-z", async (client) => {
-    const r: any = await client.callTool({ name: "falda_atoms_search", arguments: { query: "x" } });
-    check("2c wildcard principal may address any tenant", !r.isError);
-  });
-
-  // ── 3. cross-tenant isolation ────────────────────────────────────────────
-  await withClient(port, "tok-b", "proj-b", async (client) => {
-    await client.callTool({ name: "falda_atoms_upsert", arguments: { content: "proj-b secret fact", type: "fact" } });
-    const own = textOf(await client.callTool({ name: "falda_atoms_search", arguments: { query: "secret fact" } }));
-    check("3a proj-b can find its own atom", own.items.some((i: any) => i.content === "proj-b secret fact"));
-  });
-  await withClient(port, "tok-a", "proj-a", async (client) => {
-    const cross = textOf(await client.callTool({ name: "falda_atoms_search", arguments: { query: "secret fact" } }));
-    check("3b proj-a cannot see proj-b's atom", !cross.items.some((i: any) => i.content === "proj-b secret fact"));
-  });
-
-  // ── 4. pool allow-list ───────────────────────────────────────────────────
-  pools.declarePool("shared-corpus", { "proj-b": "readwrite" });
-  await withClient(port, "tok-b", "proj-b", async (client) => {
-    const r: any = await client.callTool({ name: "falda_atoms_search", arguments: { query: "x", pool: "shared-corpus" } });
-    check("4a token with pool in its allow-list may address it", !r.isError);
-  });
-  await withClient(port, "tok-a", "proj-a", async (client) => {
-    const r: any = await client.callTool({ name: "falda_atoms_search", arguments: { query: "x", pool: "shared-corpus" } });
-    check("4b token without pool in its allow-list is denied", r.isError === true && /not authorized for pool/.test(r.content[0].text));
-  });
-
-  // ── 5. scenes/core write tools not registered (checked against real server) ─
-  await withClient(port, "tok-a", "proj-a", async (client) => {
-    const tools = await client.listTools();
-    const names = tools.tools.map((t) => t.name);
-    check("5a no falda_scenes_write tool", !names.includes("falda_scenes_write"));
-    check("5b no falda_scenes_rm tool", !names.includes("falda_scenes_rm"));
-    check("5c no falda_core_write tool", !names.includes("falda_core_write"));
-  });
-
-  // ── 6. falda_whoami: echoes only the resolved tenant, nothing sensitive ────
-  await withClient(port, "tok-a", "proj-a", async (client) => {
-    const who = textOf(await client.callTool({ name: "falda_whoami", arguments: {} }));
-    check("6a whoami reports the resolved tenant", who.tenant === "proj-a");
-    check("6b whoami does not leak the token", !JSON.stringify(who).includes("tok-a"));
-    check("6c whoami does not leak the tenants allow-list", !("tenants" in who));
-    check("6d whoami does not leak the pools allow-list", !("pools" in who));
-  });
-  await withClient(port, "tok-star", "proj-z", async (client) => {
-    const who = textOf(await client.callTool({ name: "falda_whoami", arguments: {} }));
-    check("6e whoami reflects the selected tenant for a wildcard principal", who.tenant === "proj-z");
-  });
-
+after(() => {
   pools.closeAll();
   server.close();
   fs.rmSync(root, { recursive: true, force: true });
+});
 
-  console.log(`\nFALDA MCP: ${pass} passed, ${fail} failed`);
-  if (fail) process.exit(1);
-  console.log("MCP AUTH GREEN");
-}
-main().catch((e) => { console.error(e); process.exit(1); });
+test("1. auth: unknown token rejected", async () => {
+  await assert.rejects(
+    () => withClient(port, "no-such-token", "proj-a", async () => {}),
+    /unauthorized/,
+  );
+});
+
+test("2. tenant allow-list", async () => {
+  await withClient(port, "tok-a", "proj-a", async (client) => {
+    const up = await client.callTool({ name: "falda_atoms_upsert", arguments: { content: "cryostat target 4.2K", type: "fact" } });
+    assert.ok(!(up as any).isError, "allowed tenant can upsert");
+  });
+  await withClient(port, "tok-a", "proj-b", async (client) => {
+    const r: any = await client.callTool({ name: "falda_atoms_search", arguments: { query: "x" } });
+    assert.ok(
+      r.isError === true && /not authorized for tenant/.test(r.content[0].text),
+      "token denied tenant outside its allow-list",
+    );
+  });
+  await withClient(port, "tok-star", "proj-z", async (client) => {
+    const r: any = await client.callTool({ name: "falda_atoms_search", arguments: { query: "x" } });
+    assert.ok(!r.isError, "wildcard principal may address any tenant");
+  });
+});
+
+test("3. cross-tenant isolation", async () => {
+  await withClient(port, "tok-b", "proj-b", async (client) => {
+    await client.callTool({ name: "falda_atoms_upsert", arguments: { content: "proj-b secret fact", type: "fact" } });
+    const own = textOf(await client.callTool({ name: "falda_atoms_search", arguments: { query: "secret fact" } }));
+    assert.ok(own.items.some((i: any) => i.content === "proj-b secret fact"), "proj-b can find its own atom");
+  });
+  await withClient(port, "tok-a", "proj-a", async (client) => {
+    const cross = textOf(await client.callTool({ name: "falda_atoms_search", arguments: { query: "secret fact" } }));
+    assert.ok(!cross.items.some((i: any) => i.content === "proj-b secret fact"), "proj-a cannot see proj-b's atom");
+  });
+});
+
+test("4. pool allow-list", async () => {
+  pools.declarePool("shared-corpus", { "proj-b": "readwrite" });
+  await withClient(port, "tok-b", "proj-b", async (client) => {
+    const r: any = await client.callTool({ name: "falda_atoms_search", arguments: { query: "x", pool: "shared-corpus" } });
+    assert.ok(!r.isError, "token with pool in its allow-list may address it");
+  });
+  await withClient(port, "tok-a", "proj-a", async (client) => {
+    const r: any = await client.callTool({ name: "falda_atoms_search", arguments: { query: "x", pool: "shared-corpus" } });
+    assert.ok(
+      r.isError === true && /not authorized for pool/.test(r.content[0].text),
+      "token without pool in its allow-list is denied",
+    );
+  });
+});
+
+test("5. scenes/core write tools not registered (checked against real server)", async () => {
+  await withClient(port, "tok-a", "proj-a", async (client) => {
+    const tools = await client.listTools();
+    const names = tools.tools.map((t) => t.name);
+    assert.ok(!names.includes("falda_scenes_write"), "no falda_scenes_write tool");
+    assert.ok(!names.includes("falda_scenes_rm"), "no falda_scenes_rm tool");
+    assert.ok(!names.includes("falda_core_write"), "no falda_core_write tool");
+  });
+});
+
+test("6. falda_whoami: echoes only the resolved tenant, nothing sensitive", async () => {
+  await withClient(port, "tok-a", "proj-a", async (client) => {
+    const who = textOf(await client.callTool({ name: "falda_whoami", arguments: {} }));
+    assert.equal(who.tenant, "proj-a", "whoami reports the resolved tenant");
+    assert.ok(!JSON.stringify(who).includes("tok-a"), "whoami does not leak the token");
+    assert.ok(!("tenants" in who), "whoami does not leak the tenants allow-list");
+    assert.ok(!("pools" in who), "whoami does not leak the pools allow-list");
+  });
+  await withClient(port, "tok-star", "proj-z", async (client) => {
+    const who = textOf(await client.callTool({ name: "falda_whoami", arguments: {} }));
+    assert.equal(who.tenant, "proj-z", "whoami reflects the selected tenant for a wildcard principal");
+  });
+});

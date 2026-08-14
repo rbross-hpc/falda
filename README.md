@@ -37,7 +37,7 @@ single call, with no separate search service.
 
 ```bash
 npm install
-npm run smoke      # offline, deterministic — prints "ALL TIERS GREEN"
+npm test           # offline, deterministic — full node:test suite
 ```
 
 ### As a library

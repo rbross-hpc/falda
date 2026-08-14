@@ -18,6 +18,8 @@
  *   6. GET /healthz requires no authentication (proven against a real socket,
  *      since it's wired ahead of any auth in gateway.ts's request handler).
  */
+import { test, before, after } from "node:test";
+import assert from "node:assert/strict";
 import { createServer, type Server } from "node:http";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -26,12 +28,6 @@ import { PoolManager } from "../src/pools.js";
 import { makeLocalEmbedder } from "../src/embedder.js";
 import { TokenStore } from "../src/mcp_auth.js";
 import { handleRequest } from "../src/gateway.js";
-
-let pass = 0, fail = 0;
-function check(name: string, ok: boolean) {
-  if (ok) { pass++; console.log(`  ok   ${name}`); }
-  else    { fail++; console.log(`  FAIL ${name}`); }
-}
 
 function hdrs(token?: string, tenant?: string) {
   const h: Record<string, string> = {};
@@ -64,8 +60,13 @@ function startHealthzServer(): Promise<{ server: Server; port: number }> {
   });
 }
 
-async function main() {
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "falda-gw-"));
+let root: string;
+let pools: PoolManager;
+let tokenStore: TokenStore;
+let call: (token: string | undefined, tenant: string | undefined, route: string, body: any) => Promise<any>;
+
+before(() => {
+  root = fs.mkdtempSync(path.join(os.tmpdir(), "falda-gw-"));
   const tokensPath = path.join(root, "tokens.json");
   fs.writeFileSync(tokensPath, JSON.stringify({
     tokens: {
@@ -74,63 +75,72 @@ async function main() {
       "tok-star": { tenants: ["*"], pools: [], label: "star" },
     },
   }));
+  pools = new PoolManager({ root: path.join(root, "data"), embed: makeLocalEmbedder(32), dim: 32 });
+  tokenStore = new TokenStore(tokensPath);
+  call = (token, tenant, route, body) => handleRequest(pools, tokenStore, hdrs(token, tenant), route, body);
+});
 
-  const pools = new PoolManager({ root: path.join(root, "data"), embed: makeLocalEmbedder(32), dim: 32 });
-  const tokenStore = new TokenStore(tokensPath);
-  const call = (token: string | undefined, tenant: string | undefined, route: string, body: any) =>
-    handleRequest(pools, tokenStore, hdrs(token, tenant), route, body);
-
-  // ── 1. auth ───────────────────────────────────────────────────────────────
-  const noAuth = await call(undefined, "proj-a", "/atoms/search", { query: "x" });
-  check("1a missing bearer rejected (401)", noAuth.status === 401);
-  const badAuth = await call("no-such-token", "proj-a", "/atoms/search", { query: "x" });
-  check("1b unknown bearer rejected (401)", badAuth.status === 401);
-
-  // ── 2. tenant selection + allow-list ────────────────────────────────────
-  const noHeader = await call("tok-a", undefined, "/atoms/search", { query: "x" });
-  check("2a missing X-Falda-Tenant rejected (403, no default)", noHeader.status === 403);
-  const up = await call("tok-a", "proj-a", "/atoms/upsert", { content: "cryostat target 4.2K", type: "fact" });
-  check("2b allowed tenant can upsert (200)", up.status === 200);
-  const wrongTenant = await call("tok-a", "proj-b", "/atoms/search", { query: "x" });
-  check("2c token denied tenant outside its allow-list (403)", wrongTenant.status === 403);
-  const wildcard = await call("tok-star", "proj-z", "/atoms/search", { query: "x" });
-  check("2d wildcard principal may address any tenant (200)", wildcard.status === 200);
-
-  // ── 3. cross-tenant isolation ────────────────────────────────────────────
-  await call("tok-b", "proj-b", "/atoms/upsert", { content: "proj-b secret fact", type: "fact" });
-  const ownSearch = await call("tok-b", "proj-b", "/atoms/search", { query: "secret fact" });
-  check("3a proj-b can find its own atom", ownSearch.body.items?.some((i: any) => i.content === "proj-b secret fact"));
-  const crossSearch = await call("tok-a", "proj-a", "/atoms/search", { query: "secret fact" });
-  check("3b proj-a cannot see proj-b's atom", !crossSearch.body.items?.some((i: any) => i.content === "proj-b secret fact"));
-
-  // ── 4. pool allow-list ───────────────────────────────────────────────────
-  const declare = await call("tok-star", "proj-z", "/pools/declare", { name: "shared-corpus", members: { "proj-b": "readwrite" } });
-  check("4a wildcard token can declare a pool (200)", declare.status === 200);
-  const poolOk = await call("tok-b", "proj-b", "/atoms/search", { query: "x", pool: "shared-corpus" });
-  check("4b token with pool in its allow-list may address it (200)", poolOk.status === 200);
-  const poolDenied = await call("tok-a", "proj-a", "/atoms/search", { query: "x", pool: "shared-corpus" });
-  check("4c token without pool in its allow-list is denied (403)", poolDenied.status === 403);
-
-  // ── 5. pool-admin requires a fully-trusted principal ────────────────────
-  const adminDenied = await call("tok-a", "proj-a", "/pools/list", {});
-  check("5a non-wildcard token denied pool admin (403)", adminDenied.status === 403);
-  const adminOk = await call("tok-star", "proj-a", "/pools/list", {});
-  check("5b wildcard token may use pool admin (200)", adminOk.status === 200);
-
-  // ── 6. /healthz needs no auth ─────────────────────────────────────────────
-  const { server, port } = await startHealthzServer();
-  const res = await fetch(`http://127.0.0.1:${port}/healthz`);
-  check("6a GET /healthz returns 200 with no Authorization header", res.status === 200);
-  const body = await res.json();
-  check("6b /healthz body reports ok", body.ok === true);
-  server.close();
-
+after(() => {
   pools.closeAll();
   fs.rmSync(root, { recursive: true, force: true });
+});
 
-  console.log(`\nFALDA gateway: ${pass} passed, ${fail} failed`);
-  if (fail) process.exit(1);
-  console.log("GATEWAY AUTH GREEN");
-}
+test("1. auth", async () => {
+  const noAuth = await call(undefined, "proj-a", "/atoms/search", { query: "x" });
+  assert.equal(noAuth.status, 401, "missing bearer rejected (401)");
+  const badAuth = await call("no-such-token", "proj-a", "/atoms/search", { query: "x" });
+  assert.equal(badAuth.status, 401, "unknown bearer rejected (401)");
+});
 
-main().catch((e) => { console.error(e); process.exit(1); });
+test("2. tenant selection + allow-list", async () => {
+  const noHeader = await call("tok-a", undefined, "/atoms/search", { query: "x" });
+  assert.equal(noHeader.status, 403, "missing X-Falda-Tenant rejected (403, no default)");
+  const up = await call("tok-a", "proj-a", "/atoms/upsert", { content: "cryostat target 4.2K", type: "fact" });
+  assert.equal(up.status, 200, "allowed tenant can upsert (200)");
+  const wrongTenant = await call("tok-a", "proj-b", "/atoms/search", { query: "x" });
+  assert.equal(wrongTenant.status, 403, "token denied tenant outside its allow-list (403)");
+  const wildcard = await call("tok-star", "proj-z", "/atoms/search", { query: "x" });
+  assert.equal(wildcard.status, 200, "wildcard principal may address any tenant (200)");
+});
+
+test("3. cross-tenant isolation", async () => {
+  await call("tok-b", "proj-b", "/atoms/upsert", { content: "proj-b secret fact", type: "fact" });
+  const ownSearch = await call("tok-b", "proj-b", "/atoms/search", { query: "secret fact" });
+  assert.ok(
+    ownSearch.body.items?.some((i: any) => i.content === "proj-b secret fact"),
+    "proj-b can find its own atom",
+  );
+  const crossSearch = await call("tok-a", "proj-a", "/atoms/search", { query: "secret fact" });
+  assert.ok(
+    !crossSearch.body.items?.some((i: any) => i.content === "proj-b secret fact"),
+    "proj-a cannot see proj-b's atom",
+  );
+});
+
+test("4. pool allow-list", async () => {
+  const declare = await call("tok-star", "proj-z", "/pools/declare", { name: "shared-corpus", members: { "proj-b": "readwrite" } });
+  assert.equal(declare.status, 200, "wildcard token can declare a pool (200)");
+  const poolOk = await call("tok-b", "proj-b", "/atoms/search", { query: "x", pool: "shared-corpus" });
+  assert.equal(poolOk.status, 200, "token with pool in its allow-list may address it (200)");
+  const poolDenied = await call("tok-a", "proj-a", "/atoms/search", { query: "x", pool: "shared-corpus" });
+  assert.equal(poolDenied.status, 403, "token without pool in its allow-list is denied (403)");
+});
+
+test("5. pool-admin requires a fully-trusted principal", async () => {
+  const adminDenied = await call("tok-a", "proj-a", "/pools/list", {});
+  assert.equal(adminDenied.status, 403, "non-wildcard token denied pool admin (403)");
+  const adminOk = await call("tok-star", "proj-a", "/pools/list", {});
+  assert.equal(adminOk.status, 200, "wildcard token may use pool admin (200)");
+});
+
+test("6. /healthz needs no auth", async () => {
+  const { server, port } = await startHealthzServer();
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/healthz`);
+    assert.equal(res.status, 200, "GET /healthz returns 200 with no Authorization header");
+    const body = await res.json();
+    assert.equal(body.ok, true, "/healthz body reports ok");
+  } finally {
+    server.close();
+  }
+});

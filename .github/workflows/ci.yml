@@ -7,8 +7,8 @@ on:
     branches: [master]
 
 jobs:
-  build-and-smoke:
-    name: build + smoke (Node ${{ matrix.node }} / ${{ matrix.os }})
+  build-and-test:
+    name: build + test (Node ${{ matrix.node }} / ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -30,14 +30,8 @@ jobs:
       - name: TypeScript build
         run: npm run build
 
-      - name: Smoke test (13 tier checks)
-        run: npm run smoke
-
-      - name: Gateway auth test
-        run: npm run test:gateway
-
-      - name: Token-file fail-fast guard test
-        run: npm run test:mcp-auth
+      - name: Test suite
+        run: npm test
 
   origin-clean:
     name: origin-clean guard
