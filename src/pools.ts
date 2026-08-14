@@ -178,6 +178,25 @@ export class PoolManager {
     return { dir, db: path.join(dir, "falda.db"), blobs: path.join(dir, "blobs") };
   }
 
+  /**
+   * Enumerate tenants that have an initialised self-store on disk.
+   * A tenant counts if `${root}/tenants/<tenant>/self/falda.db` exists.
+   * Used by the gateway worker to auto-enqueue every known self-store.
+   */
+  listSelfTenants(): string[] {
+    const tenantsDir = path.join(this.root, "tenants");
+    let entries: string[];
+    try {
+      entries = fs.readdirSync(tenantsDir);
+    } catch {
+      return [];
+    }
+    return entries.filter((name) => {
+      const dbPath = path.join(tenantsDir, name, "self", "falda.db");
+      try { return fs.statSync(dbPath).isFile(); } catch { return false; }
+    });
+  }
+
   /** Open (or reuse) the Falda store at a physical location. */
   private storeAt(loc: { dir: string; db: string; blobs: string }): Falda {
     const key = loc.db;

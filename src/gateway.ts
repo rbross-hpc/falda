@@ -206,14 +206,17 @@ export async function handleRequest(
 
 /** Start the in-process background distillation worker. Drains the queue
  *  by calling distillOnce() directly against the store via PoolManager.
- *  Only distills 'self' stores in this initial implementation (§2, §13). */
+ *  Also auto-enqueues every known self-store on each interval tick so
+ *  distillation runs continuously without requiring an external trigger.
+ *  Only distills 'self' stores (pools deferred to §13). */
 function startWorker(
   queueDb: Database.Database,
   pools: PoolManager,
   llm: (prompt: string) => Promise<string>,
   intervalMs = 60_000,
 ) {
-  const tick = async () => {
+  // Drain: claim the next ready job and run distillOnce against its store.
+  const drain = async () => {
     const job = claimNext(queueDb);
     if (!job) return;
     const [tenant, poolName] = job.store_key.split(":", 2);
@@ -225,11 +228,28 @@ function startWorker(
       failJob(queueDb, job.id, String(e?.message ?? e));
     }
   };
-  setInterval(() => { tick().catch(console.error); }, intervalMs);
-  // Also self-enqueue an interval trigger for self stores (operator enqueues, or timer fires).
-  setInterval(() => {
-    // Placeholder: actual tenant enumeration comes when pool distillation lands (§13).
-  }, intervalMs * 5);
+
+  // Enqueue: discover every self-store on disk and enqueue it (coalescing
+  // dedups so a tenant with a pending job is never double-queued).
+  const enqueueAll = () => {
+    const tenants = pools.listSelfTenants();
+    for (const tenant of tenants) {
+      try {
+        enqueue(queueDb, storeKeyFor(tenant, undefined));
+      } catch (e) {
+        console.error(`[falda-worker] enqueue failed for tenant ${tenant}:`, e);
+      }
+    }
+    if (tenants.length > 0) {
+      console.log(`[falda-worker] enqueued ${tenants.length} self-store(s): ${tenants.join(", ")}`);
+    }
+  };
+
+  // Enqueue immediately on startup, then on every interval.
+  enqueueAll();
+  setInterval(enqueueAll, intervalMs);
+  // Drain on every interval (offset slightly so enqueue fires first on startup).
+  setInterval(() => { drain().catch(console.error); }, intervalMs);
 }
 
 const IS_MAIN = process.argv[1]?.endsWith("gateway.js") || process.argv[1]?.endsWith("gateway.ts");
@@ -250,9 +270,12 @@ if (IS_MAIN) {
   const tokenStore = new TokenStore(TOKENS_PATH);
 
   // Gateway-level queue db (separate from per-store dbs).
+  // busy_timeout lets the gateway wait for the MCP server's concurrent
+  // enqueue writes (also on this db) to clear rather than throwing SQLITE_BUSY.
   const queueDbPath = pathJoin(ROOT, "distill_queue.db");
   mkdirSync(ROOT, { recursive: true });
   gatewayQueueDb = new Database(queueDbPath);
+  gatewayQueueDb.pragma("busy_timeout = 5000");
   initQueueSchema(gatewayQueueDb);
 
   const llm = async (prompt: string): Promise<string> => {

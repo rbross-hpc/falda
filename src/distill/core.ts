@@ -72,29 +72,50 @@ interface CandidateAtom {
   confidence: AtomConfidence;
 }
 
+function validateCandidate(obj: any): CandidateAtom | null {
+  const type = obj?.type as string;
+  const content = obj?.content as string;
+  const confidence = obj?.confidence as string;
+  if (!VALID_TYPES.includes(type as AtomType)) return null;
+  if (!VALID_CONFIDENCE.includes(confidence as AtomConfidence)) return null;
+  if (typeof content !== "string" || !content.trim()) return null;
+  return { type: type as AtomType, content: content.trim(), confidence: confidence as AtomConfidence };
+}
+
+/**
+ * Parse LLM extraction output into candidate atoms.
+ *
+ * Tolerates the common variations a chat model may emit despite "Output ONLY
+ * the JSON lines" instructions:
+ *   1. Markdown code fences (```json … ```) — stripped before parsing.
+ *   2. A JSON array of objects ([ {…}, {…} ]) — parsed as one unit.
+ *   3. Newline-delimited JSON objects (the intended format) — scanned line-by-line.
+ *
+ * Any object that fails field validation is silently skipped (best-effort).
+ */
 function parseCandidates(raw: string): CandidateAtom[] {
+  // Strip markdown code fences.
+  const stripped = raw.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
+
+  // Try JSON array first.
+  if (stripped.startsWith("[")) {
+    try {
+      const arr = JSON.parse(stripped);
+      if (Array.isArray(arr)) {
+        return arr.map(validateCandidate).filter((c): c is CandidateAtom => c !== null);
+      }
+    } catch { /* fall through to line scan */ }
+  }
+
+  // Line-by-line scan: accept any line containing a parseable JSON object.
   const results: CandidateAtom[] = [];
-  for (const line of raw.split("\n")) {
+  for (const line of stripped.split("\n")) {
     const trimmed = line.trim();
     if (!trimmed.startsWith("{")) continue;
     try {
-      const obj = JSON.parse(trimmed);
-      const type = obj.type as string;
-      const content = obj.content as string;
-      const confidence = obj.confidence as string;
-      if (!VALID_TYPES.includes(type as AtomType)) {
-        throw new Error(`Invalid type: ${type}`);
-      }
-      if (!VALID_CONFIDENCE.includes(confidence as AtomConfidence)) {
-        throw new Error(`Invalid confidence: ${confidence}`);
-      }
-      if (typeof content !== "string" || !content.trim()) {
-        throw new Error("Missing content");
-      }
-      results.push({ type: type as AtomType, content: content.trim(), confidence: confidence as AtomConfidence });
-    } catch {
-      // Skip malformed lines — extraction is best-effort.
-    }
+      const candidate = validateCandidate(JSON.parse(trimmed));
+      if (candidate) results.push(candidate);
+    } catch { /* skip malformed line */ }
   }
   return results;
 }
