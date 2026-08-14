@@ -134,31 +134,33 @@ describe("watermark", () => {
   test("setWatermark then getWatermark round-trips", () => {
     const db = new Database(":memory:");
     initWatermarkSchema(db);
-    setWatermark(db, "k", "id-123", "2026-01-01T00:00:00.000Z");
+    setWatermark(db, "k", "id-123", "2026-01-01T00:00:00.000Z", 42);
     const wm = getWatermark(db, "k");
     assert.equal(wm?.last_processed_id, "id-123");
     assert.equal(wm?.last_processed_ts, "2026-01-01T00:00:00.000Z");
+    assert.equal(wm?.last_processed_seq, 42);
     db.close();
   });
 
   test("setWatermark is idempotent (upsert)", () => {
     const db = new Database(":memory:");
     initWatermarkSchema(db);
-    setWatermark(db, "k", "id-1", "2026-01-01T00:00:00.000Z");
-    setWatermark(db, "k", "id-2", "2026-01-02T00:00:00.000Z");
+    setWatermark(db, "k", "id-1", "2026-01-01T00:00:00.000Z", 1);
+    setWatermark(db, "k", "id-2", "2026-01-02T00:00:00.000Z", 2);
     assert.equal(getWatermark(db, "k")?.last_processed_id, "id-2");
+    assert.equal(getWatermark(db, "k")?.last_processed_seq, 2);
     db.close();
   });
 
   test("passId is deterministic for same inputs", () => {
-    const p1 = passId("store-X", "ts-start", "ts-end");
-    const p2 = passId("store-X", "ts-start", "ts-end");
+    const p1 = passId("store-X", 1, 20);
+    const p2 = passId("store-X", 1, 20);
     assert.equal(p1, p2);
   });
 
   test("passId differs for different inputs", () => {
-    const p1 = passId("store-X", "ts-A", "ts-end");
-    const p2 = passId("store-X", "ts-B", "ts-end");
+    const p1 = passId("store-X", 1, 20);
+    const p2 = passId("store-X", 5, 20);
     assert.notEqual(p1, p2);
   });
 });

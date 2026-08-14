@@ -13,7 +13,7 @@
 import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { unlinkSync, existsSync } from "node:fs";
-import type { Falda, AtomType, AtomConfidence, SceneKind } from "../falda.js";
+import type { Falda, AtomType, AtomConfidence, SceneKind, StreamTurn } from "../falda.js";
 import { VALID_TYPES, VALID_CONFIDENCE } from "./prompts.js";
 import {
   extractionPrompt, consolidationPrompt,
@@ -185,34 +185,27 @@ export async function distillOnce(
     core_regenerated: false,
   };
 
-  // ── L0: Read new turns since watermark ────────────────────────────────────
+  // ── L0: Read new turns since watermark (seq-based, cross-session safe) ────
+  // queryStreamSeq orders globally by seq (insertion order), not by session_id
+  // first. This prevents a full session-A window from advancing the watermark
+  // past unprocessed session-B turns that share an overlapping timestamp range.
 
   const wm = getWatermark(db, storeKey);
-  const sinceTs = wm?.last_processed_ts ?? null;
+  const afterSeq = wm?.last_processed_seq ?? null;
 
-  const { messages: allTurns } = store.queryStream({
-    time_start: sinceTs ?? undefined,
-    limit: windowSize,
-    offset: 0,
-  });
-
-  // Filter out the exact watermark turn (already processed).
-  const lastProcessedId = wm?.last_processed_id;
-  const turns = (allTurns as any[]).filter((t: any) =>
-    !lastProcessedId || t.id !== lastProcessedId || sinceTs === null
-  );
+  const turns = store.queryStreamSeq({ afterSeq: afterSeq ?? 0, limit: windowSize });
 
   if (!turns.length) {
     log("[distill] no new turns, skipping");
-    result.pass_id = passId(storeKey, sinceTs, sinceTs ?? "empty");
+    result.pass_id = passId(storeKey, afterSeq, afterSeq ?? "empty");
     return result;
   }
 
-  const lastTurn = turns[turns.length - 1] as any;
-  const pid = passId(storeKey, sinceTs, lastTurn.id);
+  const lastTurn = turns[turns.length - 1];
+  const pid = passId(storeKey, afterSeq, lastTurn.seq);
   result.pass_id = pid;
   result.turns_processed = turns.length;
-  log(`[distill] pass ${pid}: ${turns.length} turns`);
+  log(`[distill] pass ${pid}: ${turns.length} turns (seq ${(afterSeq ?? 0) + 1}–${lastTurn.seq})`);
 
   // ── L1: Extract + Consolidate (one atomic transaction) ────────────────────
 
@@ -221,11 +214,11 @@ export async function distillOnce(
   // Strategy: do all async work (LLM calls, embeddings) outside the transaction,
   // collect the resulting write operations, then commit them atomically.
 
-  const streamIds = turns.map((t: any) => t.id as string);
+  const streamIds = turns.map((t) => t.id);
 
   // Extract candidate atoms.
   const extractRaw = await llm(extractionPrompt(
-    turns.map((t: any) => ({ role: t.role, content: t.content }))
+    turns.map((t) => ({ role: t.role, content: t.content }))
   ));
   const candidates = parseCandidates(extractRaw);
   log(`[distill] L1 extracted ${candidates.length} candidates`);
@@ -337,7 +330,7 @@ export async function distillOnce(
       }
     }
     // Advance watermark — last thing in the transaction.
-    setWatermark(db, storeKey, lastTurn.id, lastTurn.timestamp ?? lastTurn.ts ?? new Date().toISOString());
+    setWatermark(db, storeKey, lastTurn.id, lastTurn.timestamp, lastTurn.seq);
     db.exec("COMMIT");
   } catch (e) {
     try { db.exec("ROLLBACK"); } catch {}

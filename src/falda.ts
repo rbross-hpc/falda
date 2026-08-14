@@ -76,6 +76,11 @@ export interface StreamHit {
   turn_index: number | null; turn_id: string | null; score: number;
 }
 
+export interface StreamTurn {
+  id: string; session_id: string; role: string; content: string;
+  timestamp: string; turn_index: number | null; turn_id: string | null; seq: number;
+}
+
 export interface Atom {
   id: string;
   type: AtomType;
@@ -267,8 +272,10 @@ export class Falda {
         content TEXT NOT NULL,
         ts TEXT NOT NULL,
         turn_index INTEGER,
-        turn_id TEXT
+        turn_id TEXT,
+        seq INTEGER
       );
+      CREATE INDEX IF NOT EXISTS idx_stream_seq ON stream(seq);
       CREATE INDEX IF NOT EXISTS idx_stream_session ON stream(session_id);
       CREATE UNIQUE INDEX IF NOT EXISTS idx_stream_turn_index
         ON stream(session_id, turn_index) WHERE turn_index IS NOT NULL;
@@ -363,6 +370,18 @@ export class Falda {
     if (this.tableExists("stream") && !this.hasColumn("stream", "turn_id")) {
       this.db.exec("ALTER TABLE stream ADD COLUMN turn_id TEXT");
     }
+    // stream: add monotonic seq column for cross-session distillation ordering.
+    // Backfill existing rows in rowid order (preserves original insertion order).
+    if (this.tableExists("stream") && !this.hasColumn("stream", "seq")) {
+      this.db.exec("ALTER TABLE stream ADD COLUMN seq INTEGER");
+      this.db.exec(`
+        WITH ranked AS (
+          SELECT id, ROW_NUMBER() OVER (ORDER BY rowid) AS rn FROM stream
+        )
+        UPDATE stream SET seq = (SELECT rn FROM ranked WHERE ranked.id = stream.id)
+      `);
+      this.db.exec("CREATE INDEX IF NOT EXISTS idx_stream_seq ON stream(seq)");
+    }
 
     // atoms: add new columns if missing, then backfill
     const atomCols: Array<[string, string]> = [
@@ -403,7 +422,8 @@ export class Falda {
   async addStream(sessionId: string, items: StreamItem[]): Promise<string[]> {
     const ids: string[] = [];
     const ins = this.db.prepare(
-      "INSERT INTO stream(id,session_id,role,content,ts,turn_index,turn_id) VALUES(?,?,?,?,?,?,?)"
+      `INSERT INTO stream(id,session_id,role,content,ts,turn_index,turn_id,seq)
+       VALUES(?,?,?,?,?,?,?,(SELECT COALESCE(MAX(seq),0)+1 FROM stream))`
     );
     const insF = this.db.prepare("INSERT INTO stream_fts(content,id) VALUES(?,?)");
     const insV = this.db.prepare("INSERT INTO stream_vec(id,embedding) VALUES(?,?)");
@@ -478,6 +498,19 @@ export class Falda {
       `SELECT id,session_id,role,content,ts AS timestamp,turn_index,turn_id FROM stream ${w} ${order} LIMIT ? OFFSET ?`
     ).all(...args, p.limit ?? 50, p.offset ?? 0);
     return { messages, total };
+  }
+
+  /**
+   * Read new turns in global insertion order, starting after `afterSeq`.
+   * Use this for the distillation watermark cursor — it is safe across
+   * concurrent sessions because `seq` is monotonic store-globally.
+   */
+  queryStreamSeq(p: { afterSeq?: number | null; limit?: number } = {}): StreamTurn[] {
+    const afterSeq = p.afterSeq ?? 0;
+    return this.db.prepare(
+      `SELECT id,session_id,role,content,ts AS timestamp,turn_index,turn_id,seq
+       FROM stream WHERE seq > ? ORDER BY seq LIMIT ?`
+    ).all(afterSeq, p.limit ?? 50) as StreamTurn[];
   }
 
   async searchStream(query: string, limit = 10): Promise<StreamHit[]> {
