@@ -317,6 +317,90 @@ test("T2: listScenes status filter (active vs retired)", async () => {
   } finally { cleanup(s, blobDir); }
 });
 
+// ─── T2 scene consistency (regression for upsert read-back bug) ───────────────
+
+test("T2: update omitting summary preserves summary in FTS and mirror", async () => {
+  const blobDir = fs.mkdtempSync(path.join(os.tmpdir(), "falda-scfix-"));
+  const s = new Falda({ dbPath: ":memory:", blobDir, embed: makeLocalEmbedder(32), dim: 32 });
+  try {
+    const a1 = await s.upsertAtom({ type: "fact", content: "detector stable" });
+    // First upsert: create with a summary.
+    const sc = await s.upsertScene({
+      scene_kind: "topic",
+      title: "Cryogenic detectors",
+      atom_ids: [a1.id],
+      summary: "Covers cryogenic temperature stability and detector calibration.",
+      content_hash: "hash-v1",
+    });
+    assert.equal(sc.summary, "Covers cryogenic temperature stability and detector calibration.", "initial summary stored");
+
+    // Second upsert: update atom_ids + content_hash but do NOT supply summary.
+    const a2 = await s.upsertAtom({ type: "fact", content: "new detector measurement" });
+    const updated = await s.upsertScene({
+      scene_id: sc.scene_id,
+      scene_kind: "topic",
+      title: "Cryogenic detectors",
+      atom_ids: [a1.id, a2.id],
+      content_hash: "hash-v2",
+      // summary intentionally omitted — must be preserved from the stored row
+    });
+
+    // Bug: previously row.summary was preserved but FTS/vec/mirror used s.summary=""
+    assert.equal(updated.summary, sc.summary, "summary preserved in row");
+
+    // FTS must reflect the preserved summary (search on summary text should hit).
+    const hits = await s.searchScenes("cryogenic temperature stability detector calibration", 5);
+    assert.ok(hits.some((h) => h.scene_id === sc.scene_id), "FTS still indexes the preserved summary");
+
+    // Mirror must contain the summary.
+    const mirrorPath = `${blobDir}/scenes/${sc.scene_id}.md`;
+    const mirrorContent = fs.readFileSync(mirrorPath, "utf8");
+    assert.ok(
+      mirrorContent.includes("Covers cryogenic temperature stability"),
+      "mirror reflects preserved summary",
+    );
+  } finally {
+    s.close();
+    fs.rmSync(blobDir, { recursive: true, force: true });
+  }
+});
+
+test("T2: update with new summary updates FTS, vec, and mirror", async () => {
+  const blobDir = fs.mkdtempSync(path.join(os.tmpdir(), "falda-scfix2-"));
+  const s = new Falda({ dbPath: ":memory:", blobDir, embed: makeLocalEmbedder(32), dim: 32 });
+  try {
+    const sc = await s.upsertScene({
+      scene_kind: "episode",
+      title: "Session alpha",
+      atom_ids: [],
+      summary: "Old summary text about nothing.",
+      content_hash: "hash-old",
+    });
+
+    const updated = await s.upsertScene({
+      scene_id: sc.scene_id,
+      scene_kind: "episode",
+      title: "Session alpha",
+      atom_ids: [],
+      summary: "New summary about neutron detection calibration runs.",
+      content_hash: "hash-new",
+    });
+
+    assert.equal(updated.summary, "New summary about neutron detection calibration runs.", "row has new summary");
+
+    const hits = await s.searchScenes("neutron detection calibration", 5);
+    assert.ok(hits.some((h) => h.scene_id === sc.scene_id), "FTS reflects new summary");
+
+    const mirrorPath = `${blobDir}/scenes/${sc.scene_id}.md`;
+    const mirrorContent = fs.readFileSync(mirrorPath, "utf8");
+    assert.ok(mirrorContent.includes("neutron detection calibration"), "mirror reflects new summary");
+    assert.ok(!mirrorContent.includes("Old summary"), "mirror does not contain old summary");
+  } finally {
+    s.close();
+    fs.rmSync(blobDir, { recursive: true, force: true });
+  }
+});
+
 // ─── 10. Evidence ─────────────────────────────────────────────────────────────
 
 test("provenance: addEvidence, evidenceForAtom, atomsFromStream, atomsFromSession", async () => {

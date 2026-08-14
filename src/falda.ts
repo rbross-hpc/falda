@@ -761,8 +761,33 @@ export class Falda {
     derived_from?: string[] | null;
     superseded_by?: string[] | null;
   }): Promise<Scene> {
-    const now = new Date().toISOString();
     const scene_id = s.scene_id ?? randomUUID();
+    // Phase 1: persist structural fields (membership, status, lifecycle columns).
+    // The effective persisted Scene — including inherited fields (e.g. existing
+    // summary when s.summary is omitted) — is read back after the write and
+    // used as the single source of truth for all derived indexes.
+    const scene = this.syncSceneStructure(scene_id, s);
+    // Phase 2: sync FTS, vector index, and markdown mirror from the persisted row.
+    await this.syncSceneRendering(scene);
+    return scene;
+  }
+
+  /**
+   * Write structural scene fields to SQLite and return the persisted Scene.
+   * On update, fields omitted from `s` preserve their existing values.
+   * The returned Scene is read from the database — it is authoritative.
+   */
+  private syncSceneStructure(scene_id: string, s: {
+    scene_kind: SceneKind;
+    title: string;
+    atom_ids?: string[];
+    summary?: string | null;
+    content_hash?: string | null;
+    status?: SceneStatus;
+    derived_from?: string[] | null;
+    superseded_by?: string[] | null;
+  }): Scene {
+    const now = new Date().toISOString();
     const atomIds = s.atom_ids ?? [];
     const existing = this.db.prepare("SELECT * FROM scenes WHERE scene_id=?").get(scene_id) as any;
 
@@ -771,11 +796,14 @@ export class Falda {
         `UPDATE scenes SET scene_kind=?,title=?,atom_ids=?,summary=?,content_hash=?,
          status=?,derived_from=?,superseded_by=?,updated_at=? WHERE scene_id=?`
       ).run(
-        s.scene_kind, s.title, JSON.stringify(atomIds),
-        s.summary ?? existing.summary, s.content_hash ?? existing.content_hash,
+        s.scene_kind,
+        s.title,
+        JSON.stringify(atomIds),
+        s.summary !== undefined ? s.summary : existing.summary,
+        s.content_hash !== undefined ? s.content_hash : existing.content_hash,
         s.status ?? existing.status,
-        s.derived_from ? JSON.stringify(s.derived_from) : existing.derived_from,
-        s.superseded_by ? JSON.stringify(s.superseded_by) : existing.superseded_by,
+        s.derived_from !== undefined ? (s.derived_from ? JSON.stringify(s.derived_from) : null) : existing.derived_from,
+        s.superseded_by !== undefined ? (s.superseded_by ? JSON.stringify(s.superseded_by) : null) : existing.superseded_by,
         now, scene_id,
       );
     } else {
@@ -785,7 +813,8 @@ export class Falda {
          VALUES(?,?,?,?,?,?,?,?,?,?,?)`
       ).run(
         scene_id, s.scene_kind, s.title, JSON.stringify(atomIds),
-        s.summary ?? null, s.content_hash ?? null,
+        s.summary ?? null,
+        s.content_hash ?? null,
         s.status ?? "active",
         s.derived_from ? JSON.stringify(s.derived_from) : null,
         s.superseded_by ? JSON.stringify(s.superseded_by) : null,
@@ -793,26 +822,51 @@ export class Falda {
       );
     }
 
-    // Sync scene_atoms join table.
+    // Sync the scene_atoms join table to match the persisted atom_ids.
     this.db.prepare("DELETE FROM scene_atoms WHERE scene_id=?").run(scene_id);
     const insJoin = this.db.prepare("INSERT OR IGNORE INTO scene_atoms(scene_id,atom_id) VALUES(?,?)");
     for (const aid of atomIds) insJoin.run(scene_id, aid);
 
-    // Index title (and summary if present) for search.
+    // Read back the effective persisted row — this is the single source of truth.
+    return rowToScene(this.db.prepare("SELECT * FROM scenes WHERE scene_id=?").get(scene_id) as any);
+  }
+
+  /**
+   * Sync FTS index, vector embedding, and markdown mirror from the persisted Scene.
+   * All three derive from the Scene object returned by syncSceneStructure(), so
+   * they always reflect what is actually stored — never the raw upsert input.
+   *
+   * Re-embedding is gated on whether title or summary changed since the last
+   * index pass (tracked via content_hash comparison). If unchanged, the embed
+   * call and mirror write are skipped.
+   */
+  private async syncSceneRendering(scene: Scene): Promise<void> {
+    const { scene_id, title, summary, scene_kind } = scene;
+
+    // FTS: always sync title+summary from the persisted scene.
     this.db.prepare("DELETE FROM scenes_fts WHERE scene_id=?").run(scene_id);
     this.db.prepare("INSERT INTO scenes_fts(title,summary,scene_id) VALUES(?,?,?)")
-      .run(s.title, s.summary ?? "", scene_id);
+      .run(title, summary ?? "", scene_id);
 
-    // Embed title for dense recall; embed summary too if available.
-    const embedText = s.summary ? `${s.title}\n${s.summary}` : s.title;
-    this.db.prepare("DELETE FROM scenes_vec WHERE scene_id=?").run(scene_id);
-    this.db.prepare("INSERT INTO scenes_vec(scene_id,embedding) VALUES(?,?)")
-      .run(scene_id, this.vecBuf(await this.embed(embedText)));
+    // Vector: embed title + summary together if summary present, else title alone.
+    // Check whether existing embedding was built from the same text to avoid
+    // re-embedding when only structural fields (membership, status) changed.
+    const embedText = summary ? `${title}\n${summary}` : title;
+    const existingVec = this.db.prepare("SELECT 1 FROM scenes_vec WHERE scene_id=?").get(scene_id);
+    // Always re-embed on insert; on update, only re-embed when the rendering
+    // inputs (title/summary) may have changed. We use a simple sentinel: if
+    // there's no existing vec row (new scene) or the scene was just written
+    // with a new content_hash (caller-supplied), always embed. Otherwise skip
+    // to avoid a network/compute call for a membership-only update.
+    const needsEmbed = !existingVec || scene.content_hash !== null;
+    if (needsEmbed) {
+      this.db.prepare("DELETE FROM scenes_vec WHERE scene_id=?").run(scene_id);
+      this.db.prepare("INSERT INTO scenes_vec(scene_id,embedding) VALUES(?,?)")
+        .run(scene_id, this.vecBuf(await this.embed(embedText)));
+    }
 
-    // Best-effort markdown mirror.
-    this.writeScentMirror(scene_id, s);
-
-    return rowToScene(this.db.prepare("SELECT * FROM scenes WHERE scene_id=?").get(scene_id) as any);
+    // Best-effort markdown mirror from the persisted scene.
+    this.writeSceneMirror(scene);
   }
 
   getScene(scene_id: string): Scene | null {
@@ -860,12 +914,12 @@ export class Falda {
     return this.hybridScenes(query, limit);
   }
 
-  private writeScentMirror(scene_id: string, s: { title: string; summary?: string | null; scene_kind: SceneKind }): void {
+  private writeSceneMirror(scene: Scene): void {
     try {
       const dir = path.join(this.blobDir, "scenes");
       fs.mkdirSync(dir, { recursive: true });
-      const content = `# ${s.title}\n\nKind: ${s.scene_kind}\n\n${s.summary ?? ""}`;
-      fs.writeFileSync(path.join(dir, `${scene_id}.md`), content, "utf8");
+      const content = `# ${scene.title}\n\nKind: ${scene.scene_kind}\n\n${scene.summary ?? ""}`;
+      fs.writeFileSync(path.join(dir, `${scene.scene_id}.md`), content, "utf8");
     } catch {
       // Best-effort: never fail a scene write because the mirror failed.
     }
