@@ -1,5 +1,5 @@
 {
-  "_comment": "tenants[] is per-PROJECT, not per-container/agent. Extend a token's tenants[] every time you set up a new project against this container's token — see docs/MCP.md and integrations/opencode/README.md 'Checklist for setting up a new project's tenant'.",
+  "_comment": "DEPRECATED: prefer falda_tokens.example.json (the canonical file, shared by HTTP and MCP when run via `falda serve`). This file remains only for the standalone `falda mcp` legacy entry point (honored via the FALDA_MCP_TOKENS fallback). tenants[] is per-PROJECT, not per-container/agent. Extend a token's tenants[] every time you set up a new project against this container's token — see docs/MCP.md and integrations/opencode/README.md 'Checklist for setting up a new project's tenant'.",
   "tokens": {
     "REPLACE_WITH_openssl_rand_hex_24": {
       "tenants": ["proj-a", "proj-b"],

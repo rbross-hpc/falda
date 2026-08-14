@@ -1,7 +1,9 @@
 # FALDA API
 
 All routes are `POST` with a JSON body and JSON response, except `/healthz` (`GET`).
-Gateway default port: `8077` (`FALDA_PORT`).
+Default port: `8077` (`FALDA_PORT`). Served by `falda serve` (recommended —
+runs alongside the MCP endpoint from one shared runtime, see `docs/MCP.md`)
+or the standalone `falda gateway` legacy entry point (HTTP API only, no MCP).
 
 ## Authentication
 
@@ -25,11 +27,14 @@ Pool-admin routes (`/pools/*`) are cross-tenant management operations and
 require a fully-trusted principal (`tenants: ["*"]`) regardless of
 `X-Falda-Tenant`; any other principal gets `403`.
 
-The gateway refuses to boot if `FALDA_TOKENS` doesn't point at a valid,
+The server refuses to boot if `FALDA_TOKENS` doesn't point at a valid,
 non-empty token file (fail-fast — see `docs/POOLS.md` "Environment").
-Auth is defense-in-depth on top of whatever network exposure you choose
-(e.g. binding to localhost); it does not itself change where the gateway
-listens.
+`FALDA_TOKENS` is the **one canonical token file, shared by the HTTP API
+and the MCP endpoint** — both authenticate against the same `TokenStore`
+(`src/runtime.ts` builds it once; `falda serve` hands the same instance to
+both protocol adapters). Auth is defense-in-depth on top of whatever
+network exposure you choose (e.g. binding to localhost); it does not itself
+change where the server listens.
 
 ## Tier T0 — Stream
 
@@ -188,13 +193,17 @@ Scene kinds: `episode | topic`. Scene status: `active | retired`.
 
 ### `POST /distill`
 ```json
-{ "store_key": "optional-explicit-key" }
+{ "pool": "optional-pool-name" }
 ```
 → `{ "job_id": "...", "store_key": "..." }`
 
-Enqueues a distillation job for the addressed store. Duplicate pending jobs
-for the same store are coalesced (returns existing job id). Asynchronous —
-does not wait for distillation to complete.
+Enqueues a distillation job for the addressed store. `store_key` is always
+derived from the authenticated tenant + pool (never from a body field) to
+prevent cross-tenant enqueue. Duplicate pending jobs for the same store are
+coalesced (returns existing job id). Asynchronous — does not wait for
+distillation to complete. Drained by the single in-process distillation
+worker started by `falda serve` (or `falda gateway`) — see the README's
+"Distillation" section.
 
 ### `POST /distill/status`
 ```json

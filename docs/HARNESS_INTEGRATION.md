@@ -19,7 +19,7 @@ Everything below is built on three primitives:
 
 | Surface            | What it is                                  | Where documented |
 |--------------------|---------------------------------------------|------------------|
-| HTTP gateway       | `POST` JSON to `:8077` (`/stream/*`, `/atoms/*`, `/scenes/*`, `/core/*`, `/pools/*`) | `docs/API.md`, `docs/POOLS.md` |
+| HTTP API           | `POST` JSON to `:8077` (`/stream/*`, `/atoms/*`, `/scenes/*`, `/core/*`, `/pools/*`), served by `falda serve` (or the legacy `falda gateway` standalone entry point) | `docs/API.md`, `docs/POOLS.md` |
 | CLI                | `bin/falda` — same operations from a shell | `README.md` |
 | Multi-tenant addr  | tenant is selected via the `X-Falda-Tenant` header (not a body field); optional body `pool` ⇒ a shared pool instead of the tenant's private `self` store | `docs/POOLS.md` |
 
@@ -27,15 +27,18 @@ Pick a stable **tenant id per agent** (e.g. one per agent identity). Two agents
 sharing memory do it via an opt-in named **pool** (`docs/POOLS.md`), never by
 sharing a tenant.
 
-> **Auth (all examples below):** the gateway requires
+> **Auth (all examples below):** the server requires
 > `Authorization: Bearer <token>` + `X-Falda-Tenant: <tenant>` on every route
 > except `GET /healthz` — see `docs/API.md` "Authentication". The `curl`/env
 > snippets in this guide predate that requirement and, where they show a bare
 > `POST` or a body `{tenant: ...}`, still need a bearer token added and the
-> tenant moved to the header to work against a current gateway.
-> Distillation is now handled by the in-process gateway worker — see the
+> tenant moved to the header to work against a current server. That token
+> file (`FALDA_TOKENS`) is now canonical and shared by the HTTP API and the
+> MCP endpoint when run via `falda serve` — see `docs/MCP.md`.
+> Distillation is handled by the in-process distillation worker — see the
 > `POST /distill` route and `falda_distill` MCP tool (`docs/API.md`,
-> `docs/MCP.md`). The Python sidecar (`falda_distiller.py`) has been removed.
+> `docs/MCP.md`). It is always drained by the same process that accepted the
+> job. The Python sidecar (`falda_distiller.py`) has been removed.
 
 Health check, harness-independent:
 

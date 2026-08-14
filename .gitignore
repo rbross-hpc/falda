@@ -21,8 +21,11 @@ proxy/falda_proxy.crt
 proxy/falda_proxy.key
 proxy/proxy.log
 
-# FALDA MCP server secrets (never commit)
-falda_mcp_tokens.json
+# FALDA canonical token file (never commit) — shared by HTTP API and MCP
+# when run via `falda serve`.
+falda_tokens.json
 
-# FALDA gateway secrets (never commit)
+# Legacy per-surface token files (never commit) — still honored by the
+# standalone falda_gateway.js / falda_mcp.js entry points.
+falda_mcp_tokens.json
 falda_gateway_tokens.json

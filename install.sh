@@ -82,7 +82,7 @@ ok "dependencies installed"
 say "Building (tsc)"
 npm run build >/dev/null
 [ -f dist/index.js ] || die "build did not emit dist/index.js"
-[ -f dist/gateway.js ] || die "build did not emit dist/gateway.js"
+[ -f dist/server.js ] || die "build did not emit dist/server.js"
 ok "dist/ emitted"
 
 # ---- 4. smoke test ---------------------------------------------------------
@@ -123,6 +123,6 @@ fi
 
 echo
 say "Done."
-echo "    Start the gateway:   ./bin/falda serve"
+echo "    Start the server:    ./bin/falda serve"
 echo "    Health check:        curl -s localhost:\${FALDA_PORT:-8077}/healthz"
 echo

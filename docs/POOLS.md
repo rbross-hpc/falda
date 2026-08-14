@@ -127,8 +127,8 @@ pool. Read routes require `read` or `readwrite`.
 | var | meaning | default |
 |-----|---------|---------|
 | `FALDA_ROOT`   | pool root dir                                          | `./falda-data` |
-| `FALDA_TOKENS` | path to the gateway's bearer-token file (required — boot fails if missing/empty, see Authentication above) | `./falda_gateway_tokens.json` |
-| `FALDA_PORT` / `FALDA_DIM` / `FALDA_EMBED*` | as before | — |
+| `FALDA_TOKENS` | path to the canonical bearer-token file, shared by the HTTP API and MCP endpoint (required — boot fails if missing/empty, see Authentication above) | `./falda_tokens.json` |
+| `FALDA_PORT` / `FALDA_MCP_PORT` / `FALDA_DIM` / `FALDA_EMBED*` | as before | — |
 
 ## Migration from single-store
 

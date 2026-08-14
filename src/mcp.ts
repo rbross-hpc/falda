@@ -27,23 +27,28 @@
  * Atom type enum (§3.1): fact | pattern | preference | constraint | instruction.
  * Out-of-set values are rejected as errors (no coercion).
  *
- * Env:
- *   FALDA_MCP_PORT     Port to listen on (default 8079)
- *   FALDA_ROOT         Pool root dir (shared with the gateway)
- *   FALDA_MCP_TOKENS   Path to token file (default ./falda_mcp_tokens.json)
- *   FALDA_DIM / FALDA_EMBED*  As in the gateway
+ * Prefer `falda serve` (src/server.ts) for new deployments — it starts this
+ * same MCP endpoint alongside the HTTP API (src/gateway.ts) from one shared
+ * runtime (src/runtime.ts), with one canonical token file and one
+ * distillation worker for both surfaces. This module's own IS_MAIN entry
+ * point (`node dist/mcp.js`) is kept for backward compatibility; it runs
+ * MCP only, with no distillation worker of its own (falda_distill still
+ * enqueues into the shared queue — nothing will drain it unless a gateway
+ * or `falda serve` process elsewhere owns that queue db).
+ *
+ * Env: see src/runtime.ts for the canonical set (FALDA_ROOT, FALDA_DIM,
+ * FALDA_EMBED*, FALDA_TOKENS, FALDA_LLM_*). MCP-specific:
+ *   FALDA_MCP_PORT     Port to listen on (default 8079).
  */
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
-import { join as pathJoin } from "node:path";
-import { mkdirSync } from "node:fs";
-import Database from "better-sqlite3";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import { z } from "zod";
 import { PoolManager, PoolError } from "./pools.js";
-import { selectEmbedder, enforceEmbeddingLock } from "./boot.js";
-import { TokenStore, AuthError, parseBearer, requireTokenFile, type Principal } from "./mcp_auth.js";
-import { initQueueSchema, enqueue, storeKeyFor, getJobAuthorized } from "./distill/queue.js";
+import { TokenStore, AuthError, parseBearer, type Principal } from "./mcp_auth.js";
+import { enqueue, storeKeyFor, getJobAuthorized } from "./distill/queue.js";
+import { buildRuntime } from "./runtime.js";
+import Database from "better-sqlite3";
 
 interface RequestCtx { tenant: string; principal: Principal; }
 
@@ -344,20 +349,7 @@ export async function handleFaldaMcpRequest(
 const IS_MAIN = process.argv[1]?.endsWith("mcp.js") || process.argv[1]?.endsWith("mcp.ts");
 if (IS_MAIN) {
   const PORT = Number(process.env.FALDA_MCP_PORT ?? 8079);
-  const DIM = Number(process.env.FALDA_DIM ?? 768);
-  const ROOT = process.env.FALDA_ROOT ?? "./falda-data";
-  const TOKENS_PATH = process.env.FALDA_MCP_TOKENS ?? "./falda_mcp_tokens.json";
-
-  enforceEmbeddingLock(ROOT, DIM, "FALDA MCP");
-  requireTokenFile(TOKENS_PATH, "FALDA MCP");
-  const pools = new PoolManager({ root: ROOT, embed: selectEmbedder(DIM, "FALDA MCP"), dim: DIM });
-  const tokenStore = new TokenStore(TOKENS_PATH);
-
-  // MCP server shares the gateway's queue db if it exists.
-  const queueDbPath = pathJoin(ROOT, "distill_queue.db");
-  mkdirSync(ROOT, { recursive: true });
-  const mcpQueueDb = new Database(queueDbPath);
-  initQueueSchema(mcpQueueDb);
+  const runtime = buildRuntime({ label: "FALDA MCP" });
 
   createServer((req, res) => {
     if (req.method === "GET" && req.url === "/healthz") {
@@ -370,12 +362,12 @@ if (IS_MAIN) {
       res.end(JSON.stringify({ error: "not found" }));
       return;
     }
-    handleFaldaMcpRequest(pools, tokenStore, req, res, mcpQueueDb).catch((e) => {
+    handleFaldaMcpRequest(runtime.pools, runtime.tokenStore, req, res, runtime.queueDb).catch((e) => {
       console.error("[falda-mcp] fatal:", e);
       if (!res.headersSent) {
         res.writeHead(e instanceof PoolError ? 400 : 500, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: String(e?.message ?? e) }));
       }
     });
-  }).listen(PORT, () => console.log(`FALDA MCP server listening on :${PORT} (root=${ROOT}, tokens=${TOKENS_PATH})`));
+  }).listen(PORT, () => console.log(`FALDA MCP server listening on :${PORT} (root=${runtime.root})`));
 }

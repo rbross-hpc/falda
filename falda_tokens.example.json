@@ -1,0 +1,15 @@
+{
+  "_comment": "Canonical FALDA bearer tokens — shared by the HTTP API and the MCP endpoint when run via `falda serve` (see docs/API.md 'Authentication' and docs/MCP.md 'Auth model'). Copy to falda_tokens.json, replace the placeholder tokens (openssl rand -hex 24), and point FALDA_TOKENS at it. tenants[] is per-PROJECT, not per-container/agent — extend it every time you set up a new project against this token. Pool-admin routes (/pools/*, HTTP only) require a tenants: [\"*\"] token.",
+  "tokens": {
+    "REPLACE_WITH_openssl_rand_hex_24": {
+      "tenants": ["proj-a", "proj-b"],
+      "pools": ["shared-corpus"],
+      "label": "opencode container — proj-a & proj-b"
+    },
+    "REPLACE_WITH_ANOTHER_openssl_rand_hex_24": {
+      "tenants": ["*"],
+      "pools": [],
+      "label": "fully-trusted internal caller (any tenant; required for /pools/*)"
+    }
+  }
+}

@@ -57,16 +57,22 @@ The installer:
 ## Using the CLI
 
 ```bash
-cp falda_gateway_tokens.example.json falda_gateway_tokens.json  # fill in real tokens; required
-falda serve            # start the HTTP gateway (default :8077)
-falda health           # curl /healthz (unauthenticated)
-falda smoke            # re-run the offline smoke test
-falda build            # recompile to dist/
+cp falda_tokens.example.json falda_tokens.json  # fill in real tokens; required
+falda serve             # unified server: HTTP API (:8077) + MCP (:8079) + distillation worker
+falda serve --no-mcp    # HTTP API + worker only, no MCP listener
+falda health            # curl the HTTP API's /healthz (unauthenticated)
+falda smoke             # re-run the offline smoke test
+falda build             # recompile to dist/
 falda version
 ```
 
-The gateway requires a bearer-token file (`FALDA_TOKENS`) and refuses to boot
-without one — see `docs/API.md` "Authentication".
+`falda serve` requires a bearer-token file (`FALDA_TOKENS`) and refuses to
+boot without one — see `docs/API.md` "Authentication". This one token file
+is shared by both the HTTP API and the MCP endpoint.
+
+`falda gateway` and `falda mcp` remain available as legacy standalone entry
+points (HTTP-only / MCP-only, each its own process) for deployments that
+haven't migrated — see `docs/API.md` and `docs/MCP.md`.
 
 ## Using it as a library
 
@@ -86,21 +92,26 @@ const hits = await mem.recall("kukla", "what should I remember?");
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `FALDA_PORT` | `8077` | Gateway listen port |
-| `FALDA_TOKENS` | `./falda_gateway_tokens.json` | Bearer-token file (required — see `docs/API.md`) |
-| `FALDA_DB` | `./falda.db` | SQLite path (`:memory:` for ephemeral) |
+| `FALDA_PORT` | `8077` | HTTP API listen port |
+| `FALDA_MCP_PORT` | `8079` | MCP endpoint listen port |
+| `FALDA_ROOT` | `./falda-data` | Pool root dir (all tenant/pool stores) |
+| `FALDA_TOKENS` | `./falda_tokens.json` | Canonical bearer-token file, shared by HTTP and MCP (required — see `docs/API.md`) |
 | `FALDA_EMBED_BASE_URL` | _(unset)_ | OpenAI-compatible `/v1/embeddings` base URL |
 | `FALDA_EMBED_API_KEY` | _(unset)_ | API key for the embedder, if required |
 | `FALDA_EMBED_MODEL` | `nomic-embed-text` | Embedding model id |
 
+`FALDA_DB` (a single store's SQLite path) applies only when embedding
+`Falda` directly as a library, not to `falda serve`/`falda gateway`/`falda
+mcp`, which always address stores through `FALDA_ROOT` + the pool layer.
+
 With no embedder configured, FALDA uses a built-in **deterministic local
-embedder** so the gateway and all four tiers work fully offline out of the box
-(lexical FTS5/BM25 recall plus a no-network dense vector). Set
+embedder** so `falda serve` and all four tiers work fully offline out of the
+box (lexical FTS5/BM25 recall plus a no-network dense vector). Set
 `FALDA_EMBED_BASE_URL` (or `FALDA_EMBED=remote`) to switch to a real
 embedding model — local Ollama, self-hosted vLLM/llama.cpp, or any
 OpenAI-compatible service — for production-quality dense + hybrid recall.
 
-Embedder selection precedence (gateway):
+Embedder selection precedence (all server entry points, via `src/runtime.ts`):
 
 - `FALDA_EMBED=local` → force the offline deterministic embedder.
 - `FALDA_EMBED=remote` → require a configured `/v1/embeddings` endpoint.
@@ -109,7 +120,7 @@ Embedder selection precedence (gateway):
 
 > **Native addon / Node pinning.** `better-sqlite3` compiles a native addon
 > against the Node.js ABI of whatever `node` ran `npm install`. If you later
-> run the gateway under a *different* Node major version you may see
+> run `falda serve` under a *different* Node major version you may see
 > `ERR_DLOPEN_FAILED` / `NODE_MODULE_VERSION` mismatch. Fix: run FALDA under
 > the same Node you installed with, or rebuild with `npm rebuild better-sqlite3`.
 

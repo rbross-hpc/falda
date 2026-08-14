@@ -14,22 +14,7 @@
 import { PoolManager } from "../pools.js";
 import { selectEmbedder } from "../boot.js";
 import { distillOnce } from "./core.js";
-
-async function makeLLM(): Promise<(prompt: string) => Promise<string>> {
-  const baseUrl = process.env.FALDA_LLM_BASE_URL ?? "http://localhost:11434/v1";
-  const apiKey = process.env.FALDA_LLM_API_KEY ?? "x";
-  const model = process.env.FALDA_LLM_MODEL ?? "gpt-4o-mini";
-  return async (prompt: string): Promise<string> => {
-    const resp = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], temperature: 0 }),
-    });
-    if (!resp.ok) throw new Error(`LLM ${resp.status}: ${await resp.text()}`);
-    const j = (await resp.json()) as any;
-    return j.choices[0].message.content as string;
-  };
-}
+import { makeLLM } from "./llm.js";
 
 async function run(once: boolean, intervalMs: number): Promise<void> {
   const ROOT = process.env.FALDA_ROOT ?? "./falda-data";
@@ -43,7 +28,7 @@ async function run(once: boolean, intervalMs: number): Promise<void> {
   }
 
   const pools = new PoolManager({ root: ROOT, embed: selectEmbedder(DIM, "distill-cli"), dim: DIM });
-  const llm = await makeLLM();
+  const llm = makeLLM();
 
   const doPass = async () => {
     const store = pools.resolve(TENANT!, POOL, true);

@@ -71,32 +71,49 @@ const hits = await memory.searchAtoms("what temperature is the cryostat?", 3);
 
 ### As a service
 
+`falda serve` starts the unified server: the HTTP JSON API, the MCP
+endpoint, and the background distillation worker, all in one process
+sharing one runtime (one embedder, one auth store, one distillation queue).
+
 ```bash
-cp falda_gateway_tokens.example.json falda_gateway_tokens.json   # fill in real tokens
-npm run gateway     # JSON HTTP API on :8077
-curl localhost:8077/healthz   # unauthenticated
+cp falda_tokens.example.json falda_tokens.json   # fill in real tokens; shared by HTTP + MCP
+npm run serve        # HTTP JSON API on :8077, MCP on :8079
+curl localhost:8077/healthz   # HTTP API, unauthenticated
+curl localhost:8079/healthz   # MCP endpoint, unauthenticated
 curl -X POST localhost:8077/atoms/search \
   -H "Authorization: Bearer <token>" -H "X-Falda-Tenant: <tenant>" \
   -d '{"query":"..."}'
 ```
 
-See [`docs/API.md`](docs/API.md) for the full route table and auth model.
+Pass `--no-mcp` to run the HTTP API + distillation worker only, with no MCP
+listener (`falda serve --no-mcp`, or `npm run gateway` as a standalone legacy
+entry point — see below).
 
-### As an MCP server (opencode and other MCP clients)
+See [`docs/API.md`](docs/API.md) for the full HTTP route table and auth
+model, and [`docs/MCP.md`](docs/MCP.md) for the MCP tool table — both
+surfaces share one `TokenStore`/auth model but expose different operations
+by design (MCP is the restricted agent-facing surface; HTTP additionally
+exposes pool-admin routes).
 
 For deployments where many agents (e.g. containerized opencode instances)
-share one FALDA over a network, use the authenticated MCP server instead of
-the gateway directly:
-
-```bash
-cp falda_mcp_tokens.example.json falda_mcp_tokens.json   # fill in real tokens
-npm run mcp          # Streamable HTTP MCP endpoint on :8079
-curl localhost:8079/healthz
-```
-
-See [`docs/MCP.md`](docs/MCP.md) for the tool table and auth model, and
+share one FALDA over a network, point them at the MCP endpoint. See
 [`integrations/opencode/README.md`](integrations/opencode/README.md) for the
 opencode-specific setup (MCP config + auto-capture plugin).
+
+<details>
+<summary>Legacy standalone entry points (deprecated, kept for compatibility)</summary>
+
+Before the unified server, the HTTP API and MCP endpoint ran as two separate
+processes with two separate token files. Both still work standalone —
+`npm run gateway` / `npm run mcp` (`dist/gateway.js` / `dist/mcp.js`) — for
+existing deployments that haven't migrated. `falda gateway` starts only the
+HTTP API + distillation worker (no MCP); `falda mcp` starts only the MCP
+endpoint (no distillation worker — nothing drains the shared queue unless
+some other process owns it). Both now read the canonical `FALDA_TOKENS`
+(with the old `FALDA_MCP_TOKENS` honored as a deprecated fallback for the
+MCP entry point). New deployments should use `falda serve`.
+
+</details>
 
 To connect an agent runtime (Hermes, OpenClaw, opencode, or your own) to
 FALDA — shadow or live, single-tenant or shared-pool — see
@@ -104,8 +121,13 @@ FALDA — shadow or live, single-tenant or shared-pool — see
 
 ### Distillation (T0 → T1 → T2 → T3)
 
-Distillation runs **in-process inside the gateway** as a background worker
-(`src/distill/core.ts`). It uses any OpenAI-compatible chat model to:
+Distillation runs **in-process inside `falda serve`** (or its `falda
+gateway` legacy equivalent) as a background worker (`src/distill/worker.ts`,
+`src/distill/core.ts`). It is the canonical owner of the distillation
+queue — a job enqueued via `falda_distill` (MCP) or `POST /distill` (HTTP)
+is always drained by the same process that accepted it, because both
+protocol surfaces and the worker share one runtime (`src/runtime.ts`). It
+uses any OpenAI-compatible chat model to:
 
 - **T0 → T1**: extract typed atoms (`fact | pattern | preference | constraint |
   instruction`) from new turns, consolidate against existing atoms (merge/update/
@@ -115,19 +137,21 @@ Distillation runs **in-process inside the gateway** as a background worker
   hysteresis).
 - **T2 → T3**: synthesize a core document from the active scene structure.
 
-Distillation is triggered by: an interval timer inside the gateway, a `POST
-/distill` HTTP call, or the `falda_distill` MCP tool. Each trigger enqueues a
-job; a single in-process worker drains the queue.
+Distillation is triggered by: an interval timer inside `falda serve` (which
+also auto-enqueues every known self-store, so distillation runs continuously
+with no external trigger required), a `POST /distill` HTTP call, or the
+`falda_distill` MCP tool. Each trigger enqueues a job; the single in-process
+worker drains the queue.
 
 ```bash
-# Trigger a distillation pass from the CLI (one-shot, requires gateway running):
+# Trigger a distillation pass on demand (falda serve must be running):
 curl -s -X POST http://localhost:8077/distill \
   -H "Authorization: Bearer <token>" \
   -H "X-Falda-Tenant: my-agent" \
   -H "Content-Type: application/json" \
   -d '{}' | jq
 
-# Or via the CLI entrypoint (standalone, no gateway needed):
+# Or via the standalone CLI entrypoint (one-shot, no server process needed):
 FALDA_TENANT=my-agent FALDA_LLM_BASE_URL=http://localhost:8000/v1 \
   tsx src/distill/cli.ts --once
 ```
@@ -137,7 +161,7 @@ FALDA_TENANT=my-agent FALDA_LLM_BASE_URL=http://localhost:8000/v1 \
 | `FALDA_LLM_BASE_URL`    | `http://localhost:11434/v1` | chat-completions endpoint |
 | `FALDA_LLM_API_KEY`     | `x`                         | bearer token for chat endpoint |
 | `FALDA_LLM_MODEL`       | `gpt-4o-mini`               | extraction/synthesis model id |
-| `FALDA_WORKER_INTERVAL_MS` | `60000`                  | gateway worker poll interval |
+| `FALDA_WORKER_INTERVAL_MS` | `60000`                  | distillation worker poll interval |
 
 ---
 
@@ -152,10 +176,15 @@ locally (Ollama, vLLM, llama.cpp) or against a self-hosted lab server.
 | `FALDA_EMBED_API_KEY`   | `x`                            | bearer token (`x` for keyless local)   |
 | `FALDA_EMBED_MODEL`     | `nomic-embed-text`             | embedding model id                     |
 | `FALDA_DIM`             | `768`                          | must match the model's dimensionality  |
-| `FALDA_DB`              | `./falda.db`                 | SQLite file                            |
-| `FALDA_BLOBS`           | `./falda-blobs`              | scene + core blob directory            |
-| `FALDA_PORT`            | `8077`                         | gateway port                           |
-| `FALDA_TOKENS`          | `./falda_gateway_tokens.json`  | gateway bearer-token file (required — see `docs/API.md`) |
+| `FALDA_ROOT`            | `./falda-data`                | pool root dir (all tenant/pool stores) |
+| `FALDA_PORT`            | `8077`                         | HTTP JSON API port                     |
+| `FALDA_MCP_PORT`        | `8079`                         | MCP endpoint port                      |
+| `FALDA_TOKENS`          | `./falda_tokens.json`          | canonical bearer-token file, shared by HTTP and MCP (required — see `docs/API.md`) |
+
+`FALDA_DB`/`FALDA_BLOBS` (a single store's SQLite path/blob dir) apply only
+when embedding `Falda` directly as a library — see "As a library" above.
+`falda serve`/`falda gateway`/`falda mcp` always address stores through
+`FALDA_ROOT` + the pool layer (`docs/POOLS.md`), never a single `FALDA_DB`.
 
 Recommended open embedding models: `nomic-embed-text` (768), `BAAI/bge-base-en-v1.5`
 (768), `nomic-ai/nomic-embed-text-v1.5` (768). Set `FALDA_DIM` to match.
@@ -178,8 +207,10 @@ Recommended open embedding models: `nomic-embed-text` (768), `BAAI/bge-base-en-v
                           embeddings via OpenAI-compatible endpoint
 ```
 
-The store is a single embeddable class (`Falda`). The gateway is a thin
-JSON wrapper over it for multi-process or polyglot deployments.
+The store is a single embeddable class (`Falda`). `falda serve` layers the
+HTTP JSON API and MCP endpoint over one shared runtime (`src/runtime.ts`) as
+independent protocol adapters — for multi-process or polyglot deployments,
+or when embedding `Falda` directly isn't an option.
 
 ---
 

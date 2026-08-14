@@ -43,7 +43,8 @@
  *   /scenes/for-atom {atom_id, scene_kind?}              -> {items}
  *   /core/read       {}                                  -> {content}
  *   /core/write      {content}                           -> {ok}
- *   /distill         (reserved for Branch B)
+ *   /distill         {}                                  -> {job_id, store_key}
+ *   /distill/status  {job_id}                             -> DistillJob | {error}
  *
  * Pool admin routes (POST) — cross-tenant management, restricted to
  * fully-trusted (`tenants: ["*"]`) principals regardless of X-Falda-Tenant:
@@ -56,25 +57,26 @@
  *
  *   /healthz         (GET, unauthenticated)                        -> {ok, tiers}
  *
- * Env:
- *   FALDA_PORT         Port to listen on (default 8077).
- *   FALDA_TOKENS       Path to token file (default ./falda_gateway_tokens.json).
- *   FALDA_ROOT         Pool root dir (default ./falda-data).
- *   FALDA_DIM          Embedding dimensionality (default 768).
+ * Prefer `falda serve` (src/server.ts) for new deployments — it starts this
+ * same HTTP API alongside the MCP endpoint (src/mcp.ts) from one shared
+ * runtime (src/runtime.ts), with one canonical token file and one
+ * distillation worker for both surfaces. This module's own IS_MAIN entry
+ * point (`node dist/gateway.js`) is kept for backward compatibility and is
+ * equivalent to `falda serve --no-mcp`.
+ *
+ * Env: see src/runtime.ts for the canonical set (FALDA_ROOT, FALDA_DIM,
+ * FALDA_EMBED*, FALDA_TOKENS, FALDA_LLM_*). Gateway-specific:
+ *   FALDA_PORT               Port to listen on (default 8077).
+ *   FALDA_WORKER_INTERVAL_MS Distillation worker interval, ms (default 60000).
  */
 import { createServer } from "node:http";
-import { join as pathJoin } from "node:path";
-import { mkdirSync } from "node:fs";
 import Database from "better-sqlite3";
 import { PoolManager, PoolError } from "./pools.js";
-import { selectEmbedder, enforceEmbeddingLock } from "./boot.js";
-import { TokenStore, AuthError, parseBearer, requireTokenFile, type Principal } from "./mcp_auth.js";
+import { TokenStore, AuthError, parseBearer, type Principal } from "./mcp_auth.js";
 import { StreamConflictError, AtomImmutabilityError, AtomTypeError } from "./falda.js";
-import { initQueueSchema, enqueue, claimNext, completeJob, failJob, storeKeyFor, getJobAuthorized } from "./distill/queue.js";
-import { distillOnce } from "./distill/core.js";
-
-/** Module-level gateway queue database (set when IS_MAIN). */
-let gatewayQueueDb: Database.Database | null = null;
+import { enqueue, storeKeyFor, getJobAuthorized } from "./distill/queue.js";
+import { buildRuntime } from "./runtime.js";
+import { startDistiller } from "./distill/worker.js";
 
 /** Routes that mutate the addressed store (need readwrite on a shared pool). */
 const WRITE_ROUTES = new Set([
@@ -92,7 +94,14 @@ function headerValue(headers: Headers, name: string): string | undefined {
   return Array.isArray(v) ? v[0] : v;
 }
 
-async function handleData(pools: PoolManager, principal: Principal, headers: Headers, route: string, b: any) {
+async function handleData(
+  pools: PoolManager,
+  principal: Principal,
+  headers: Headers,
+  route: string,
+  b: any,
+  queueDb: Database.Database | undefined,
+) {
   const tenant = TokenStore.requireTenant(principal, headerValue(headers, "x-falda-tenant"));
   const pool = TokenStore.requirePool(principal, b.pool);
   const store = pools.resolve(tenant, pool, WRITE_ROUTES.has(route));
@@ -129,16 +138,16 @@ async function handleData(pools: PoolManager, principal: Principal, headers: Hea
       // store_key is always derived from the authenticated tenant+pool — never
       // from the request body, to prevent cross-tenant enqueue.
       const storeKey = storeKeyFor(tenant, pool ?? undefined);
-      if (!gatewayQueueDb) return { error: "distillation queue not initialized" };
-      const jobId = enqueue(gatewayQueueDb, storeKey);
+      if (!queueDb) return { error: "distillation queue not initialized" };
+      const jobId = enqueue(queueDb, storeKey);
       return { job_id: jobId, store_key: storeKey };
     }
     case "/distill/status": {
-      if (!gatewayQueueDb) return { error: "distillation queue not initialized" };
+      if (!queueDb) return { error: "distillation queue not initialized" };
       const callerKey = storeKeyFor(tenant, pool ?? undefined);
       // getJobAuthorized returns null for both missing and unauthorized jobs
       // so the caller cannot distinguish the two (no existence oracle).
-      const job = getJobAuthorized(gatewayQueueDb, b.job_id, callerKey);
+      const job = getJobAuthorized(queueDb, b.job_id, callerKey);
       return job ?? { error: "job not found" };
     }
     default: return undefined;
@@ -170,6 +179,7 @@ export async function handleRequest(
   headers: Headers,
   route: string,
   b: any,
+  queueDb?: Database.Database,
 ): Promise<{ status: number; body: any }> {
   try {
     const principal = tokenStore.authenticate(parseBearer(headers["authorization"]));
@@ -178,7 +188,7 @@ export async function handleRequest(
       if (out === undefined) return { status: 404, body: { error: "unknown route" } };
       return { status: 200, body: out };
     }
-    const out = await handleData(pools, principal, headers, route, b);
+    const out = await handleData(pools, principal, headers, route, b, queueDb);
     if (out === undefined) return { status: 404, body: { error: "unknown route" } };
     return { status: 200, body: out };
   } catch (e: any) {
@@ -204,92 +214,28 @@ export async function handleRequest(
   }
 }
 
-/** Start the in-process background distillation worker. Drains the queue
- *  by calling distillOnce() directly against the store via PoolManager.
- *  Also auto-enqueues every known self-store on each interval tick so
- *  distillation runs continuously without requiring an external trigger.
- *  Only distills 'self' stores (pools deferred to §13). */
-function startWorker(
-  queueDb: Database.Database,
-  pools: PoolManager,
-  llm: (prompt: string) => Promise<string>,
-  intervalMs = 60_000,
-) {
-  // Drain: claim the next ready job and run distillOnce against its store.
-  const drain = async () => {
-    const job = claimNext(queueDb);
-    if (!job) return;
-    const [tenant, poolName] = job.store_key.split(":", 2);
-    try {
-      const store = pools.resolve(tenant, poolName === "self" ? undefined : poolName, true);
-      await distillOnce(store, llm, { storeKey: job.store_key, verbose: false });
-      completeJob(queueDb, job.id);
-    } catch (e: any) {
-      failJob(queueDb, job.id, String(e?.message ?? e));
-    }
-  };
-
-  // Enqueue: discover every self-store on disk and enqueue it (coalescing
-  // dedups so a tenant with a pending job is never double-queued).
-  const enqueueAll = () => {
-    const tenants = pools.listSelfTenants();
-    for (const tenant of tenants) {
-      try {
-        enqueue(queueDb, storeKeyFor(tenant, undefined));
-      } catch (e) {
-        console.error(`[falda-worker] enqueue failed for tenant ${tenant}:`, e);
-      }
-    }
-    if (tenants.length > 0) {
-      console.log(`[falda-worker] enqueued ${tenants.length} self-store(s): ${tenants.join(", ")}`);
-    }
-  };
-
-  // Enqueue immediately on startup, then on every interval.
-  enqueueAll();
-  setInterval(enqueueAll, intervalMs);
-  // Drain on every interval (offset slightly so enqueue fires first on startup).
-  setInterval(() => { drain().catch(console.error); }, intervalMs);
-}
-
+/**
+ * Standalone entry point (legacy): `node dist/gateway.js` starts the HTTP
+ * API + distillation worker only, no MCP endpoint — equivalent to
+ * `falda serve --no-mcp`. Delegates to the same buildRuntime() the unified
+ * server uses (src/runtime.ts), so there is exactly one runtime bootstrap
+ * path regardless of which entry point is invoked. The HTTP listener here
+ * is intentionally self-contained (not imported from src/server.ts) to
+ * avoid a circular module dependency, since server.ts imports handleRequest
+ * from this file.
+ *
+ * FALDA_TOKENS is the canonical token file for both HTTP and MCP; see
+ * src/runtime.ts. Prefer `falda serve` for new deployments — this entry
+ * point is kept for backward compatibility with existing deployments that
+ * invoke dist/gateway.js directly.
+ */
 const IS_MAIN = process.argv[1]?.endsWith("gateway.js") || process.argv[1]?.endsWith("gateway.ts");
 if (IS_MAIN) {
   const PORT = Number(process.env.FALDA_PORT ?? 8077);
-  const DIM = Number(process.env.FALDA_DIM ?? 768);
-  const ROOT = process.env.FALDA_ROOT ?? "./falda-data";
-  const TOKENS_PATH = process.env.FALDA_TOKENS ?? "./falda_gateway_tokens.json";
   const WORKER_INTERVAL_MS = Number(process.env.FALDA_WORKER_INTERVAL_MS ?? 60_000);
-  const LLM_BASE = process.env.FALDA_LLM_BASE_URL ?? "http://localhost:11434/v1";
-  const LLM_KEY = process.env.FALDA_LLM_API_KEY ?? "x";
-  const LLM_MODEL = process.env.FALDA_LLM_MODEL ?? "gpt-4o-mini";
 
-  enforceEmbeddingLock(ROOT, DIM, "FALDA gateway");
-  requireTokenFile(TOKENS_PATH, "FALDA gateway");
-
-  const pools = new PoolManager({ root: ROOT, embed: selectEmbedder(DIM, "FALDA gateway"), dim: DIM });
-  const tokenStore = new TokenStore(TOKENS_PATH);
-
-  // Gateway-level queue db (separate from per-store dbs).
-  // busy_timeout lets the gateway wait for the MCP server's concurrent
-  // enqueue writes (also on this db) to clear rather than throwing SQLITE_BUSY.
-  const queueDbPath = pathJoin(ROOT, "distill_queue.db");
-  mkdirSync(ROOT, { recursive: true });
-  gatewayQueueDb = new Database(queueDbPath);
-  gatewayQueueDb.pragma("busy_timeout = 5000");
-  initQueueSchema(gatewayQueueDb);
-
-  const llm = async (prompt: string): Promise<string> => {
-    const resp = await fetch(`${LLM_BASE}/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${LLM_KEY}` },
-      body: JSON.stringify({ model: LLM_MODEL, messages: [{ role: "user", content: prompt }], temperature: 0 }),
-    });
-    if (!resp.ok) throw new Error(`LLM ${resp.status}: ${await resp.text()}`);
-    const j = (await resp.json()) as any;
-    return j.choices[0].message.content as string;
-  };
-
-  startWorker(gatewayQueueDb, pools, llm, WORKER_INTERVAL_MS);
+  const runtime = buildRuntime({ label: "FALDA gateway" });
+  startDistiller(runtime.queueDb, runtime.pools, runtime.llm, WORKER_INTERVAL_MS);
 
   createServer((req, res) => {
     if (req.method === "GET" && req.url === "/healthz") {
@@ -302,7 +248,9 @@ if (IS_MAIN) {
     req.on("end", async () => {
       try {
         const parsed = body ? JSON.parse(body) : {};
-        const { status, body: out } = await handleRequest(pools, tokenStore, req.headers, req.url ?? "", parsed);
+        const { status, body: out } = await handleRequest(
+          runtime.pools, runtime.tokenStore, req.headers, req.url ?? "", parsed, runtime.queueDb,
+        );
         res.writeHead(status, { "content-type": "application/json" });
         res.end(JSON.stringify(out));
       } catch (e: any) {
@@ -310,5 +258,5 @@ if (IS_MAIN) {
         res.end(JSON.stringify({ error: String(e?.message ?? e) }));
       }
     });
-  }).listen(PORT, () => console.log(`FALDA gateway listening on :${PORT} (root=${ROOT}, tokens=${TOKENS_PATH})`));
+  }).listen(PORT, () => console.log(`FALDA gateway listening on :${PORT} (root=${runtime.root})`));
 }
