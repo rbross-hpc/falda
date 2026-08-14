@@ -70,7 +70,7 @@ import { PoolManager, PoolError } from "./pools.js";
 import { selectEmbedder, enforceEmbeddingLock } from "./boot.js";
 import { TokenStore, AuthError, parseBearer, requireTokenFile, type Principal } from "./mcp_auth.js";
 import { StreamConflictError, AtomImmutabilityError, AtomTypeError } from "./falda.js";
-import { initQueueSchema, enqueue, claimNext, completeJob, failJob, getJob } from "./distill/queue.js";
+import { initQueueSchema, enqueue, claimNext, completeJob, failJob, storeKeyFor, getJobAuthorized } from "./distill/queue.js";
 import { distillOnce } from "./distill/core.js";
 
 /** Module-level gateway queue database (set when IS_MAIN). */
@@ -126,16 +126,19 @@ async function handleData(pools: PoolManager, principal: Principal, headers: Hea
     case "/core/read":       return { content: store.readCore() };
     case "/core/write":      return (store.writeCore(b.content ?? ""), { ok: true });
     case "/distill": {
-      // Enqueue a distillation job. Queue db is the gateway-level queue db (passed via closure).
-      // The body may optionally specify a store_key; otherwise derived from tenant+pool.
-      const storeKey = b.store_key ?? `${tenant}:${pool ?? "self"}`;
+      // store_key is always derived from the authenticated tenant+pool — never
+      // from the request body, to prevent cross-tenant enqueue.
+      const storeKey = storeKeyFor(tenant, pool ?? undefined);
       if (!gatewayQueueDb) return { error: "distillation queue not initialized" };
       const jobId = enqueue(gatewayQueueDb, storeKey);
       return { job_id: jobId, store_key: storeKey };
     }
     case "/distill/status": {
       if (!gatewayQueueDb) return { error: "distillation queue not initialized" };
-      const job = getJob(gatewayQueueDb, b.job_id);
+      const callerKey = storeKeyFor(tenant, pool ?? undefined);
+      // getJobAuthorized returns null for both missing and unauthorized jobs
+      // so the caller cannot distinguish the two (no existence oracle).
+      const job = getJobAuthorized(gatewayQueueDb, b.job_id, callerKey);
       return job ?? { error: "job not found" };
     }
     default: return undefined;

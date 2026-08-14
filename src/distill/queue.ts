@@ -98,7 +98,32 @@ export function failJob(db: Database.Database, jobId: string, error: string): vo
 }
 
 export function getJob(db: Database.Database, jobId: string): DistillJob | null {
-  return db.prepare("SELECT * FROM distill_jobs WHERE id=?").get(jobId) as DistillJob | null;
+  const row = db.prepare("SELECT * FROM distill_jobs WHERE id=?").get(jobId);
+  return (row ?? null) as DistillJob | null;
+}
+
+/**
+ * Canonical store key for a (tenant, pool) pair. Matches the format used by
+ * falda_distill / POST /distill when enqueuing: "<tenant>:<pool>".
+ * pool=undefined/"self" → "<tenant>:self".
+ */
+export function storeKeyFor(tenant: string, pool: string | undefined): string {
+  return `${tenant}:${pool ?? "self"}`;
+}
+
+/**
+ * Retrieve a job only if its store_key matches the caller's authorized
+ * (tenant, pool). Returns null for both missing jobs AND unauthorized access,
+ * so the caller cannot distinguish the two — no existence oracle.
+ */
+export function getJobAuthorized(
+  db: Database.Database,
+  jobId: string,
+  callerStoreKey: string,
+): DistillJob | null {
+  const job = getJob(db, jobId);
+  if (!job || job.store_key !== callerStoreKey) return null;
+  return job;
 }
 
 export function listJobs(
