@@ -393,6 +393,106 @@ describe("assembleContext", () => {
       assert.ok(ctx.scenes.length > 0, "scenes included");
     } finally { cleanup(s, blobDir); }
   });
+
+  test("per-tier budgets prevent atoms from starving scenes and core", async () => {
+    // The regression: with enough relevant atoms, scenes and core got 0 chars.
+    // Now each tier has a reserved allowance; atoms cannot consume past ~40%.
+    const { s, blobDir } = makeStore();
+    try {
+      // Fill store with many relevant atoms.
+      for (let i = 0; i < 15; i++) {
+        await s.upsertAtom({ type: "fact", content: `Neutron detector fact ${i}: calibration parameter at ${i * 1.1} MeV.` });
+      }
+      // A relevant scene.
+      const a = await s.upsertAtom({ type: "fact", content: "Detector stable at 4.2K" });
+      await s.upsertScene({
+        scene_kind: "topic", title: "Neutron detector calibration",
+        atom_ids: [a.id], summary: "Episode covering detector calibration runs.",
+      });
+      // A core document.
+      s.writeCore("# Lab core\n\nNuclear physics experiment system.");
+
+      const budget = 4000;
+      const ctx = await assembleContext(s, "neutron detector calibration", budget);
+
+      // Atoms should not have consumed the entire budget.
+      assert.ok(
+        ctx.per_tier_chars.atoms <= budget * 0.42,
+        `atoms (${ctx.per_tier_chars.atoms}) should not exceed ~40% of budget (${budget * 0.42})`,
+      );
+      // Scenes must have had an opportunity to participate.
+      assert.ok(ctx.scenes.length > 0, "scenes got chars despite many atoms");
+      // Core must have had an opportunity to participate.
+      assert.ok(ctx.core !== null, "core got chars despite many atoms");
+      // Total still within budget.
+      assert.ok(ctx.total_chars <= budget, `total within budget`);
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("per_tier_chars breakdown sums to total_chars", async () => {
+    const { s, blobDir } = makeStore();
+    try {
+      await s.upsertAtom({ type: "fact", content: "A durable fact about the system." });
+      s.writeCore("# Core\n\nSystem overview.");
+      const ctx = await assembleContext(s, "system", 3000);
+      const sum = ctx.per_tier_chars.pinned + ctx.per_tier_chars.atoms +
+                  ctx.per_tier_chars.scenes + ctx.per_tier_chars.core;
+      assert.equal(sum, ctx.total_chars, "per_tier_chars sums to total_chars");
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("unused tier budget spills to later tiers", async () => {
+    // With no pinned atoms, the pinned allowance (20%) rolls forward.
+    // Fill atoms with long content that would exceed their nominal 40% slice
+    // (800 chars of 2000) but fits within the 60% cap (pinned 20% + atoms 40%).
+    const { s, blobDir } = makeStore();
+    try {
+      // ~70 chars each; 14 of them = ~980 chars > 40% of 2000 (800).
+      for (let i = 0; i < 14; i++) {
+        const pad = "x".repeat(30);
+        await s.upsertAtom({ type: "fact", content: `Calibration fact ${i} ${pad} about neutron detector energy measurement.` });
+      }
+      // No pinned atoms — pinned budget (20%) should spill to atoms.
+      const budget = 2000;
+      const ctx = await assembleContext(s, "calibration neutron detector", budget);
+      assert.equal(ctx.per_tier_chars.pinned, 0, "no pinned chars (none pinned)");
+      // With spillover, atoms cap is 60% (1200). Without spillover it would be 40% (800).
+      // Assert atoms consumed more than 40% — i.e. they used the spilled budget.
+      assert.ok(ctx.per_tier_chars.atoms > budget * 0.40, `atoms (${ctx.per_tier_chars.atoms}) exceeded 40% thanks to spillover`);
+      assert.ok(ctx.per_tier_chars.atoms <= budget * 0.62, "atoms stayed within 60% cap");
+      assert.ok(ctx.total_chars <= budget, "still within total budget");
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("custom TierBudgets override respected", async () => {
+    const { s, blobDir } = makeStore();
+    try {
+      for (let i = 0; i < 10; i++) {
+        await s.upsertAtom({ type: "fact", content: `System fact ${i} about the neutron source energy.` });
+      }
+      s.writeCore("# Core\n\nThis is the core document with important system context.");
+      // Give core 60% of the budget.
+      const budget = 2000;
+      const ctx = await assembleContext(s, "neutron energy", budget, { pinned: 0.05, atoms: 0.15, scenes: 0.20, core: 0.60 });
+      const coreMax = budget * 0.62; // 60% + possible spillover from other tiers
+      assert.ok(ctx.per_tier_chars.core > 0, "core has chars with high core fraction");
+      assert.ok(ctx.total_chars <= budget, "total within budget");
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("getPinnedAtoms returns only active pinned atoms", async () => {
+    const { s, blobDir } = makeStore();
+    try {
+      await s.upsertAtom({ type: "fact", content: "not pinned" });
+      const p1 = await s.upsertAtom({ type: "instruction", content: "always verify", pinned: true });
+      const p2 = await s.upsertAtom({ type: "instruction", content: "never delete production", pinned: true });
+      s.archiveAtom(p2.id); // archived — should not appear
+
+      const pinned = s.getPinnedAtoms();
+      assert.equal(pinned.length, 1, "only active pinned atoms returned");
+      assert.equal(pinned[0].id, p1.id);
+    } finally { cleanup(s, blobDir); }
+  });
 });
 
 // ─── 5. MCP distill tool registration ─────────────────────────────────────────

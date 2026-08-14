@@ -884,17 +884,20 @@ export class Falda {
 
   // ─── Recall: pinned-first + hybrid re-rank ────────────────────────────────────
 
+  /** Return all active pinned atoms. Public primitive — avoids callers reaching into .db. */
+  getPinnedAtoms(): Atom[] {
+    return (this.db.prepare(
+      "SELECT * FROM atoms WHERE status='active' AND pinned=1"
+    ).all() as any[]).map(rowToAtom);
+  }
+
   async recallAtoms(query: string, limit = 10): Promise<AtomHit[]> {
-    const w = this.weights;
     const pinnedBudget = Math.floor(TOTAL_CHAR_BUDGET * PINNED_BUDGET_FRACTION);
     let usedChars = 0;
     const results: AtomHit[] = [];
 
     // Pinned-first pass: all active pinned atoms, unconditionally.
-    const pinned = (this.db.prepare(
-      "SELECT * FROM atoms WHERE status='active' AND pinned=1"
-    ).all() as any[]).map(rowToAtom);
-    for (const a of pinned) {
+    for (const a of this.getPinnedAtoms()) {
       const truncated = truncate(a.content);
       if (usedChars + truncated.length > pinnedBudget) break;
       usedChars += truncated.length;
