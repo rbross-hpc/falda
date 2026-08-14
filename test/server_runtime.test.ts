@@ -92,7 +92,10 @@ describe("HTTP and MCP share one runtime", () => {
   before(() => {
     ({ runtime, root } = makeTestRuntime());
     httpServer = startHttpApi(runtime, 0);
-    mcpServer = startMcp(runtime, 0);
+    // "full" toolset: this suite exercises falda_atoms_search directly to
+    // prove HTTP/MCP share one store — that tool lives in the advanced
+    // surface under the new compact-default toolset (see mcp/registry.ts).
+    mcpServer = startMcp(runtime, 0, "full");
     httpPort = (httpServer.address() as any).port;
     mcpPort = (mcpServer.address() as any).port;
   });

@@ -663,11 +663,17 @@ export class Falda {
     }
   }
 
-  /** Archive an atom (retire without replacement). */
-  archiveAtom(id: string): void {
-    this.db.prepare("UPDATE atoms SET status='archived',updated_at=? WHERE id=?")
+  /**
+   * Archive an atom (logical forgetting — retire without replacement).
+   * Returns the number of rows changed (0 or 1): 0 means no *active* atom
+   * matched `id` (already archived/superseded/merged, or unknown) — this is
+   * not an existence oracle since the store handle is already tenant-scoped.
+   */
+  archiveAtom(id: string): number {
+    const res = this.db.prepare("UPDATE atoms SET status='archived',updated_at=? WHERE id=? AND status='active'")
       .run(new Date().toISOString(), id);
     // Scene/core regeneration handled lazily by next distillOnce() pass.
+    return res.changes;
   }
 
   updateConfidence(id: string, confidence: AtomConfidence): void {

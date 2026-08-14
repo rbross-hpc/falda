@@ -1,9 +1,9 @@
 /**
- * Private cross-tier context assembly (§8.9).
+ * Cross-tier context assembly (§8.9).
  *
- * Evaluation-only — not exposed via gateway or MCP.
- * Used by the retrieval evaluation harness to test whether cross-tier
- * assembly adds value beyond atom-ranking alone.
+ * Backs the compact `falda_recall` MCP tool (src/mcp/tools/recall.ts) as well
+ * as the retrieval evaluation harness, which uses it to test whether
+ * cross-tier assembly adds value beyond atom-ranking alone.
  *
  * Budget model: each tier gets a reserved fraction of the total budget.
  * Unused budget from one tier spills forward to the next, so nothing is
@@ -40,6 +40,13 @@ const DEFAULT_TIER_BUDGETS: TierBudgets = {
   core:   0.15,
 };
 
+export interface ContextHit {
+  tier: "T1" | "T2" | "T3";
+  id: string;
+  score?: number;
+  pinned?: boolean;
+}
+
 export interface AssembledContext {
   pinned_atoms: string[];
   ranked_atoms: string[];
@@ -49,6 +56,10 @@ export interface AssembledContext {
   budget_chars: number;
   /** Chars actually used per tier (for eval assertions). */
   per_tier_chars: { pinned: number; atoms: number; scenes: number; core: number };
+  /** Structured provenance for each item actually admitted into the context. */
+  hits: ContextHit[];
+  /** True if any tier had a candidate that didn't fit its budget. */
+  truncated: boolean;
 }
 
 export async function assembleContext(
@@ -71,6 +82,7 @@ export async function assembleContext(
   let coreAllowance   = budget - pinnedAllowance - atomsAllowance - scenesAllowance; // remainder
 
   let spillover = 0;
+  let truncated = false;
   const ctx: AssembledContext = {
     pinned_atoms: [],
     ranked_atoms: [],
@@ -79,30 +91,35 @@ export async function assembleContext(
     total_chars: 0,
     budget_chars: budget,
     per_tier_chars: { pinned: 0, atoms: 0, scenes: 0, core: 0 },
+    hits: [],
+    truncated: false,
   };
 
   // ── 1. Pinned atoms ────────────────────────────────────────────────────────
   const pinnedCap = pinnedAllowance; // no spillover into pinned from prior tiers
-  for (const a of store.getPinnedAtoms()) {
+  const pinnedAtoms = store.getPinnedAtoms();
+  for (const a of pinnedAtoms) {
     const t = truncate(a.content);
-    if (ctx.per_tier_chars.pinned + t.length > pinnedCap) break;
+    if (ctx.per_tier_chars.pinned + t.length > pinnedCap) { truncated = true; break; }
     ctx.pinned_atoms.push(t);
     ctx.per_tier_chars.pinned += t.length;
+    ctx.hits.push({ tier: "T1", id: a.id, pinned: true });
   }
   spillover = pinnedAllowance - ctx.per_tier_chars.pinned;
 
   // ── 2. Query-ranked atoms ──────────────────────────────────────────────────
   const atomsCap = atomsAllowance + spillover;
   spillover = 0;
-  const pinnedIds = new Set(store.getPinnedAtoms().map((a) => a.id));
+  const pinnedIds = new Set(pinnedAtoms.map((a) => a.id));
   const atomLimit = Math.max(10, Math.ceil(atomsCap / 200));
   const rankedAtoms = await store.searchAtoms(query, atomLimit);
   for (const atom of rankedAtoms) {
     if (pinnedIds.has(atom.id)) continue;
     const t = truncate(atom.content);
-    if (ctx.per_tier_chars.atoms + t.length > atomsCap) break;
+    if (ctx.per_tier_chars.atoms + t.length > atomsCap) { truncated = true; break; }
     ctx.ranked_atoms.push(t);
     ctx.per_tier_chars.atoms += t.length;
+    ctx.hits.push({ tier: "T1", id: atom.id, score: atom.score });
   }
   spillover = atomsCap - ctx.per_tier_chars.atoms;
 
@@ -116,9 +133,10 @@ export async function assembleContext(
       ? `[${sc.scene_kind}] ${sc.title}\n${sc.summary}`
       : `[${sc.scene_kind}] ${sc.title}`;
     const t = truncate(text);
-    if (ctx.per_tier_chars.scenes + t.length > scenesCap) break;
+    if (ctx.per_tier_chars.scenes + t.length > scenesCap) { truncated = true; break; }
     ctx.scenes.push(t);
     ctx.per_tier_chars.scenes += t.length;
+    ctx.hits.push({ tier: "T2", id: sc.scene_id, score: sc.score });
   }
   spillover = scenesCap - ctx.per_tier_chars.scenes;
 
@@ -129,6 +147,10 @@ export async function assembleContext(
     const t = truncate(core, coreCap);
     ctx.core = t;
     ctx.per_tier_chars.core = t.length;
+    ctx.hits.push({ tier: "T3", id: "core" });
+    if (t.length < core.length) truncated = true;
+  } else if (core) {
+    truncated = true;
   }
 
   ctx.total_chars =
@@ -136,6 +158,7 @@ export async function assembleContext(
     ctx.per_tier_chars.atoms +
     ctx.per_tier_chars.scenes +
     ctx.per_tier_chars.core;
+  ctx.truncated = truncated;
 
   return ctx;
 }

@@ -111,24 +111,27 @@ need a public-facing endpoint, terminate TLS in front of it (see
 
 ## Tools
 
+**The tiers (T0/T1/T2/T3) are FALDA's internal memory model, not the
+agent's API vocabulary.** By default, agents see a small,
+intention-oriented tool set: ask FALDA to recall, remember, forget, or
+distill. FALDA decides internally which tiers to read or write to satisfy
+that intent — the model never has to choose between "search atoms" vs.
+"search scenes" vs. "read core."
+
 All tools accept an optional `pool` argument (must be in the token's `pools`
 allow-list; omit for the tenant's private `self` store).
 
-| Tool | Tier | R/W | Description |
-|---|---|---|---|
-| `falda_stream_search` | T0 Stream | read | Hybrid dense+lexical search over raw turns |
-| `falda_stream_query` | T0 Stream | read | List turns by session/time window |
-| `falda_stream_add` | T0 Stream | write | Append raw turns (supports `turn_index`/`turn_id` for idempotency) |
-| `falda_atoms_search` | T1 Atoms | read | Hybrid dense+lexical search over distilled atoms (active only, blended re-rank) |
-| `falda_atoms_query` | T1 Atoms | read | List atoms by type/time window (active by default) |
-| `falda_atoms_upsert` | T1 Atoms | write | Create or update metadata of a distilled atom. Content/type are immutable post-write. |
-| `falda_scenes_search` | T2 Scenes | read | Hybrid dense+lexical search over scenes (episodes + topics) |
-| `falda_scenes_query` | T2 Scenes | read | List scenes by kind/status |
-| `falda_scenes_get` | T2 Scenes | read | Get a single scene by id |
-| `falda_core_read` | T3 Core | read | Read the persona/project core document |
-| `falda_distill` | — | write | Enqueue a distillation job; returns `{job_id, store_key}`. Async. |
-| `falda_distill_status` | — | read | Poll a distillation job by `job_id`. |
-| `falda_whoami` | — | read | Return the tenant this connection resolves to |
+### Default surface (`FALDA_MCP_TOOLSET` unset or `default`)
+
+| Tool | R/W | When to use |
+|---|---|---|
+| `falda_recall` | read | **Primary retrieval tool.** Search long-term memory for anything relevant to the current task — prior facts, preferences, constraints, instructions, or related episodes. Assembles cross-tier context (pinned atoms, ranked T1 atoms, T2 scenes, T3 core) under a character budget and returns `{context, hits, truncated}`. |
+| `falda_remember` | write | Save a durable fact, pattern, preference, constraint, or standing instruction for future sessions. Not for transient details relevant only to the current conversation. Content is immutable — a changed proposition becomes a new memory, never an edit of the old one. |
+| `falda_forget` | write | Stop recalling a previously stored memory (`atom_id` from `falda_remember`/a `falda_recall` hit). Logical forgetting only — moves it from active to archived; does not erase historical/provenance evidence. Not privacy erasure. |
+| `falda_distill` | write | Enqueue a distillation job for the addressed store; returns `{job_id, store_key}`. Async — a background worker already distills periodically, so this is for requesting an out-of-cycle run. |
+| `falda_distill_status` | read | Poll a distillation job by `job_id`. Returns `pending \| running \| done \| failed/dead`. Enforces tenant/pool ownership of the job (no existence oracle for jobs you don't own). |
+| `falda_whoami` | read | Return the tenant this connection resolves to. |
+| `falda_stream_add` | write | **Machine/harness ingestion**, not an interactive tool. Appends raw conversation turns (T0) for later distillation. Normally called automatically by a capture plugin/harness integration after each turn (see `integrations/opencode/plugin`) — the model should generally prefer `falda_remember` over calling this directly. Stays on the default endpoint (not `full`-gated) because MCP cannot hide a registered tool from one caller while exposing it to another on the same endpoint. |
 
 **Atom type enum:** `fact | pattern | preference | constraint | instruction`.
 Out-of-set values are rejected as errors (no coercion).
@@ -139,14 +142,42 @@ full `tenants`/`pools` allow-lists. Use it to confirm which tenant a given
 connection actually addresses (e.g. after changing a project's
 `opencode.json`), not to enumerate what a token can reach.
 
-**T2 Scenes and T3 Core are intentionally read-only over MCP for agents.**
-Those tiers are populated by the in-process distillation pipeline (triggered
-via `falda_distill` / `POST /distill` / an interval timer inside
-`falda serve`, and always drained by that same process's worker — see
-`docs/API.md` "Distillation"), not by freehand agent edits. Pool
-administration (`/pools/declare`, `/pools/grant`, ...) is likewise **not**
-exposed over MCP — use the HTTP API's `/pools/*` routes from an
-internal/admin context.
+### Advanced/debug surface (`FALDA_MCP_TOOLSET=full`)
+
+Adds the tier-specific storage primitives the compact tools are built on
+top of — for diagnostics, migrations, and workflows that genuinely need
+low-level tier access. Implementations are unchanged from before this
+tool set was introduced; nothing here is new capability, only visibility.
+
+| Tool | Tier | R/W | Description |
+|---|---|---|---|
+| `falda_stream_search` | T0 Stream | read | Hybrid dense+lexical search over raw turns |
+| `falda_stream_query` | T0 Stream | read | List turns by session/time window |
+| `falda_atoms_search` | T1 Atoms | read | Hybrid dense+lexical search over distilled atoms (active only, blended re-rank) |
+| `falda_atoms_query` | T1 Atoms | read | List atoms by type/time window (active by default) |
+| `falda_atoms_upsert` | T1 Atoms | write | Create or update metadata of a distilled atom, including `id`/`confidence`/`supersedes` and immediate pinning. Content/type are immutable post-write. |
+| `falda_scenes_search` | T2 Scenes | read | Hybrid dense+lexical search over scenes (episodes + topics) |
+| `falda_scenes_query` | T2 Scenes | read | List scenes by kind/status |
+| `falda_scenes_get` | T2 Scenes | read | Get a single scene by id |
+| `falda_core_read` | T3 Core | read | Read the persona/project core document |
+
+**T2 Scenes and T3 Core are intentionally read-only over MCP for agents,
+even in `full`.** Those tiers are populated by the in-process distillation
+pipeline (triggered via `falda_distill` / `POST /distill` / an interval
+timer inside `falda serve`, and always drained by that same process's
+worker — see `docs/API.md` "Distillation"), not by freehand agent edits.
+Pool administration (`/pools/declare`, `/pools/grant`, ...) is likewise
+**not** exposed over MCP in either toolset — use the HTTP API's `/pools/*`
+routes from an internal/admin context.
+
+### Choosing a toolset
+
+Set `FALDA_MCP_TOOLSET=full` (env var on the `falda serve`/`falda mcp`
+process) to expose the advanced tools alongside the default ones — useful
+for a debugging session or an admin/migration script. The underlying
+service methods (`Falda.searchAtoms`, `upsertAtom`, etc.) are never
+removed; `full` only changes which tools are *registered* on the MCP
+endpoint. `default` is the recommended setting for normal agent use.
 
 ## Environment
 
@@ -156,6 +187,7 @@ API when run via `falda serve`). MCP-specific:
 | var | meaning | default |
 |---|---|---|
 | `FALDA_MCP_PORT` | port to listen on | `8079` |
+| `FALDA_MCP_TOOLSET` | `default` (compact agent API) or `full` (+ tier-specific advanced tools) | `default` |
 | `FALDA_ROOT` | pool root dir (shared with the HTTP API) | `./falda-data` |
 | `FALDA_TOKENS` | canonical token file, shared by HTTP and MCP | `./falda_tokens.json` |
 | `FALDA_MCP_TOKENS` | **deprecated** fallback for `FALDA_TOKENS`, honored with a startup warning for the standalone `falda mcp` entry point only | — |

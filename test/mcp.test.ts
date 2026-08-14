@@ -3,6 +3,11 @@
  * on top of the pool isolation already proven by test/pools.test.ts.
  * Fully offline (deterministic local embedder, temp root + temp token file).
  *
+ * Exercises the advanced/full toolset (falda_atoms_*, falda_scenes_*) — the
+ * compact default toolset's auth/isolation behavior is proven separately in
+ * test/mcp_compact.test.ts, since it shares the same underlying
+ * pools.resolve()-based store scoping.
+ *
  * Guarantees under test:
  *   1. Unknown/missing bearer token is rejected (401) before any tool runs.
  *   2. A token may only select a tenant in its `tenants` allow-list; a
@@ -27,7 +32,7 @@ import { handleFaldaMcpRequest } from "../src/mcp.js";
 function startTestServer(pools: PoolManager, tokenStore: TokenStore): Promise<{ server: Server; port: number }> {
   return new Promise((resolve) => {
     const httpServer = createServer((req, res) => {
-      handleFaldaMcpRequest(pools, tokenStore, req, res).catch((e) => {
+      handleFaldaMcpRequest(pools, tokenStore, req, res, undefined, { toolset: "full" }).catch((e) => {
         console.error(e);
         if (!res.headersSent) { res.writeHead(500); res.end(JSON.stringify({ error: String(e) })); }
       });
