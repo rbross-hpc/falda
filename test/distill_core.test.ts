@@ -395,6 +395,42 @@ describe("distillOnce", () => {
       assert.equal(epAfterPass2[0].title, "Detector Incident Resolved", "title updated to new LLM output");
     } finally { cleanup(s, blobDir); }
   });
+
+  test("core hash-gate: unchanged scene structure skips L3 on second pass", async () => {
+    const { s, blobDir } = makeStore();
+    try {
+      await s.addStream("sess-core", [{ role: "user", content: "deploy script lives in bin/release" }]);
+
+      // Pass 1: atoms + scenes created, core synthesized.
+      const llmPass1 = makeMockLLM([
+        `{"type":"fact","content":"Deploy script in bin/release.","confidence":"high"}`,
+        `{"action":"store","target_ids":[],"rationale":"New."}`,
+        "Deploy session", "Deploy process discussed.",
+        "Deploy topic", "Deploy facts.",
+        "# Core\nDeploy in bin/release.",
+      ]);
+      const r1 = await distillOnce(s, llmPass1, { storeKey: "core-gate-test:self" });
+      assert.ok(r1.core_regenerated, "core generated on first pass");
+
+      // Pass 2: add a new turn so L1 runs (new seq > watermark).
+      await s.addStream("sess-core", [{ role: "user", content: "also see INSTALL.md" }]);
+
+      // L2 produces the same scene structure (same atoms modulo the new one,
+      // which the LLM skips). If the new atom IS stored but scene membership
+      // changes, core would legitimately regenerate — so we skip the new atom.
+      const llmPass2 = makeMockLLM([
+        // extraction produces a candidate
+        `{"type":"fact","content":"See INSTALL.md for details.","confidence":"low"}`,
+        // consolidation skips it
+        `{"action":"skip","target_ids":[],"rationale":"Low-value."}`,
+        // L2 scene title/summary: content_hash unchanged if atoms unchanged
+        // → scene LLM calls not made (hash-gated). Core input unchanged.
+        // L3 should NOT call LLM at all.
+      ]);
+      const r2 = await distillOnce(s, llmPass2, { storeKey: "core-gate-test:self" });
+      assert.equal(r2.core_regenerated, false, "core NOT regenerated when input structure unchanged");
+    } finally { cleanup(s, blobDir); }
+  });
 });
 
 // ─── 4. assembleContext ────────────────────────────────────────────────────────
