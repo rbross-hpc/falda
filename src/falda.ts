@@ -107,6 +107,7 @@ export interface Scene {
   atom_ids: string[];
   summary: string | null;
   content_hash: string | null;
+  render_hash: string | null;
   status: SceneStatus;
   derived_from: string[] | null;
   superseded_by: string[] | null;
@@ -207,12 +208,22 @@ function rowToScene(row: any): Scene {
     atom_ids: row.atom_ids ? JSON.parse(row.atom_ids) : [],
     summary: row.summary ?? null,
     content_hash: row.content_hash ?? null,
+    render_hash: row.render_hash ?? null,
     status: (row.status ?? "active") as SceneStatus,
     derived_from: row.derived_from ? JSON.parse(row.derived_from) : null,
     superseded_by: row.superseded_by ? JSON.parse(row.superseded_by) : null,
     created_at: row.created_at,
     updated_at: row.updated_at,
   };
+}
+
+/** Stable render hash for embedding re-index gating.
+ *  hash(title + "\n" + (summary ?? ""))
+ *  Changes only when the text that gets embedded changes — title or summary.
+ *  Distinct from content_hash (membership-based) to avoid re-embedding on
+ *  every structural reconciliation where title/summary did not change. */
+function computeRenderHash(title: string, summary: string | null): string {
+  return createHash("sha256").update(`${title}\n${summary ?? ""}`).digest("hex");
 }
 
 // ─── Main store class ──────────────────────────────────────────────────────────
@@ -336,6 +347,7 @@ export class Falda {
         atom_ids TEXT NOT NULL DEFAULT '[]',
         summary TEXT,
         content_hash TEXT,
+        render_hash TEXT,
         status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','retired')),
         derived_from TEXT,
         superseded_by TEXT,
@@ -381,6 +393,11 @@ export class Falda {
         UPDATE stream SET seq = (SELECT rn FROM ranked WHERE ranked.id = stream.id)
       `);
       this.db.exec("CREATE INDEX IF NOT EXISTS idx_stream_seq ON stream(seq)");
+    }
+
+    // scenes: add render_hash column for embedding re-index gating (Branch 4).
+    if (this.tableExists("scenes") && !this.hasColumn("scenes", "render_hash")) {
+      this.db.exec("ALTER TABLE scenes ADD COLUMN render_hash TEXT");
     }
 
     // atoms: add new columns if missing, then backfill
@@ -869,33 +886,34 @@ export class Falda {
    * All three derive from the Scene object returned by syncSceneStructure(), so
    * they always reflect what is actually stored — never the raw upsert input.
    *
-   * Re-embedding is gated on whether title or summary changed since the last
-   * index pass (tracked via content_hash comparison). If unchanged, the embed
-   * call and mirror write are skipped.
+   * FTS and mirror are always kept in sync (cheap, synchronous).
+   * Embeddings are gated on render_hash — sha256(title + "\n" + summary).
+   * This distinguishes two separate concerns:
+   *   content_hash  → member atom set changed; LLM may regenerate title/summary
+   *   render_hash   → title or summary changed; embedding must be regenerated
+   * A structural membership-only upsert (same title/summary) never triggers
+   * an embed call.
    */
   private async syncSceneRendering(scene: Scene): Promise<void> {
-    const { scene_id, title, summary, scene_kind } = scene;
+    const { scene_id, title, summary } = scene;
 
-    // FTS: always sync title+summary from the persisted scene.
+    // FTS: always sync title+summary from the persisted scene (cheap).
     this.db.prepare("DELETE FROM scenes_fts WHERE scene_id=?").run(scene_id);
     this.db.prepare("INSERT INTO scenes_fts(title,summary,scene_id) VALUES(?,?,?)")
       .run(title, summary ?? "", scene_id);
 
-    // Vector: embed title + summary together if summary present, else title alone.
-    // Check whether existing embedding was built from the same text to avoid
-    // re-embedding when only structural fields (membership, status) changed.
-    const embedText = summary ? `${title}\n${summary}` : title;
+    // Vector: re-embed only when title or summary changed (render_hash differs).
+    const newRenderHash = computeRenderHash(title, summary);
     const existingVec = this.db.prepare("SELECT 1 FROM scenes_vec WHERE scene_id=?").get(scene_id);
-    // Always re-embed on insert; on update, only re-embed when the rendering
-    // inputs (title/summary) may have changed. We use a simple sentinel: if
-    // there's no existing vec row (new scene) or the scene was just written
-    // with a new content_hash (caller-supplied), always embed. Otherwise skip
-    // to avoid a network/compute call for a membership-only update.
-    const needsEmbed = !existingVec || scene.content_hash !== null;
+    const needsEmbed = !existingVec || scene.render_hash !== newRenderHash;
     if (needsEmbed) {
+      const embedText = summary ? `${title}\n${summary}` : title;
       this.db.prepare("DELETE FROM scenes_vec WHERE scene_id=?").run(scene_id);
       this.db.prepare("INSERT INTO scenes_vec(scene_id,embedding) VALUES(?,?)")
         .run(scene_id, this.vecBuf(await this.embed(embedText)));
+      // Persist the render_hash so subsequent passes can skip the embed call.
+      this.db.prepare("UPDATE scenes SET render_hash=? WHERE scene_id=?")
+        .run(newRenderHash, scene_id);
     }
 
     // Best-effort markdown mirror from the persisted scene.
