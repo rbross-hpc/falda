@@ -50,15 +50,15 @@
 #                            server (requires the server up + a bearer
 #                            token — unlike stats/distill-inspect, this is
 #                            a live authenticated client, not an offline
-#                            inspector). With no --query/--topic, shows the
-#                            MOST RECENT recall for the tenant/pool,
-#                            reconstructed against current memory (not a
-#                            byte-faithful replay — see docs/OPERATIONS.md
-#                            "Previewing a recall"). --query/--topic fire a
-#                            new recall instead.
+#                            inspector). With no selector (or --last),
+#                            shows the MOST RECENT recall for the
+#                            tenant/pool, reconstructed against current
+#                            memory (not a byte-faithful replay — see
+#                            docs/OPERATIONS.md "Previewing a recall").
+#                            --query/--topic fire a new recall instead.
 #                            ARGS: --tenant=T --pool=P --token=TOK --url=BASE
-#                            --recall-id=ID --query=STR --topic=ID|SUBSTR
-#                            --budget=N --json
+#                            --last --recall-id=ID --query=STR
+#                            --topic=ID|SUBSTR --budget=N --json
 #   falda version           Print the package version.
 #   falda help              This help.
 #

@@ -1,16 +1,19 @@
 /**
  * `falda show recall` — view a recall via the running falda HTTP server.
  *
- * Two modes, mutually exclusive:
- *   1. Show a PRIOR recall (default — no --query/--topic given): fetches
- *      the most recent recall trace for the addressed tenant/pool
- *      (`recall_id: "latest"`) or a specific one (`--recall-id=ID`), and
- *      re-renders it against CURRENT memory via POST /recalls/reconstruct.
- *      This is NOT a byte-faithful replay — the trace never stored
- *      rendered text, only item ids/scores (src/recall/reconstruct.ts) —
- *      so items that changed since the recall are listed as `stale_items`
- *      rather than silently shown wrong or omitted.
- *   2. Synthesize a NEW recall: --query="..." or --topic=<scene_id|title
+ * Three selectors, mutually exclusive:
+ *   1. Show the most recent PRIOR recall (the default — no selector given,
+ *      or explicitly `--last`): fetches the most recent recall trace for
+ *      the addressed tenant/pool (`recall_id: "latest"`) and re-renders it
+ *      against CURRENT memory via POST /recalls/reconstruct. This is NOT a
+ *      byte-faithful replay — the trace never stored rendered text, only
+ *      item ids/scores (src/recall/reconstruct.ts) — so items that changed
+ *      since the recall are listed as `stale_items` rather than silently
+ *      shown wrong or omitted. `--last` takes no value; it only exists so
+ *      "show me the last one" can be spelled explicitly instead of relying
+ *      on the absence of every other flag.
+ *   2. Show a SPECIFIC PAST recall: --recall-id=ID, same reconstruction as above.
+ *   3. Synthesize a NEW recall: --query="..." or --topic=<scene_id|title
  *      substring> fires a real POST /recall and shows today's result.
  *      This writes a new recall trace, like any other recall.
  *
@@ -21,6 +24,7 @@
  *
  * Usage:
  *   falda show recall --tenant=T [--pool=P] [--token=TOK] [--url=BASE] [--json]
+ *   falda show recall --tenant=T --last
  *   falda show recall --tenant=T --recall-id=ID
  *   falda show recall --tenant=T --query="..." [--budget=N]
  *   falda show recall --tenant=T --topic=<scene_id|substring> [--budget=N]
@@ -30,11 +34,12 @@
  *   FALDA_TOKEN  Bearer token (falls back to --token)
  */
 
-interface CliOptions {
+export interface CliOptions {
   url: string;
   token?: string;
   tenant?: string;
   pool?: string;
+  last?: boolean;
   recallId?: string;
   query?: string;
   topic?: string;
@@ -43,7 +48,7 @@ interface CliOptions {
   help: boolean;
 }
 
-function parseArgs(argv: string[]): CliOptions {
+export function parseArgs(argv: string[]): CliOptions {
   const opts: CliOptions = {
     url: process.env.FALDA_URL ?? "http://localhost:8077",
     token: process.env.FALDA_TOKEN,
@@ -53,6 +58,11 @@ function parseArgs(argv: string[]): CliOptions {
   for (const arg of argv) {
     if (arg === "--json") opts.json = true;
     else if (arg === "--help" || arg === "-h") opts.help = true;
+    else if (arg === "--last") opts.last = true;
+    else if (arg.startsWith("--last=")) {
+      console.error("falda show recall: --last takes no value; it shows the single most recent recall (see --help)");
+      process.exit(1);
+    }
     else if (arg.startsWith("--url=")) opts.url = arg.slice("--url=".length);
     else if (arg.startsWith("--token=")) opts.token = arg.slice("--token=".length);
     else if (arg.startsWith("--tenant=")) opts.tenant = arg.slice("--tenant=".length);
@@ -78,13 +88,15 @@ Views a recall through the running falda HTTP server. Requires the server
 to be up and a bearer token — unlike \`falda stats\`/\`falda distill
 inspect\`, this is a live authenticated client, not an offline inspector.
 
-Default (no --query/--topic/--recall-id): shows the MOST RECENT recall for
-the addressed tenant/pool, reconstructed against current memory. This is
-the "what did the last prompt's recall return" use case. Reconstruction is
-NOT a byte-faithful replay (the trace never stored rendered text) — items
-that changed since (superseded, merged, archived, retired, deleted) are
-listed under "Stale items" rather than silently shown wrong.
+Default (no selector, or explicit --last): shows the MOST RECENT recall
+for the addressed tenant/pool, reconstructed against current memory. This
+is the "what did the last prompt's recall return" use case. Reconstruction
+is NOT a byte-faithful replay (the trace never stored rendered text) —
+items that changed since (superseded, merged, archived, retired, deleted)
+are listed under "Stale items" rather than silently shown wrong.
 
+  --last               Show the most recent recall (the default — this flag
+                       exists so you can say so explicitly). Takes no value.
   --recall-id=ID       Show a specific PAST recall instead of the latest one
   --query="..."        Fire a NEW recall with this query and show it (writes a trace)
   --topic=ID|SUBSTR    Fire a NEW recall using an active topic scene's title as
@@ -169,15 +181,29 @@ function renderRecall(r: RecallResponse): string {
   return lines.join("\n");
 }
 
+/**
+ * Cross-flag validation, separated from parseArgs (which only parses one
+ * flag at a time) so mutual-exclusion rules can be unit-tested without
+ * driving process.argv/network I/O through main(). Returns an error
+ * message, or null if opts are internally consistent.
+ */
+export function validateOptions(opts: CliOptions): string | null {
+  if (!opts.tenant) return "--tenant is required";
+  if (opts.query && opts.topic) return "--query and --topic are mutually exclusive";
+  if (opts.recallId && (opts.query || opts.topic)) {
+    return "--recall-id shows a prior recall; it cannot be combined with --query/--topic (which fire a new one)";
+  }
+  if (opts.last && (opts.query || opts.topic || opts.recallId)) {
+    return "--last already means 'show the most recent recall'; it cannot be combined with --query/--topic/--recall-id";
+  }
+  return null;
+}
+
 async function main(): Promise<void> {
   const opts = parseArgs(process.argv.slice(2));
   if (opts.help) { console.log(HELP); process.exit(0); }
-  if (!opts.tenant) { console.error("falda show recall: --tenant is required"); process.exit(1); }
-  if (opts.query && opts.topic) { console.error("falda show recall: --query and --topic are mutually exclusive"); process.exit(1); }
-  if (opts.recallId && (opts.query || opts.topic)) {
-    console.error("falda show recall: --recall-id shows a prior recall; it cannot be combined with --query/--topic (which fire a new one)");
-    process.exit(1);
-  }
+  const validationError = validateOptions(opts);
+  if (validationError) { console.error(`falda show recall: ${validationError}`); process.exit(1); }
 
   if (opts.query || opts.topic) {
     const { status, body } = await post(opts, "/recall", {

@@ -346,6 +346,7 @@ offline inspector.
 ```bash
 # What did the last recall for this tenant return? (the common case)
 falda show recall --tenant=my-agent --token=<tok>
+falda show recall --tenant=my-agent --token=<tok> --last   # same thing, spelled explicitly
 
 # A specific past recall, by the recall_id falda_recall/POST /recall returned
 falda show recall --tenant=my-agent --recall-id=<id> --token=<tok>
@@ -371,11 +372,12 @@ docker compose exec -e FALDA_ROOT=/data falda \
 
 ## "What did the last prompt's recall return?"
 
-With no `--query`/`--topic`/`--recall-id`, `falda show recall` fetches the
-**most recent** recall trace for the addressed tenant/pool
-(`POST /recalls/reconstruct {recall_id: "latest"}`) and re-renders it. This
-answers "what memory did the agent's last recall actually pull" without
-needing to already know a `recall_id`.
+With no selector — or explicitly `--last`, which takes no value and exists
+so this can be said out loud rather than relying on the absence of every
+other flag — `falda show recall` fetches the **most recent** recall trace
+for the addressed tenant/pool (`POST /recalls/reconstruct {recall_id:
+"latest"}`) and re-renders it. This answers "what memory did the agent's
+last recall actually pull" without needing to already know a `recall_id`.
 
 **This is a reconstruction, not a recording.** A recall trace
 (`docs/RECALL_TRACES.md`) never stored the rendered text an agent
