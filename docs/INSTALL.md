@@ -63,6 +63,10 @@ falda serve --no-mcp    # HTTP API + worker only, no MCP listener
 falda health            # curl the HTTP API's /healthz (unauthenticated)
 falda smoke             # re-run the offline smoke test
 falda build             # recompile to dist/
+falda stats             # read-only, offline report of everything under FALDA_ROOT (see docs/OPERATIONS.md)
+falda reembed           # rebuild vector indexes after a model/dim change (see docs/OPERATIONS.md)
+falda distill inspect   # review what a distillation pass actually decided (see docs/OPERATIONS.md)
+falda show recall       # view a recall via the running server (see docs/OPERATIONS.md)
 falda version
 ```
 

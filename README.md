@@ -98,7 +98,14 @@ exposes pool-admin routes).
 To interrogate a deployment from the host — tier counts, distillation queue
 health, recall metrics, and config/layout, all read-only and offline (no
 token, no running server needed) — run `falda stats` (or `npm run stats`).
-See [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+A few sibling CLIs cover the rest of day-2 operations: `falda reembed`
+rebuilds vector indexes after an embedding model/dimension change; `falda
+distill inspect` reviews what a distillation pass actually decided (which
+memories were extracted, stored, updated, merged, or skipped, and why —
+also read-only and offline); `falda show recall` views a recall (by
+default, the most recent one) through a *running* server, since a real
+recall needs the configured embedder. See
+[`docs/OPERATIONS.md`](docs/OPERATIONS.md) for all four.
 
 For deployments where many agents (e.g. containerized opencode instances)
 share one FALDA over a network, point them at the MCP endpoint. This repo
@@ -179,17 +186,24 @@ locally (Ollama, vLLM, llama.cpp) or against a self-hosted lab server.
 
 | Env var                   | Default                        | Notes                                  |
 |---------------------------|--------------------------------|----------------------------------------|
+| `FALDA_EMBED`           | *(unset)*                      | embedder mode: `local` (deterministic, offline) or `remote` (calls `FALDA_EMBED_BASE_URL`); unset + no base URL defaults to `local`, unset + a base URL configured defaults to `remote` |
 | `FALDA_EMBED_BASE_URL`  | `http://localhost:11434/v1`    | embeddings endpoint                    |
 | `FALDA_EMBED_API_KEY`   | `x`                            | bearer token (`x` for keyless local)   |
 | `FALDA_EMBED_MODEL`     | `nomic-embed-text`             | embedding model id                     |
+| `FALDA_EMBED_STRICT`    | *(unset)*                      | `1` makes an unconfigured embedder a startup FATAL instead of silently falling back to the local embedder — recommended for production |
 | `FALDA_DIM`             | `768`                          | must match the model's dimensionality  |
 | `FALDA_ROOT`            | `./falda-data`                | pool root dir (all tenant/pool stores) |
 | `FALDA_PORT`            | `8077`                         | HTTP JSON API port                     |
 | `FALDA_MCP_PORT`        | `8079`                         | MCP endpoint port                      |
+| `FALDA_MCP_TOOLSET`     | `default`                      | `default` (compact agent API) or `full` (+ tier-specific advanced tools) |
 | `FALDA_TOKENS`          | `./falda_tokens.json`          | canonical bearer-token file, shared by HTTP and MCP (required — see `docs/API.md`) |
 | `FALDA_RECALL_BUDGET`      | `6000`  | `falda_recall`/`POST /recall` default budget (chars) for a deliberate ("explicit") call |
 | `FALDA_AUTO_RECALL_BUDGET` | `3500`  | default budget for an unattended per-task recall (`mode: "auto"`) fired by a harness integration — kept smaller so it doesn't crowd out the task prompt |
 | `FALDA_RECALL_MAX_BUDGET`  | `20000` | hard ceiling on any requested `budget`, explicit or auto |
+| `FALDA_RECALL_ATOM_ITEM_CAP`  | `600`  | per-item char cap for one T1 atom admitted into a recall's assembled context |
+| `FALDA_RECALL_SCENE_ITEM_CAP` | `1800` | per-item char cap for one T2 scene admitted into a recall's assembled context |
+| `FALDA_RECALL_TRACE_RETENTION_DAYS` | `90` | days to retain `recall_traces.db` rows; `<= 0` retains indefinitely |
+| `FALDA_LEGACY_ATOM_BUDGET` | `6000` | total char budget for `Falda.recallAtoms()`, a legacy T1-only recall path superseded by the cross-tier `assembleContext()` behind `falda_recall`/`POST /recall` — exercised only by tests today, not the live recall surface |
 
 `FALDA_DB`/`FALDA_BLOBS` (a single store's SQLite path/blob dir) apply only
 when embedding `Falda` directly as a library — see "As a library" above.
@@ -198,6 +212,16 @@ when embedding `Falda` directly as a library — see "As a library" above.
 
 Recommended open embedding models: `nomic-embed-text` (768), `BAAI/bge-base-en-v1.5`
 (768), `nomic-ai/nomic-embed-text-v1.5` (768). Set `FALDA_DIM` to match.
+
+### CLI-client environment variables
+
+These are read by CLI **clients**, not `falda serve`/`falda gateway`/`falda
+mcp` themselves:
+
+| Env var        | Default                   | Notes |
+|----------------|----------------------------|-------|
+| `FALDA_URL`    | `http://localhost:8077`   | server base URL for `falda show recall` |
+| `FALDA_TOKEN`  | *(unset)*                  | bearer token for `falda show recall` — **not** the same as `FALDA_TOKENS` above (that's the server's token *file*; this is a single token *value* a client sends) |
 
 ---
 
