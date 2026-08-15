@@ -202,5 +202,8 @@ API when run via `falda serve`). MCP-specific:
 
 ## opencode integration
 
-See `integrations/opencode/README.md` for the full setup recipe (MCP config
-+ auto-capture plugin) for containerized opencode agents.
+See `integrations/opencode/README.md` for the full setup recipe (Docker
+Compose service, MCP config, auto-capture plugin) for containerized
+opencode agents. This repo's `Dockerfile` builds an image whose default
+`CMD` is `falda serve` — both this MCP endpoint and the HTTP API from one
+container.
