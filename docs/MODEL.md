@@ -437,6 +437,29 @@ Neither substitutes for the other, and a future verification pass — "does
 this atom still faithfully represent its evidence?" (§3.2) — reads
 `atom_evidence`, not `consolidation_decisions`.
 
+**`consolidation_decisions` also persists the proposed candidate**
+(`candidate_type`/`candidate_content`/`candidate_confidence`), not only the
+applied action. This matters most for **skip**: a skipped candidate never
+becomes an atom, so without the candidate columns its content would be
+unrecoverable — the rationale alone doesn't say *what* was rejected, only
+*that* something was. This is read-only audit data consumed by `falda
+distill inspect` (`docs/OPERATIONS.md`); it never feeds back into
+consolidation itself.
+
+Two further per-pass tables exist purely for that same inspection surface
+and are otherwise inert to the pipeline's own operation:
+**`distillation_passes`** (one row per pass — timing, watermark range,
+input/candidate counts, job status, and `model`/`prompt_version`/
+`distiller_version` provenance) and **`pass_scene_effects`** /
+**`pass_core_effects`** (what L2/L3, §8.3/§8.4, actually changed on that
+pass — scene created/updated/retired with before/after membership, and
+core regenerated/deleted/unchanged with old/new input hash and char
+count). None of the three participate in scene/core hash-gating, recall,
+or any decision `distillOnce` makes — they are a write-only audit trail
+alongside the authoritative state, not a second source of truth for it.
+Only passes run after this instrumentation existed have rows in
+`distillation_passes`; there is no retroactive backfill.
+
 ### 5.6 Provenance is also what defines episode membership
 
 `atom_evidence`, joined through `stream_id` to `stream.session_id`, is not
@@ -814,7 +837,9 @@ naming targets that no longer exist degrades to a store; one whose only
 target is its own prior copy degrades to a skip. Every applied action is
 recorded in `consolidation_decisions` (§5.5) with a deterministic key
 derived from the pass id (§8.5), so a re-fired pass does not duplicate
-audit rows.
+audit rows. The candidate that was extracted — not only the action taken
+on it — is recorded on that same row (§5.5), so a rejected (`skip`)
+candidate remains inspectable after the pass.
 
 ### 8.3 L2 — organize into scenes
 
@@ -898,6 +923,16 @@ replay.**
 - Retry/backoff/dead-lettering (unchanged from the original design): 30s
   doubling to a 900s cap, an 8-attempt ceiling, after which the job becomes
   a visible `dead` row instead of retrying indefinitely.
+- **The `distillation_passes`/`pass_scene_effects`/`pass_core_effects`
+  audit trail (§5.5) is deliberately best-effort, outside every atomicity
+  guarantee above.** A failure writing pass metadata never rolls back or
+  blocks L1/L2/L3 — it would defeat the point of an audit trail if
+  recording it could itself fail the pipeline. This means the audit trail
+  can, in principle, be incomplete for a pass whose actual atom/scene/core
+  writes still succeeded (e.g. a disk-full condition hitting only the last
+  write); `falda distill inspect` reports what it finds, and its
+  `distillation_passes.status` reflects `distillOnce`'s own outcome
+  (`done`/`failed`), not whether every audit row landed.
 
 ### 8.6 Concurrency with live writes
 

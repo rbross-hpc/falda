@@ -41,7 +41,7 @@ import { PoolManager } from "./pools.js";
 import { selectEmbedder, enforceEmbeddingLock, probeEmbedder } from "./boot.js";
 import { TokenStore, requireTokenFile } from "./mcp_auth.js";
 import { initQueueSchema } from "./distill/queue.js";
-import { makeLLM, type LLMFn } from "./distill/llm.js";
+import { makeLLM, type LLMFnWithModel } from "./distill/llm.js";
 import { initRecallTraceSchema } from "./recall/schema.js";
 
 export interface RuntimeConfig {
@@ -58,7 +58,7 @@ export interface FaldaRuntime {
   tokenStore: TokenStore;
   queueDb: Database.Database;
   recallTraceDb: Database.Database;
-  llm: LLMFn;
+  llm: LLMFnWithModel;
   close(): void;
 }
 

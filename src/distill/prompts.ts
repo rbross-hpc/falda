@@ -9,6 +9,16 @@ export type DistillType = typeof VALID_TYPES[number];
 export const VALID_CONFIDENCE = ["high", "medium", "low"] as const;
 export type DistillConfidence = typeof VALID_CONFIDENCE[number];
 
+/**
+ * Hand-maintained identifier for the current extraction/consolidation/scene/
+ * core prompt set. Bump this whenever any prompt template in this file
+ * changes meaning (not for pure formatting/typo fixes) — it is persisted on
+ * every distillation_passes row (see src/distill/core.ts) so `falda distill
+ * inspect` can attribute a decision to the prompt policy that produced it,
+ * independent of the LLM model used.
+ */
+export const PROMPT_VERSION = "distill-prompts-v1";
+
 /** L1 extraction: extract candidate atoms from a window of turns. */
 export function extractionPrompt(turns: Array<{ role: string; content: string }>): string {
   const transcript = turns.map((t) => `${t.role}: ${t.content}`).join("\n");

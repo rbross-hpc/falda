@@ -34,6 +34,7 @@
     "mcp": "tsx src/mcp.ts",
     "stats": "tsx src/stats.ts",
     "reembed": "tsx src/reembed.ts",
+    "distill-inspect": "tsx src/inspect/cli.ts",
     "example": "tsx examples/basic.ts",
     "install:falda": "bash install.sh"
   },

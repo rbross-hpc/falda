@@ -198,3 +198,138 @@ Caveats:
   run still updates the root-level lock; make sure every store under that
   root is actually being migrated together (or plan a separate
   `FALDA_ROOT` per differently-configured deployment).
+
+# Reviewing distillation quality: `falda distill inspect`
+
+A successful LLM call is not evidence of successful distillation.
+`falda distill inspect` is a read-only, offline report of what
+distillation *decided* — not merely whether the job ran — so an operator
+can audit semantic behavior after the fact: which candidate memories were
+extracted, whether each was stored/updated/merged/skipped and why, what
+old memories were replaced or absorbed, what T0 evidence supports the
+result, how T2 scene membership changed, whether T3 core regenerated, and
+whether anything about the pass looks suspicious enough to review by hand.
+
+```bash
+falda distill inspect                              # last 10 passes, all stores
+falda distill inspect --tenant=my-agent            # scope to one tenant's self store
+falda distill inspect --last=5
+falda distill inspect --since=24h
+falda distill inspect --pass=<pass-id>
+falda distill inspect --action=merge,update        # the two destructive actions
+falda distill inspect --action=skip --evidence     # what got thrown away, and why
+falda distill inspect --random=20                  # sample decisions for spot review
+falda distill inspect --json | jq .
+falda distill inspect --pass=<pass-id> --export-fixture=case.json
+```
+
+Or directly: `tsx src/inspect/cli.ts [args]` / `node dist/inspect/cli.js
+[args]` / `npm run distill-inspect -- [args]`.
+
+## What it reads (and does not write)
+
+`falda distill inspect` opens each in-scope store's `falda.db` **read-only**
+(`{ readonly: true }`), the same store-enumeration/scoping convention as
+`falda stats`/`falda reembed` (`--root`/`--tenant`/`--pool` over
+`FALDA_ROOT`, no token/auth layer — this is a filesystem-access tool for
+operators, not an authenticated per-tenant API surface). It never opens a
+`PoolManager`, never calls an embedder, and executes no `INSERT`/`UPDATE`/
+`DELETE` statement anywhere in `src/inspect/` — a store is byte-identical
+before and after any `inspect` invocation, including `--export-fixture`
+(the fixture file is the only write, and it lives outside the store).
+
+It reads four tables that `distillOnce()` (`src/distill/core.ts`) now
+populates on every pass, alongside the existing `atoms`/`scenes`/`stream`:
+
+- **`distillation_passes`** — one row per pass: timing, watermark range,
+  input turn count, candidate count, job status, and provenance (`model`,
+  `prompt_version`, `distiller_version`) so a bad decision can be
+  attributed to the policy that produced it.
+- **`consolidation_decisions`** — extended with `candidate_type`/
+  `candidate_content`/`candidate_confidence`. This is the fix for a real
+  gap: previously a `skip` decision recorded only its rationale — the
+  candidate memory it rejected was unrecoverable. Now every decision,
+  including skip, retains the candidate that was proposed.
+- **`pass_scene_effects`** / **`pass_core_effects`** — per-pass T2/T3
+  effect log: which scenes were created/updated/retired (with member
+  before/after counts and added/removed atom ids) and whether T3 core was
+  regenerated/deleted/unchanged (with old/new input hash and char count).
+
+**Only passes distilled after this feature was deployed are visible.**
+`distillation_passes` did not exist before; there is no way to
+retroactively reconstruct pass timing, provenance, or scene/core effects
+for older passes, and `inspect` does not attempt to synthesize a degraded
+view from `consolidation_decisions` alone — a pass with no
+`distillation_passes` row simply does not appear.
+
+## Selectors
+
+Selectors compose (e.g. `--since=7d --action=merge --evidence`):
+
+| Flag | Effect |
+|------|--------|
+| `--root=DIR` / `--tenant=T` / `--pool=P` | Store scope — same as `falda stats` |
+| `--last=N` | Most recent N passes. Default `10`, applied only when no other selector (`--since`/`--pass`/`--random`) already narrows the result — so `--since=24h` on its own shows every matching pass, not just 10 of them. |
+| `--since=24h\|7d\|30m` | Passes started within the given duration (`m`/`h`/`d`/`w` units) |
+| `--pass=ID` | Exact pass lookup |
+| `--action=A[,A...]` | Only passes/decisions with action `store`, `update`, `merge`, and/or `skip` — narrows both which passes are listed and which decisions are shown within them |
+| `--status=running\|done\|failed` | Job status — `failed` surfaces passes where `distillOnce` threw, with the error message, distinct from the recall/queue health `falda stats` already reports |
+| `--random=N` | Sample N **decisions** at random (not cryptographic — a full shuffle is unnecessary here), grouped by owning pass, honoring `--action`/store scope |
+| `--evidence` | Include T0 evidence turns per decision |
+| `--verbose` | Expand evidence truncation limits (10→50 turns, 1000→5000 chars/turn), show unchanged scenes, include `decided_at` timestamps |
+| `--json` | Structured JSON — same DTOs as the human renderer, not a separate representation |
+| `--export-fixture=PATH` | Write a replayable evaluation fixture (requires `--pass`) |
+
+## Evidence resolution
+
+- **store/update/merge** (a durable atom exists): evidence is the atom's
+  full `atom_evidence → stream` chain — every turn that ever contributed
+  to that atom, including prior passes for an atom that's been updated
+  more than once.
+- **skip** (no durable atom was ever created): evidence falls back to the
+  pass's own turn window (`watermark_start`, `watermark_end`] — the only
+  evidence a rejected candidate ever had.
+
+Defaults: 10 evidence turns per decision, 1000 chars per turn, with an
+explicit `truncated` flag (and a "…(truncated)" marker in human output)
+when either limit is hit. `--verbose` raises both ceilings.
+
+## Warnings are heuristics, not judgments
+
+`falda distill inspect` computes anomaly signals to direct attention —
+`large_extraction`, `empty_extraction`, `large_merge`,
+`atom_growth_spike`, `rapid_supersession`, `scene_churn`, `core_churn` —
+purely by reading already-persisted state; computing them never mutates
+anything. Thresholds are configurable per deployment without a rebuild:
+
+| Env | Default | Meaning |
+|-----|---------|---------|
+| `FALDA_INSPECT_WARN_LARGE_EXTRACTION_RATIO` | `1.5` | `candidate_count / input_turn_count` above this warns |
+| `FALDA_INSPECT_WARN_EMPTY_EXTRACTION_MIN_TURNS` | `5` | zero candidates from at least this many turns warns |
+| `FALDA_INSPECT_WARN_LARGE_MERGE_ATOMS` | `3` | a merge absorbing at least this many atoms warns |
+| `FALDA_INSPECT_WARN_ATOM_GROWTH_SPIKE` | `10` | atoms stored in a single pass at/above this warns |
+| `FALDA_INSPECT_WARN_RAPID_SUPERSESSION_MINUTES` | `60` | an atom updated/merged away within this many minutes of its own creation warns |
+| `FALDA_INSPECT_WARN_SCENE_CHURN_FRACTION` | `0.5` | scene membership `(added+removed)/max(before,after)` above this warns |
+| `FALDA_INSPECT_WARN_CORE_CHURN_FRACTION` | `0.5` | core char-count relative change above this warns |
+
+## Fixture export — turning a bad decision into a regression test
+
+`falda distill inspect --pass=<id> --export-fixture=case.json` (optionally
+narrowed with `--action`) writes one JSON object per matched decision:
+the T0 evidence, the extracted candidate, the existing atoms presented to
+consolidation, the applied decision (action/target_ids/rationale), the
+resulting atom id, and the model/prompt/distiller version that produced
+it. This is deliberately decoupled from any store mutation — exporting a
+fixture never approves, rejects, or otherwise changes the decision it
+describes; it exists purely so a mistake found by inspection can become a
+future `distillOnce` regression case.
+
+## What this is not
+
+- Not a mutation tool — `falda distill inspect` has no approve/reject/undo.
+  If inspection reveals a decision that should be corrected, that requires
+  a separate, explicit action through the existing atom lifecycle (see
+  `Falda.supersedeAtom`/`archiveAtom` in `src/falda.ts`), not this command.
+- Not a substitute for `falda stats`'s `queue` section — `stats` answers
+  "did distillation execute" (job status, dead-letter, backlog age);
+  `inspect` answers "what did successful distillation decide."
