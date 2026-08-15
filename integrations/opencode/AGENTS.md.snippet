@@ -20,13 +20,13 @@ This project has a FALDA memory store connected via MCP (`falda_*` tools).
 - To stop recalling a memory that's outdated or wrong, call `falda_forget`
   with its `atom_id` (from a `falda_remember` result or a `falda_recall`
   hit). This only stops it from surfacing — it is not privacy erasure.
-- Before a context compaction/summarization, or at the end of a substantial
-  work session, call `falda_distill` so this session's raw turns get
-  distilled into durable memories before the working context is truncated.
-  It's asynchronous (returns a `job_id`; poll with `falda_distill_status` if
-  you need to confirm completion). A background worker also runs
-  periodically, so this is a safeguard against losing a session's learnings
-  to compaction, not something to call on every turn.
+- Distillation into durable memories happens automatically — a plugin
+  triggers it as a session compacts, and a background worker also runs
+  periodically — so you don't need to call `falda_distill` for that. At the
+  end of a substantial work session you may call it yourself as an extra
+  safeguard (it's asynchronous — returns a `job_id`; poll with
+  `falda_distill_status` if you need to confirm completion), but it's not
+  something to call on every turn.
 - Raw conversation turns are captured automatically; you do not need to call
   `falda_stream_add` yourself except to backfill or annotate.
 - Scenes and core are not directly editable and are not separate tools here
