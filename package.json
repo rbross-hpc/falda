@@ -32,6 +32,7 @@
     "serve": "tsx src/server.ts",
     "gateway": "tsx src/gateway.ts",
     "mcp": "tsx src/mcp.ts",
+    "stats": "tsx src/stats.ts",
     "example": "tsx examples/basic.ts",
     "install:falda": "bash install.sh"
   },

@@ -95,6 +95,11 @@ surfaces share one `TokenStore`/auth model but expose different operations
 by design (MCP is the restricted agent-facing surface; HTTP additionally
 exposes pool-admin routes).
 
+To interrogate a deployment from the host — tier counts, distillation queue
+health, recall metrics, and config/layout, all read-only and offline (no
+token, no running server needed) — run `falda stats` (or `npm run stats`).
+See [`docs/OPERATIONS.md`](docs/OPERATIONS.md).
+
 For deployments where many agents (e.g. containerized opencode instances)
 share one FALDA over a network, point them at the MCP endpoint. This repo
 ships a `Dockerfile` running `falda serve` by default (see
