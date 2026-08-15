@@ -23,6 +23,27 @@ import { makeLocalEmbedder } from "../src/embedder.js";
 import { TokenStore } from "../src/mcp_auth.js";
 import { handleRequest } from "../src/gateway.js";
 import { initRecallTraceSchema } from "../src/recall/schema.js";
+import { parseArgs, validateOptions } from "../src/show/recall.js";
+
+/** Run fn with process.exit stubbed to throw a sentinel instead of exiting —
+ *  same pattern as test/boot.test.ts / test/mcp_auth.test.ts, needed here
+ *  because parseArgs() calls process.exit(1) on invalid CLI input rather
+ *  than throwing, matching every other FALDA CLI's error convention. */
+function captureExit<T>(fn: () => T): { exited: boolean; code: number | undefined; result?: T } {
+  const realExit = process.exit;
+  let exited = false;
+  let code: number | undefined;
+  (process as any).exit = ((c?: number) => { exited = true; code = c; throw new Error("__exit__"); }) as any;
+  try {
+    const result = fn();
+    return { exited, code, result };
+  } catch (e: any) {
+    if (e?.message !== "__exit__") throw e;
+    return { exited, code };
+  } finally {
+    process.exit = realExit;
+  }
+}
 
 function hdrs(token?: string, tenant?: string) {
   const h: Record<string, string> = {};
@@ -162,5 +183,53 @@ describe("show recall: gateway support", () => {
     await call("tok-a", "acme", "/recalls/reconstruct", { recall_id: "latest" });
     const after = await call("tok-a", "acme", "/recalls/metrics", {});
     assert.equal(before.body.trace_count, after.body.trace_count, "reconstruct writes no new trace");
+  });
+});
+
+// ─── CLI arg parsing (src/show/recall.ts's parseArgs) ──────────────────────
+//
+// Unlike falda stats/reembed/distill-inspect, whose parseArgs is untested
+// elsewhere in this repo, --last gets a dedicated regression test: it was
+// added specifically because a user's wrapper script assumed it existed
+// and the flag's entire job is to be accepted (and mean "most recent"),
+// so a parsing regression here would silently reintroduce that bug.
+
+describe("show recall: parseArgs (--last)", () => {
+  test("--last is accepted and sets opts.last = true", () => {
+    const opts = parseArgs(["--tenant=acme", "--last"]);
+    assert.equal(opts.last, true);
+    assert.equal(opts.tenant, "acme");
+  });
+
+  test("no selector at all leaves opts.last undefined (falsy) — default path", () => {
+    const opts = parseArgs(["--tenant=acme"]);
+    assert.equal(opts.last, undefined);
+  });
+
+  test("--last=N (a value) is rejected — --last takes no argument", () => {
+    const { exited, code } = captureExit(() => parseArgs(["--tenant=acme", "--last=5"]));
+    assert.equal(exited, true);
+    assert.equal(code, 1);
+  });
+
+  test("--last combined with --query is rejected by validateOptions", () => {
+    const opts = parseArgs(["--tenant=acme", "--last", "--query=x"]);
+    assert.equal(opts.last, true);
+    assert.equal(opts.query, "x");
+    const error = validateOptions(opts);
+    assert.match(error ?? "", /--last already means/);
+  });
+
+  test("--last combined with --topic or --recall-id is also rejected", () => {
+    assert.match(validateOptions(parseArgs(["--tenant=acme", "--last", "--topic=x"])) ?? "", /--last already means/);
+    assert.match(validateOptions(parseArgs(["--tenant=acme", "--last", "--recall-id=x"])) ?? "", /--last already means/);
+  });
+
+  test("--last alone (with --tenant) passes validation", () => {
+    assert.equal(validateOptions(parseArgs(["--tenant=acme", "--last"])), null);
+  });
+
+  test("no --tenant fails validation regardless of --last", () => {
+    assert.match(validateOptions(parseArgs(["--last"])) ?? "", /--tenant is required/);
   });
 });
