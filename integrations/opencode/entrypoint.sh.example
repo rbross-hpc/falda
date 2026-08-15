@@ -41,6 +41,10 @@
 #                      not this entrypoint — no install step needed, unlike
 #                      FALDA_CAPTURE above). Pass it through to the agent
 #                      container's environment like any other runtime var.
+#   FALDA_DISTILL_ON_COMPACT  "0" disables the plugin's auto-distill-on-
+#                      compaction at runtime (default: enabled; read by the
+#                      plugin itself, not this entrypoint — same pass-through
+#                      pattern as FALDA_AUTO_RECALL above).
 #   FALDA_PLUGIN_SRC   path to falda-capture.ts inside the container
 #                      (default below — set to wherever your FALDA checkout
 #                      is mounted; this is deployment-specific)

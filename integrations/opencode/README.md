@@ -106,7 +106,7 @@ services:
       FALDA_MCP_PORT: "8079"
       FALDA_TOKENS: /run/falda/tokens.json
       FALDA_EMBED: local             # see "Embeddings" below to use a real model
-      FALDA_DIM: "768"
+      FALDA_DIM: "768"              # MUST match FALDA_EMBED_MODEL's real dim; see "Embeddings" (a mismatch refuses to boot — enforceEmbeddingLock)
       # Distillation (T0->T1->T2->T3) — any OpenAI-compatible chat model,
       # decoupled from whatever model the agents themselves use:
       FALDA_LLM_BASE_URL: "https://your-llm-proxy/v1"
@@ -175,6 +175,12 @@ Notes:
       FALDA_EMBED_MODEL: <model-id>
       FALDA_DIM: "<model-dim>"        # must match the model exactly
   ```
+  One concrete example (not a requirement — any OpenAI-compatible embedding
+  endpoint works): a `Qwen3-Embedding-0.6B` served by such a proxy uses
+  `FALDA_EMBED_MODEL: Qwen3-Embedding-0.6B` and `FALDA_DIM: "1024"` — note
+  that's *not* the `768` default set above, which is exactly the mismatch
+  `enforceEmbeddingLock` will refuse to boot with if `FALDA_DIM` isn't
+  updated to match when switching models.
   The embedding-lock manifest (`EMBEDDING.json`, written into `/data` on
   first boot) pins model+dim for that store — changing them later requires
   re-embedding, not just a config edit.
