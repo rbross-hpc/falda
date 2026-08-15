@@ -1,7 +1,7 @@
 /**
- * FALDA auto-capture + auto-recall plugin for opencode.
+ * FALDA auto-capture + auto-recall + auto-distill plugin for opencode.
  *
- * Two independent features, sharing one credential-resolution path:
+ * Three independent features, sharing one credential-resolution path:
  *
  * 1. Auto-capture: writes each user/assistant turn to the FALDA Stream (T0)
  *    as it happens, so conversation history is captured for later
@@ -29,6 +29,24 @@
  *    the model's own judgment about when to search memory further. Never
  *    blocks the turn: wrapped in a short timeout, and any failure is
  *    logged and swallowed rather than surfaced to the user.
+ *
+ * 3. Auto-distill: fires one `falda_distill` (fire-and-forget, no args) on
+ *    the `experimental.session.compacting` hook — which runs *before*
+ *    opencode generates the compaction's continuation summary. Distillation
+ *    reads from the FALDA Stream (T0), which auto-capture has already
+ *    persisted server-side turn-by-turn — it does not depend on opencode's
+ *    in-context window at all. So triggering it here, rather than after
+ *    compaction finishes, lets the async distill job run *concurrently*
+ *    with the LLM's summary generation instead of strictly after it: by the
+ *    time compaction completes, distillation may already be done. This is a
+ *    deliberate (if slightly unconventional) use of an experimental hook
+ *    purely as a timing trigger — it does not read or write `output.context`
+ *    / `output.prompt`, so it can't affect what compaction produces. Because
+ *    `experimental.*` hooks may change across opencode versions, this
+ *    degrades gracefully if the hook ever silently stops firing: the
+ *    periodic background distillation worker (FALDA_WORKER_INTERVAL_MS)
+ *    remains the safety net, and this is purely a latency optimization on
+ *    top of it, not a load-bearing dependency.
  *
  * Tenant resolution — FALDA is meant to be scoped **per project**, not per
  * agent/container (see ../README.md "Per-project opencode config"): each
@@ -59,8 +77,9 @@
  *   opencode.json  mcp.falda.{url,headers.Authorization,headers.X-Falda-Tenant}
  *                  (per-project or global — see ../opencode.json.example)
  *   FALDA_MCP_URL / FALDA_MCP_TOKEN / FALDA_TENANT   fallback if no mcp.falda config resolves
- *   FALDA_CAPTURE      "0" to disable capture entirely (default: enabled)
- *   FALDA_AUTO_RECALL  "0" to disable auto-recall entirely (default: enabled)
+ *   FALDA_CAPTURE             "0" to disable capture entirely (default: enabled)
+ *   FALDA_AUTO_RECALL         "0" to disable auto-recall entirely (default: enabled)
+ *   FALDA_DISTILL_ON_COMPACT  "0" to disable auto-distill-on-compaction (default: enabled)
  *
  * Install: copy this file to .opencode/plugins/falda-capture.ts (project) or
  * ~/.config/opencode/plugins/falda-capture.ts (global), and add a
@@ -148,12 +167,37 @@ async function callFaldaAutoRecall(creds: FaldaCreds, query: string, timeoutMs: 
   }
 }
 
+/**
+ * Fire one falda_distill (no args) and return once it's been enqueued, or
+ * throw on failure/timeout. Fire-and-forget from the caller's perspective —
+ * this only confirms the job was accepted, not that distillation finished.
+ */
+async function callFaldaDistill(creds: FaldaCreds, timeoutMs: number): Promise<void> {
+  const transport = new StreamableHTTPClientTransport(new URL(creds.url), {
+    requestInit: { headers: { Authorization: `Bearer ${creds.token}`, "X-Falda-Tenant": creds.tenant } },
+  });
+  const client = new Client({ name: "opencode-falda-auto-distill", version: "1.0" });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`falda_distill timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+  try {
+    await Promise.race([client.connect(transport), timeout]);
+    await Promise.race([client.callTool({ name: "falda_distill", arguments: {} }), timeout]);
+  } finally {
+    if (timer) clearTimeout(timer);
+    await client.close().catch(() => {});
+  }
+}
+
 const AUTO_RECALL_TIMEOUT_MS = 5000;
+const DISTILL_TIMEOUT_MS = 5000;
 
 export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
   const captureEnabled = process.env.FALDA_CAPTURE !== "0";
   const autoRecallEnabled = process.env.FALDA_AUTO_RECALL !== "0";
-  if (!captureEnabled && !autoRecallEnabled) return {};
+  const distillOnCompactEnabled = process.env.FALDA_DISTILL_ON_COMPACT !== "0";
+  if (!captureEnabled && !autoRecallEnabled && !distillOnCompactEnabled) return {};
 
   // Resolved lazily on the first captured event (see "Lazy resolution"
   // above), not here — must never await server calls during plugin init.
@@ -267,6 +311,27 @@ export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
       } catch (e) {
         await client.app.log({
           body: { service: "falda-capture", level: "warn", message: "auto-recall failed", extra: { error: String(e) } },
+        }).catch(() => {});
+      }
+    } : undefined,
+
+    // Fires before opencode generates the compaction's continuation summary
+    // (see "Auto-distill" above) — used purely as a timing trigger to
+    // enqueue falda_distill early enough that it can run concurrently with
+    // that summary generation. Never touches output.context/output.prompt,
+    // never blocks or fails the compaction: any error/timeout here is
+    // logged and swallowed, with the periodic background worker as the
+    // safety net.
+    "experimental.session.compacting": distillOnCompactEnabled ? async () => {
+      if (disabled) return;
+      const creds = await getCreds();
+      if (!creds) return;
+
+      try {
+        await callFaldaDistill(creds, DISTILL_TIMEOUT_MS);
+      } catch (e) {
+        await client.app.log({
+          body: { service: "falda-capture", level: "warn", message: "auto-distill failed", extra: { error: String(e) } },
         }).catch(() => {});
       }
     } : undefined,

@@ -252,6 +252,20 @@ Set `FALDA_AUTO_RECALL=0` to disable it independently of `FALDA_CAPTURE`.
 The model is still expected to call `falda_recall` itself for anything the
 auto-recall's smaller budget didn't surface (see `AGENTS.md.snippet`).
 
+**Auto-distill** is a third, independent feature of the same plugin: it
+fires one `falda_distill` (fire-and-forget, no args) on opencode's
+`experimental.session.compacting` hook, which runs *before* opencode
+generates a compaction's continuation summary. Because distillation reads
+from the FALDA Stream (T0) that auto-capture has already persisted
+server-side, triggering it here — rather than after compaction — lets the
+async distill job run concurrently with the summary generation instead of
+strictly after it. It never blocks or fails the compaction — a 5s timeout
+or any failure is logged and swallowed. Set `FALDA_DISTILL_ON_COMPACT=0` to
+disable it independently of `FALDA_CAPTURE`/`FALDA_AUTO_RECALL`. Because
+this relies on an `experimental.*` opencode hook that may change across
+versions, it's a latency optimization on top of the periodic background
+distillation worker (`FALDA_WORKER_INTERVAL_MS`), not a replacement for it.
+
 > **Containerized deployments:** see §4b below for the entrypoint-based
 > auto-install pattern, dependency version tracking, and startup-deadlock
 > hazard notes that apply when the plugin is installed via a container image.
