@@ -19,10 +19,20 @@
  *   core    0.15   — T3 core excerpt
  */
 import type { Falda } from "../falda.js";
+import { resolveAtomItemCap, resolveSceneItemCap } from "../recall/budgets.js";
 
-const PER_ITEM_CHAR_LIMIT = 2000;
+/**
+ * Per-item char caps, tier-specific rather than one global limit: T1 atoms
+ * are short discrete facts (a large cap just wastes budget the admission
+ * loop below could spend on more atoms instead); T2 scenes are
+ * episode/topic summaries that need more room to carry a title+summary
+ * usefully. Resolved once at module load — see src/recall/budgets.ts for
+ * the FALDA_RECALL_ATOM_ITEM_CAP / FALDA_RECALL_SCENE_ITEM_CAP env vars.
+ */
+const ATOM_ITEM_CAP = resolveAtomItemCap();
+const SCENE_ITEM_CAP = resolveSceneItemCap();
 
-function truncate(s: string, limit = PER_ITEM_CHAR_LIMIT): string {
+function truncate(s: string, limit: number): string {
   return s.length <= limit ? s : s.slice(0, limit - 3) + "...";
 }
 
@@ -115,7 +125,7 @@ export async function assembleContext(
   const pinnedCap = pinnedAllowance; // no spillover into pinned from prior tiers
   const pinnedAtoms = store.getPinnedAtoms();
   for (const a of pinnedAtoms) {
-    const t = truncate(a.content);
+    const t = truncate(a.content, ATOM_ITEM_CAP);
     if (ctx.per_tier_chars.pinned + t.length > pinnedCap) { truncated = true; break; }
     ctx.pinned_atoms.push(t);
     ctx.per_tier_chars.pinned += t.length;
@@ -127,12 +137,21 @@ export async function assembleContext(
   const atomsCap = atomsAllowance + spillover;
   spillover = 0;
   const pinnedIds = new Set(pinnedAtoms.map((a) => a.id));
-  const atomLimit = Math.max(10, Math.ceil(atomsCap / 200));
+  // Fetch more candidates than the cap alone would suggest: with a per-item
+  // cap smaller than a candidate's actual content, more candidates can fit
+  // than a naive "cap / typical size" estimate assumes, and skip-and-continue
+  // below (rather than stopping at the first non-fitting item) needs extra
+  // candidates in the pool to skip past a large one and keep filling the tier.
+  const atomLimit = Math.max(15, Math.ceil((atomsCap / 100) * 1.5));
   const rankedAtoms = await store.searchAtoms(query, atomLimit);
   for (const atom of rankedAtoms) {
     if (pinnedIds.has(atom.id)) continue;
-    const t = truncate(atom.content);
-    if (ctx.per_tier_chars.atoms + t.length > atomsCap) { truncated = true; break; }
+    const t = truncate(atom.content, ATOM_ITEM_CAP);
+    // Skip (not break): a low-ranked atom that happens to fit should still
+    // get a chance to fill the tier even if a higher-ranked one didn't fit —
+    // stopping at the first miss left the remaining budget unused whenever a
+    // large item was ranked ahead of several small ones.
+    if (ctx.per_tier_chars.atoms + t.length > atomsCap) { truncated = true; continue; }
     ctx.ranked_atoms.push(t);
     ctx.per_tier_chars.atoms += t.length;
     ctx.items.push({ tier: "T1", id: atom.id, kind: "atom", source: "ranked", chars: t.length, score: atom.score });
@@ -142,14 +161,16 @@ export async function assembleContext(
   // ── 3. Scenes ──────────────────────────────────────────────────────────────
   const scenesCap = scenesAllowance + spillover;
   spillover = 0;
-  const sceneLimit = Math.max(5, Math.ceil(scenesCap / 400));
+  // Same over-fetch rationale as atomLimit above, scaled to scenes' larger
+  // per-item cap and typically-longer rendered text.
+  const sceneLimit = Math.max(8, Math.ceil((scenesCap / 300) * 1.5));
   const scenes = await store.searchScenes(query, sceneLimit);
   for (const sc of scenes) {
     const text = sc.summary
       ? `[${sc.scene_kind}] ${sc.title}\n${sc.summary}`
       : `[${sc.scene_kind}] ${sc.title}`;
-    const t = truncate(text);
-    if (ctx.per_tier_chars.scenes + t.length > scenesCap) { truncated = true; break; }
+    const t = truncate(text, SCENE_ITEM_CAP);
+    if (ctx.per_tier_chars.scenes + t.length > scenesCap) { truncated = true; continue; }
     ctx.scenes.push(t);
     ctx.per_tier_chars.scenes += t.length;
     ctx.items.push({ tier: "T2", id: sc.scene_id, kind: "scene", source: "scene", chars: t.length, score: sc.score });

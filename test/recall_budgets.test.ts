@@ -7,14 +7,18 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
+  DEFAULT_ATOM_ITEM_CAP,
   DEFAULT_AUTO_RECALL_BUDGET,
   DEFAULT_LEGACY_ATOM_BUDGET,
   DEFAULT_MAX_RECALL_BUDGET,
   DEFAULT_RECALL_BUDGET,
+  DEFAULT_SCENE_ITEM_CAP,
+  resolveAtomItemCap,
   resolveAutoRecallBudget,
   resolveLegacyAtomBudget,
   resolveMaxRecallBudget,
   resolveRecallBudget,
+  resolveSceneItemCap,
 } from "../src/recall/budgets.js";
 
 test("resolveRecallBudget: defaults to DEFAULT_RECALL_BUDGET when unset", () => {
@@ -56,4 +60,23 @@ test("env override: invalid, zero, or negative values fall back to the default",
   for (const bad of ["not-a-number", "0", "-500", "NaN", "Infinity"]) {
     assert.equal(resolveRecallBudget(bad), DEFAULT_RECALL_BUDGET, `expected fallback for ${bad}`);
   }
+});
+
+test("resolveAtomItemCap: defaults to DEFAULT_ATOM_ITEM_CAP when unset, honors env override", () => {
+  assert.equal(resolveAtomItemCap(undefined), DEFAULT_ATOM_ITEM_CAP);
+  assert.equal(resolveAtomItemCap(""), DEFAULT_ATOM_ITEM_CAP);
+  assert.equal(resolveAtomItemCap("750"), 750);
+  assert.equal(resolveAtomItemCap("not-a-number"), DEFAULT_ATOM_ITEM_CAP);
+});
+
+test("resolveSceneItemCap: defaults to DEFAULT_SCENE_ITEM_CAP when unset, honors env override", () => {
+  assert.equal(resolveSceneItemCap(undefined), DEFAULT_SCENE_ITEM_CAP);
+  assert.equal(resolveSceneItemCap(""), DEFAULT_SCENE_ITEM_CAP);
+  assert.equal(resolveSceneItemCap("2500"), 2500);
+  assert.equal(resolveSceneItemCap("0"), DEFAULT_SCENE_ITEM_CAP);
+});
+
+test("scene item cap default is strictly larger than atom item cap default", () => {
+  assert.ok(DEFAULT_SCENE_ITEM_CAP > DEFAULT_ATOM_ITEM_CAP,
+    "scenes need more room than atoms for a title+summary to be useful");
 });

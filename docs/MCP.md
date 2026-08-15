@@ -202,6 +202,8 @@ API when run via `falda serve`). MCP-specific:
 | `FALDA_RECALL_BUDGET` | `falda_recall`'s default budget for a deliberate call (`mode` omitted or `"explicit"`) | `6000` |
 | `FALDA_AUTO_RECALL_BUDGET` | `falda_recall`'s default budget when `mode: "auto"` — an unattended per-task recall fired by a harness integration; kept smaller by default | `3500` |
 | `FALDA_RECALL_MAX_BUDGET` | hard ceiling on any requested `budget`, explicit or auto | `20000` |
+| `FALDA_RECALL_ATOM_ITEM_CAP` | per-item char cap for one T1 atom admitted into `falda_recall`'s assembled context | `600` |
+| `FALDA_RECALL_SCENE_ITEM_CAP` | per-item char cap for one T2 scene admitted into `falda_recall`'s assembled context (larger than the atom cap — scenes carry a title+summary) | `1800` |
 
 ## opencode integration
 
