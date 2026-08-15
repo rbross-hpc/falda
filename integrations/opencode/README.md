@@ -272,6 +272,27 @@ this relies on an `experimental.*` opencode hook that may change across
 versions, it's a latency optimization on top of the periodic background
 distillation worker (`FALDA_WORKER_INTERVAL_MS`), not a replacement for it.
 
+**Post-compaction recall** is a fourth, independent feature of the same
+plugin: a compaction's summary can drop detail that FALDA's Stream (T0)
+still has durably, so the plugin fires one additional `falda_recall`
+(`mode: "auto"`) on the **first real user message after a session
+compacts**, reusing the same `<falda-auto-recall>` injection the model
+already recognizes from the first-turn auto-recall above. It uses opencode's
+stable `session.compacted` event to mark the session, then fires on the
+next `chat.message` — it deliberately does *not* fire on opencode's
+synthetic auto-continue turn ("Continue if you have next steps..."),
+because that turn is injected directly by opencode's compaction internals
+and never reaches the `chat.message` hook at all, so the next `chat.message`
+observed after a compaction is already the user's real next message. Never
+blocks the turn — same 5s-timeout/log-and-swallow discipline as the other
+features. Set `FALDA_RECALL_ON_COMPACT=0` to disable it independently of
+`FALDA_AUTO_RECALL`/`FALDA_DISTILL_ON_COMPACT`. It's forced off whenever
+`FALDA_CAPTURE=0`, regardless of `FALDA_RECALL_ON_COMPACT` — it only makes
+sense if auto-capture is writing this session's turns to the Stream it
+re-queries. Because the model already understands `<falda-auto-recall>`
+blocks generically (see `AGENTS.md.snippet`), no snippet change is needed
+for this feature.
+
 > **Containerized deployments:** see §4b below for the entrypoint-based
 > auto-install pattern, dependency version tracking, and startup-deadlock
 > hazard notes that apply when the plugin is installed via a container image.

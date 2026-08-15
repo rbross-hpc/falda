@@ -1,7 +1,8 @@
 /**
- * FALDA auto-capture + auto-recall + auto-distill plugin for opencode.
+ * FALDA auto-capture + auto-recall + auto-distill + post-compaction recall
+ * plugin for opencode.
  *
- * Three independent features, sharing one credential-resolution path:
+ * Four independent features, sharing one credential-resolution path:
  *
  * 1. Auto-capture: writes each user/assistant turn to the FALDA Stream (T0)
  *    as it happens, so conversation history is captured for later
@@ -48,6 +49,32 @@
  *    remains the safety net, and this is purely a latency optimization on
  *    top of it, not a load-bearing dependency.
  *
+ * 4. Post-compaction recall: fires one additional `falda_recall` (mode:
+ *    "auto") on the user's next REAL message after a session compacts,
+ *    since compaction's summary may have dropped detail that FALDA's
+ *    Stream (T0) still has durably. Uses the stable (non-experimental)
+ *    `session.compacted` event to mark the session as "awaiting its next
+ *    real message", then fires on the next `chat.message` for that session
+ *    — reusing the same injection mechanism and `<falda-auto-recall>`
+ *    marker as feature 2, so the model doesn't need a separate concept.
+ *    Deliberately does NOT key off opencode's synthetic auto-continue turn
+ *    (the "Continue if you have next steps..." message opencode injects
+ *    after compaction): that turn is written directly by opencode's
+ *    compaction internals and does not go through `chat.message` at all
+ *    (confirmed against opencode's session/compaction.ts), so the next
+ *    `chat.message` this plugin actually observes after a compaction is
+ *    already the user's real next message — no synthetic-turn filtering
+ *    needed, though the query text is still built only from non-synthetic
+ *    text parts as a defensive fallback. One-shot per compaction (like
+ *    auto-recall is one-shot per session); does not double up with feature
+ *    2 since that one has already fired earlier in the same session.
+ *    Independent of FALDA_AUTO_RECALL — can be enabled even if the
+ *    first-turn auto-recall is disabled, and vice versa. NOT independent
+ *    of capture, though: it only makes sense if auto-capture is writing
+ *    this session's turns to FALDA's Stream, since that's the only source
+ *    of "detail the compaction summary dropped" it can re-surface. Forced
+ *    off whenever FALDA_CAPTURE=0, regardless of FALDA_RECALL_ON_COMPACT.
+ *
  * Tenant resolution — FALDA is meant to be scoped **per project**, not per
  * agent/container (see ../README.md "Per-project opencode config"): each
  * project sets its own tenant in its `opencode.json`'s `mcp.falda.headers`.
@@ -80,6 +107,8 @@
  *   FALDA_CAPTURE             "0" to disable capture entirely (default: enabled)
  *   FALDA_AUTO_RECALL         "0" to disable auto-recall entirely (default: enabled)
  *   FALDA_DISTILL_ON_COMPACT  "0" to disable auto-distill-on-compaction (default: enabled)
+ *   FALDA_RECALL_ON_COMPACT   "0" to disable post-compaction recall (default: enabled;
+ *                             also requires FALDA_CAPTURE to be on — see feature 4 above)
  *
  * Install: copy this file to .opencode/plugins/falda-capture.ts (project) or
  * ~/.config/opencode/plugins/falda-capture.ts (global), and add a
@@ -197,6 +226,13 @@ export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
   const captureEnabled = process.env.FALDA_CAPTURE !== "0";
   const autoRecallEnabled = process.env.FALDA_AUTO_RECALL !== "0";
   const distillOnCompactEnabled = process.env.FALDA_DISTILL_ON_COMPACT !== "0";
+  // Post-compaction recall only makes sense if capture is also on: its
+  // whole point is to re-surface detail from THIS session's Stream (T0)
+  // that the compaction summary dropped, and that Stream only has fresh
+  // content if auto-capture is writing to it. Without capture, this would
+  // just be a second no-op-ish recall against whatever pre-existing memory
+  // auto-recall (feature 2) may have already surfaced at session start.
+  const recallOnCompactEnabled = captureEnabled && process.env.FALDA_RECALL_ON_COMPACT !== "0";
   if (!captureEnabled && !autoRecallEnabled && !distillOnCompactEnabled) return {};
 
   // Resolved lazily on the first captured event (see "Lazy resolution"
@@ -218,6 +254,12 @@ export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
   // sessionIDs that have already received their one auto-recall injection —
   // fires once per session (first user message), not once per turn.
   const autoRecalled = new Set<string>();
+
+  // sessionIDs whose most recent compaction hasn't yet had its post-
+  // compaction recall fired — set on session.compacted, consumed (deleted)
+  // on the next chat.message for that session. One-shot per compaction, so
+  // a session that compacts N times gets up to N post-compaction recalls.
+  const pendingPostCompactRecall = new Set<string>();
 
   // messageID -> accumulated text parts, until the message settles.
   const pending = new Map<string, PendingText>();
@@ -252,6 +294,16 @@ export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
     event: captureEnabled ? async ({ event }) => {
       if (disabled) return;
 
+      // Stable (non-experimental) event fired when a session finishes
+      // compacting — see feature 4 above. Marks the session so the next
+      // chat.message fires a post-compaction recall. (recallOnCompactEnabled
+      // implies captureEnabled, so this branch is reachable whenever it's on.)
+      if (recallOnCompactEnabled && event.type === "session.compacted") {
+        const sessionID = (event.properties as any)?.sessionID;
+        if (sessionID) pendingPostCompactRecall.add(sessionID);
+        return;
+      }
+
       if (event.type === "message.part.updated") {
         const part = (event.properties as any)?.part;
         if (part?.type !== "text" || !part.text) return;
@@ -277,20 +329,52 @@ export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
       }
     } : undefined,
 
-    // Fires once per session (first user message only — see autoRecalled
-    // above), before the LLM sees the turn. Injects a small falda_recall
-    // (mode:"auto") result as an extra text part on the SAME user message,
-    // so it's part of what the model reads for this turn without being a
-    // separate assistant-visible tool call. Never blocks or fails the turn:
-    // any error/timeout just means nothing gets injected.
-    "chat.message": autoRecallEnabled ? async (input, output) => {
+    // Fires on every incoming user message; internally gates to at most one
+    // injection per triggering reason per message (never two blocks on one
+    // message — see the "both triggers on the same message" note below).
+    //
+    // Reason 1 — first-turn auto-recall (see autoRecalled above): once per
+    // session, on the first user message, before the LLM sees the turn.
+    //
+    // Reason 2 — post-compaction recall (see feature 4 above and
+    // pendingPostCompactRecall): once per compaction, on the next real user
+    // message after a session.compacted event. Deliberately does not fire
+    // on opencode's synthetic auto-continue turn, because that turn is
+    // injected directly by opencode's compaction internals and never
+    // reaches this hook at all (confirmed against opencode's
+    // session/compaction.ts) — the next chat.message this plugin observes
+    // after a compaction is already the user's real next message. The
+    // `synthetic` filter on query text below is a defensive fallback only,
+    // not the primary mechanism (see feature 4's doc comment above).
+    //
+    // Both reasons inject via the same mechanism: an extra text part on
+    // the SAME user message, wrapped in `<falda-auto-recall>`, so the
+    // model doesn't need to distinguish why one showed up. Never blocks or
+    // fails the turn: any error/timeout just means nothing gets injected.
+    //
+    // If both reasons would fire on the very same message (only possible
+    // if a compaction somehow completes before this session's first real
+    // user message), only one recall actually fires — the post-compaction
+    // flag is still consumed either way, so it never fires stale on a
+    // later message.
+    "chat.message": (autoRecallEnabled || recallOnCompactEnabled) ? async (input, output) => {
       if (disabled) return;
       const sessionID = input.sessionID;
-      if (!sessionID || autoRecalled.has(sessionID)) return;
-      autoRecalled.add(sessionID); // mark immediately — at most one attempt per session, even on failure
+      if (!sessionID) return;
+
+      const isFirstTurnAutoRecall = autoRecallEnabled && !autoRecalled.has(sessionID);
+      const isPostCompactRecall = recallOnCompactEnabled && pendingPostCompactRecall.has(sessionID);
+      if (!isFirstTurnAutoRecall && !isPostCompactRecall) return;
+
+      // Mark both immediately — at most one attempt per reason, even on
+      // failure. If both happened to fire on the same message, this still
+      // only runs one actual recall below (isFirstTurnAutoRecall ||
+      // isPostCompactRecall already guaranteed at least one is true above).
+      if (isFirstTurnAutoRecall) autoRecalled.add(sessionID);
+      pendingPostCompactRecall.delete(sessionID);
 
       const query = output.parts
-        .filter((p: any) => p?.type === "text" && typeof p.text === "string")
+        .filter((p: any) => p?.type === "text" && typeof p.text === "string" && !p.synthetic)
         .map((p: any) => p.text)
         .join("\n")
         .trim();

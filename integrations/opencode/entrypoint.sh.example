@@ -45,6 +45,11 @@
 #                      compaction at runtime (default: enabled; read by the
 #                      plugin itself, not this entrypoint — same pass-through
 #                      pattern as FALDA_AUTO_RECALL above).
+#   FALDA_RECALL_ON_COMPACT  "0" disables the plugin's post-compaction
+#                      recall at runtime (default: enabled; read by the
+#                      plugin itself, not this entrypoint — same pass-through
+#                      pattern as FALDA_AUTO_RECALL above). Also forced off
+#                      whenever FALDA_CAPTURE=0, regardless of this var.
 #   FALDA_PLUGIN_SRC   path to falda-capture.ts inside the container
 #                      (default below — set to wherever your FALDA checkout
 #                      is mounted; this is deployment-specific)
