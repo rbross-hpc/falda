@@ -162,3 +162,16 @@ table by `item_id`) or by scene kind (joining `scenes` by `item_id`) —
 `computeRecallMetrics` (`src/recall/metrics.ts`) intentionally stays
 generic (tier/source/rank/chars) rather than growing tenant-schema-aware
 joins; those are one-off analysis queries, not a stable API surface.
+
+## Viewing a trace as text, not just metrics
+
+A trace is structured provenance (`{tier, id, source, score, chars}` per
+item) — it never stored the rendered text an agent actually saw. To *see*
+what a recall returned (e.g. "what did the last prompt's recall pull"),
+`POST /recalls/reconstruct` (`docs/API.md`, `src/recall/reconstruct.ts`)
+re-fetches each item's current content and re-renders it, flagging
+anything that's changed since (superseded/merged/archived/retired/
+deleted) as `stale_items` rather than showing stale text. This is
+reconstruction from current state, not replay of the original — see
+`docs/OPERATIONS.md` "Previewing a recall" for the operator-facing
+`falda show recall` CLI built on this route.

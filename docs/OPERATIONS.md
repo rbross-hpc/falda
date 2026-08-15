@@ -333,3 +333,97 @@ future `distillOnce` regression case.
 - Not a substitute for `falda stats`'s `queue` section — `stats` answers
   "did distillation execute" (job status, dead-letter, backlog age);
   `inspect` answers "what did successful distillation decide."
+
+# Previewing a recall: `falda show recall`
+
+`falda stats` and `falda distill inspect` are deliberately offline: no
+embedder, no running server, filesystem access only. Showing a *recall* is
+different — a real recall needs the configured embedder for dense search,
+and the running `falda` server already has it wired. `falda show recall`
+is a normal authenticated HTTP client against that server, not another
+offline inspector.
+
+```bash
+# What did the last recall for this tenant return? (the common case)
+falda show recall --tenant=my-agent --token=<tok>
+
+# A specific past recall, by the recall_id falda_recall/POST /recall returned
+falda show recall --tenant=my-agent --recall-id=<id> --token=<tok>
+
+# Fire a NEW recall and show it
+falda show recall --tenant=my-agent --query="deployment tooling" --token=<tok>
+falda show recall --tenant=my-agent --topic=<scene-id-or-title-substring> --token=<tok>
+
+# Point at a non-default server / read the token from FALDA_TOKEN instead
+FALDA_URL=http://localhost:8077 FALDA_TOKEN=<tok> falda show recall --tenant=my-agent
+```
+
+Or directly: `tsx src/show/recall.ts [args]` / `node dist/show/recall.js
+[args]` / `npm run show-recall -- [args]`.
+
+In a Compose deployment, run it inside the `falda` container the same way
+you'd run `falda stats`:
+
+```bash
+docker compose exec -e FALDA_ROOT=/data falda \
+  node dist/show/recall.js --tenant=my-agent --token=<tok>
+```
+
+## "What did the last prompt's recall return?"
+
+With no `--query`/`--topic`/`--recall-id`, `falda show recall` fetches the
+**most recent** recall trace for the addressed tenant/pool
+(`POST /recalls/reconstruct {recall_id: "latest"}`) and re-renders it. This
+answers "what memory did the agent's last recall actually pull" without
+needing to already know a `recall_id`.
+
+**This is a reconstruction, not a recording.** A recall trace
+(`docs/RECALL_TRACES.md`) never stored the rendered text an agent
+originally saw — only the query, budget, and each admitted item's
+`{tier, id, source, score, chars}`. `falda show recall` re-fetches each
+item's *current* content from the store and re-renders it with today's
+tier caps. If memory has changed since (an atom superseded/merged/
+archived, a scene retired, core regenerated or deleted — most commonly
+because a distillation pass ran in between), the output says so under
+"Stale items" rather than silently showing stale or missing content:
+
+```
+Recall 7014deff-...
+2026-08-15T20:24:23.978Z  mode=explicit  query="deploy script location"
+budget: 69 / 6000 chars
+
+(reconstructed from current memory — not a byte-faithful replay of what was originally returned)
+
+## Pinned
+always run tests before merging
+
+## Relevant facts/preferences/rules
+The deploy script lives in bin/release
+
+Stale items (changed since this recall):
+  T1 3f8a...: superseded
+```
+
+If a tenant/pool has never made a recall, the command says so plainly
+rather than erroring — this is an expected state for a fresh store.
+
+## Firing a fresh recall
+
+`--query="..."` or `--topic=<id-or-substring>` run a real, new
+`POST /recall` and print today's result — this is a genuine recall (it
+writes a new trace, same as `falda_recall`/any other client), not a
+preview. `--topic` is for "show me a recall from the appropriate topic"
+without composing a query string yourself: it resolves server-side to an
+active **topic** scene (exact `scene_id`, else a case-insensitive title
+substring — `src/recall/topic.ts`) and recalls using that scene's title.
+
+## What this is not
+
+- Not offline — requires the `falda` server running and a valid bearer
+  token, unlike `falda stats`/`falda distill inspect`.
+- Not a byte-faithful replay — see "Stale items" above. If a future need
+  arises for exact historical replay, that would require persisting
+  rendered text at recall time (a trace schema change), which this
+  command deliberately does not do.
+- `--query`/`--topic` mode writes a new recall trace like any other
+  recall; the default "show the last one" / `--recall-id` mode does not.

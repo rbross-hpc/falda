@@ -40,22 +40,10 @@ export function createRecallTrace(db: Database.Database, input: CreateRecallTrac
   return recall_id;
 }
 
-/**
- * Fetch a trace (with its items, in rank order) only if it belongs to
- * callerStoreKey. Returns null for both a missing recall_id AND a
- * recall_id that belongs to another store — no existence oracle, mirroring
- * distill/queue.ts's getJobAuthorized.
- */
-export function getRecallTraceAuthorized(
-  db: Database.Database,
-  recallId: string,
-  callerStoreKey: string,
-): RecallTraceView | null {
-  const trace = db.prepare("SELECT * FROM recall_traces WHERE recall_id=?").get(recallId) as any;
-  if (!trace || trace.store_key !== callerStoreKey) return null;
+function rowToTraceView(db: Database.Database, trace: any): RecallTraceView {
   const rows = db.prepare(
     "SELECT * FROM recall_trace_items WHERE recall_id=? ORDER BY ordinal"
-  ).all(recallId) as any[];
+  ).all(trace.recall_id) as any[];
   return {
     recall_id: trace.recall_id,
     store_key: trace.store_key,
@@ -77,4 +65,40 @@ export function getRecallTraceAuthorized(
       usage: r.usage as UsageState,
     })),
   };
+}
+
+/**
+ * Fetch a trace (with its items, in rank order) only if it belongs to
+ * callerStoreKey. Returns null for both a missing recall_id AND a
+ * recall_id that belongs to another store — no existence oracle, mirroring
+ * distill/queue.ts's getJobAuthorized.
+ */
+export function getRecallTraceAuthorized(
+  db: Database.Database,
+  recallId: string,
+  callerStoreKey: string,
+): RecallTraceView | null {
+  const trace = db.prepare("SELECT * FROM recall_traces WHERE recall_id=?").get(recallId) as any;
+  if (!trace || trace.store_key !== callerStoreKey) return null;
+  return rowToTraceView(db, trace);
+}
+
+/**
+ * Fetch the most recent trace for callerStoreKey (by created_at, using
+ * idx_recall_traces_created). Returns null if this store has never made a
+ * recall — "no traces yet" is a legitimate, expected state (a brand new
+ * tenant, or one that's only ever written memory without recalling it),
+ * not an error. Backs the `recall_id: "latest"` sentinel accepted by
+ * src/gateway.ts's /recalls/reconstruct (falda show recall's default,
+ * no-argument invocation).
+ */
+export function getLatestRecallTraceForStore(
+  db: Database.Database,
+  callerStoreKey: string,
+): RecallTraceView | null {
+  const trace = db.prepare(
+    "SELECT * FROM recall_traces WHERE store_key=? ORDER BY created_at DESC LIMIT 1"
+  ).get(callerStoreKey) as any;
+  if (!trace) return null;
+  return rowToTraceView(db, trace);
 }

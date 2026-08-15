@@ -5,6 +5,7 @@ import { storeKeyFor } from "../../distill/queue.js";
 import { TokenStore } from "../../mcp_auth.js";
 import { buildPolicySnapshot } from "../../recall/policy.js";
 import { createRecallTrace } from "../../recall/traces.js";
+import { renderContext } from "../../recall/render.js";
 import {
   MIN_RECALL_BUDGET,
   resolveAutoRecallBudget,
@@ -14,15 +15,6 @@ import {
 import { ctxFromExtra, errorResult, poolArg, storeFor, textResult, type ToolDeps } from "../context.js";
 
 const MIN_BUDGET = MIN_RECALL_BUDGET;
-
-function renderContext(ctx: Awaited<ReturnType<typeof assembleContext>>): string {
-  const sections: string[] = [];
-  if (ctx.pinned_atoms.length) sections.push(["## Pinned", ...ctx.pinned_atoms].join("\n"));
-  if (ctx.ranked_atoms.length) sections.push(["## Relevant facts/preferences/rules", ...ctx.ranked_atoms].join("\n"));
-  if (ctx.scenes.length) sections.push(["## Related episodes/topics", ...ctx.scenes].join("\n"));
-  if (ctx.core) sections.push(["## Project/persona core", ctx.core].join("\n"));
-  return sections.join("\n\n");
-}
 
 export function registerRecall(server: McpServer, deps: ToolDeps): void {
   const defaultBudget = resolveRecallBudget();

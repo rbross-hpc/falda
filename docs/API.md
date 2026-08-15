@@ -195,16 +195,27 @@ Scene kinds: `episode | topic`. Scene status: `active | retired`.
 ```json
 { "query": "...", "budget": 6000, "pool": "optional-pool-name" }
 ```
-→ `{ "recall_id": "...", "items": [...], "truncated": false, "total_chars": 1234 }`
+or, to recall from a specific active topic without composing your own query:
+```json
+{ "topic": "<scene_id-or-title-substring>", "budget": 6000 }
+```
+→ `{ "recall_id": "...", "context": "...", "items": [...], "truncated": false, "total_chars": 1234 }`
+
+Exactly one of `query`/`topic` is required. `topic` resolves server-side
+(`src/recall/topic.ts`) to an active **topic** scene — first an exact
+`scene_id` match, else a case-insensitive substring match against active
+topic titles (most recently updated wins on multiple matches) — and uses
+that scene's title as the recall query. No match → `404`.
 
 Assembles context across all four tiers in one call (pinned atoms first,
 then query-ranked atoms, relevant scenes, a core excerpt — see
 `src/distill/context.ts` and `docs/MODEL.md` §8.9), trimmed to `budget`
-characters (default 6000). Each entry in `items` is
-`{ tier: "T1"|"T2"|"T3", id, kind, source, chars, score? }` in the order it
-was admitted (rank order). This is the same machinery behind the MCP
-`falda_recall` tool — HTTP callers get one extra field, `total_chars`, that
-the MCP tool folds into `truncated` instead.
+characters (default 6000). `context` is the same rendered, sectioned text
+(`## Pinned` / `## Relevant facts...` / `## Related episodes/topics` /
+`## Project/persona core`) the MCP `falda_recall` tool returns
+(`src/recall/render.ts` — one renderer, shared by both surfaces). Each
+entry in `items` is `{ tier: "T1"|"T2"|"T3", id, kind, source, chars,
+score? }` in the order it was admitted (rank order).
 
 `recall_id` identifies this specific invocation for later usage feedback
 (see "Recall traces" below). It is **best-effort**: if trace persistence
@@ -256,6 +267,42 @@ An unrecognized `{tier,id}` (not part of this recall) → `400`. A
 ```
 Single-trace inspection — admin/debug, not part of the compact MCP surface.
 Ownership-scoped like `/distill/status`; `404` for missing or cross-store ids.
+
+### `POST /recalls/reconstruct`
+```json
+{ "recall_id": "latest" }
+```
+or a specific past recall:
+```json
+{ "recall_id": "..." }
+```
+→
+```json
+{
+  "trace": { "recall_id": "...", "query": "...", "created_at": "...", "items": [...] },
+  "context": "## Pinned\n...",
+  "stale_items": [{ "tier": "T1", "id": "atom-123", "reason": "superseded" }]
+}
+```
+Re-renders a past trace's items against **current** memory — backing
+`falda show recall` (`docs/OPERATIONS.md` "Previewing a recall"), the
+"what did the last prompt's recall return" use case. `recall_id: "latest"`
+means "the most recent trace for my store" (`src/recall/traces.ts`'s
+`getLatestRecallTraceForStore`), so a caller doesn't need to already know
+a `recall_id`. `404` if `latest` and this store has never made a recall,
+or if an explicit `recall_id` doesn't exist / belongs to another store (no
+existence oracle, same as `/recalls/get`).
+
+**This is not a byte-faithful replay.** A trace never stored the rendered
+text an agent originally saw — only the query, budget, and each admitted
+item's `{tier, id, source, score, chars}`. Reconstruction re-fetches each
+item's *current* content and re-renders it with today's per-item caps
+(`src/recall/reconstruct.ts`). Anything that no longer resolves the way it
+did at recall time — an atom superseded/merged/archived, a scene retired,
+core regenerated-then-deleted — is listed in `stale_items` with a
+`reason` (`not_found`/`superseded`/`merged`/`archived`/`retired`/
+`deleted`) instead of being silently dropped or shown as stale text.
+Read-only: writes no new trace, unlike `/recall` itself.
 
 ### `POST /recalls/metrics`
 ```json
