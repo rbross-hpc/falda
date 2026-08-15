@@ -35,6 +35,7 @@
     "stats": "tsx src/stats.ts",
     "reembed": "tsx src/reembed.ts",
     "distill-inspect": "tsx src/inspect/cli.ts",
+    "show-recall": "tsx src/show/recall.ts",
     "example": "tsx examples/basic.ts",
     "install:falda": "bash install.sh"
   },

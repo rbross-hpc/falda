@@ -29,10 +29,14 @@ import { resolveAtomItemCap, resolveSceneItemCap } from "../recall/budgets.js";
  * usefully. Resolved once at module load — see src/recall/budgets.ts for
  * the FALDA_RECALL_ATOM_ITEM_CAP / FALDA_RECALL_SCENE_ITEM_CAP env vars.
  */
-const ATOM_ITEM_CAP = resolveAtomItemCap();
-const SCENE_ITEM_CAP = resolveSceneItemCap();
+/** Exported for src/recall/reconstruct.ts, which re-renders a past trace's
+ *  items against CURRENT content using the same per-item caps a live
+ *  assembleContext() call would apply — a reconstruction should look like
+ *  a real recall would today, not use different truncation rules. */
+export const ATOM_ITEM_CAP = resolveAtomItemCap();
+export const SCENE_ITEM_CAP = resolveSceneItemCap();
 
-function truncate(s: string, limit: number): string {
+export function truncate(s: string, limit: number): string {
   return s.length <= limit ? s : s.slice(0, limit - 3) + "...";
 }
 

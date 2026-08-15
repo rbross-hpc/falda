@@ -45,8 +45,16 @@
  *   /core/write      {content}                           -> {ok}
  *   /distill         {}                                  -> {job_id, store_key}
  *   /distill/status  {job_id}                             -> DistillJob | {error}
- *   /recall          {query, budget?, mode?}               -> {recall_id?, items, truncated, total_chars}
+ *   /recall          {query?, topic?, budget?, mode?}      -> {recall_id?, context, items, truncated, total_chars}
  *                       Cross-tier context assembly (assembleContext(), src/distill/context.ts).
+ *                       Exactly one of {query, topic} is required: `topic` resolves to an
+ *                       active topic scene (exact scene_id, else a title substring match —
+ *                       src/recall/topic.ts) and uses its title as the query, for "show me
+ *                       a recall from the appropriate topic" callers (falda show recall
+ *                       --topic=...) that don't want to guess a query string themselves.
+ *                       `context` is the same rendered text the falda_recall MCP tool
+ *                       returns (src/recall/render.ts) — added so the HTTP surface is not
+ *                       limited to structured item metadata alone.
  *                       mode: "explicit" (default) or "auto" — selects which of
  *                       FALDA_RECALL_BUDGET/FALDA_AUTO_RECALL_BUDGET is used when budget
  *                       is omitted (see src/recall/budgets.ts). budget is always clamped
@@ -60,6 +68,16 @@
  *                                                        -> {updated:[{tier,id}], unchanged:[{tier,id}]}
  *   /recalls/get     {recall_id}                          -> RecallTraceView | 404
  *   /recalls/metrics {}                                   -> RecallMetrics for the caller's store_key
+ *   /recalls/reconstruct {recall_id}                      -> {trace, context, stale_items} | 404
+ *                       recall_id may be the literal string "latest" to mean "the most
+ *                       recent trace for my store" (falda show recall's default, no-query
+ *                       invocation) rather than requiring a known recall_id up front.
+ *                       Re-renders that trace's items against CURRENT memory — NOT a
+ *                       byte-faithful replay of what was originally returned, since traces
+ *                       never stored rendered text (src/recall/reconstruct.ts). Items no
+ *                       longer resolvable as they did at recall time (superseded, merged,
+ *                       archived, retired, deleted) are listed in `stale_items` rather than
+ *                       silently omitted or shown stale. Read-only — writes no new trace.
  *
  * Pool admin routes (POST) — cross-tenant management, restricted to
  * fully-trusted (`tenants: ["*"]`) principals regardless of X-Falda-Tenant:
@@ -99,10 +117,13 @@ import { startDistiller } from "./distill/worker.js";
 import { assembleContext, DEFAULT_TIER_BUDGETS } from "./distill/context.js";
 import { resolveAutoRecallBudget, resolveMaxRecallBudget, resolveRecallBudget } from "./recall/budgets.js";
 import { buildPolicySnapshot } from "./recall/policy.js";
-import { createRecallTrace, getRecallTraceAuthorized } from "./recall/traces.js";
+import { createRecallTrace, getRecallTraceAuthorized, getLatestRecallTraceForStore } from "./recall/traces.js";
 import { reportRecallUsage } from "./recall/usage.js";
 import { computeRecallMetrics } from "./recall/metrics.js";
 import { RecallTraceError } from "./recall/types.js";
+import { renderContext } from "./recall/render.js";
+import { reconstructRecallTrace } from "./recall/reconstruct.js";
+import { resolveTopicQuery, TopicNotFoundError } from "./recall/topic.js";
 
 // Recall budgets — see src/recall/budgets.ts for the two-tier rationale
 // (explicit vs. auto) and FALDA_RECALL_BUDGET/FALDA_AUTO_RECALL_BUDGET/
@@ -157,14 +178,34 @@ async function handleData(
     if (!recallTraceDb) return { error: "recall trace store not initialized" };
     return computeRecallMetrics(recallTraceDb, storeKey);
   }
+  if (route === "/recalls/reconstruct") {
+    if (!recallTraceDb) return { error: "recall trace store not initialized" };
+    const trace = b.recall_id === "latest"
+      ? getLatestRecallTraceForStore(recallTraceDb, storeKey)
+      : getRecallTraceAuthorized(recallTraceDb, b.recall_id, storeKey);
+    if (!trace) {
+      throw new RecallTraceError(
+        "not_found",
+        b.recall_id === "latest"
+          ? `no recall traces recorded yet for this store`
+          : `recall trace not found: ${b.recall_id}`,
+      );
+    }
+    const store = pools.resolve(tenant, pool, false);
+    return reconstructRecallTrace(store, trace);
+  }
 
   const store = pools.resolve(tenant, pool, WRITE_ROUTES.has(route));
   switch (route) {
     case "/recall": {
+      if (!b.query && !b.topic) {
+        return { error: "one of {query, topic} is required" };
+      }
+      const query = b.topic ? resolveTopicQuery(store, b.topic) : b.query;
       const mode: "explicit" | "auto" = b.mode === "auto" ? "auto" : "explicit";
       const defaultBudget = mode === "auto" ? RECALL_AUTO_DEFAULT_BUDGET : RECALL_DEFAULT_BUDGET;
       const budget = Math.min(b.budget ?? defaultBudget, RECALL_MAX_BUDGET);
-      const assembled = await assembleContext(store, b.query, budget);
+      const assembled = await assembleContext(store, query, budget);
       let recall_id: string | undefined;
       if (recallTraceDb) {
         try {
@@ -172,7 +213,7 @@ async function handleData(
             store_key: storeKey,
             tenant,
             pool: pool ?? null,
-            query: b.query,
+            query,
             requested_budget: budget,
             used_budget: assembled.total_chars,
             mode,
@@ -185,7 +226,10 @@ async function handleData(
           console.error("[gateway] /recall trace persistence failed (non-fatal):", e);
         }
       }
-      return { recall_id, items: assembled.items, truncated: assembled.truncated, total_chars: assembled.total_chars };
+      return {
+        recall_id, context: renderContext(assembled),
+        items: assembled.items, truncated: assembled.truncated, total_chars: assembled.total_chars,
+      };
     }
     case "/stream/add":
       return store.addStream(b.session_id, b.messages ?? []).then((ids) => ({
@@ -295,6 +339,9 @@ export async function handleRequest(
     if (e instanceof RecallTraceError) {
       const status = e.code === "not_found" ? 404 : e.code === "conflict" ? 409 : 400;
       return { status, body: { error: e.message, code: e.code } };
+    }
+    if (e instanceof TopicNotFoundError) {
+      return { status: 404, body: { error: e.message } };
     }
     return { status: 500, body: { error: String(e?.message ?? e) } };
   }

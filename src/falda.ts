@@ -760,6 +760,19 @@ export class Falda {
       .run(pinned ? 1 : 0, new Date().toISOString(), id);
   }
 
+  /** Fetch one atom by id regardless of status (active/superseded/merged/
+   *  archived) — unlike queryAtoms()/searchAtoms(), which only see active
+   *  atoms. Used by callers that need to resolve a specific id already in
+   *  hand (e.g. reconstructing a past recall trace's items, src/gateway.ts's
+   *  /recalls/reconstruct) and must distinguish "still active" from
+   *  "existed once, since superseded/merged/archived" rather than treating
+   *  both as "not found". Returns null only if no atom with this id was
+   *  ever recorded. */
+  getAtom(id: string): Atom | null {
+    const row = this.db.prepare("SELECT * FROM atoms WHERE id=?").get(id) as any;
+    return row ? rowToAtom(row) : null;
+  }
+
   queryAtoms(p: {
     type?: string; status?: AtomStatus; limit?: number; offset?: number;
     time_start?: string; time_end?: string;
