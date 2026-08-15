@@ -6,8 +6,15 @@ FALDA ships both halves of the integration:
 
 | Piece | What it does | Where |
 |---|---|---|
-| **MCP server** | Recall + write tools (`falda_*`) the model calls directly | `src/mcp.ts` (this repo) |
+| **MCP endpoint** | Recall/remember/forget/distill tools (`falda_*`) the model calls directly | one facet of `falda serve` (`src/server.ts`), backed by `src/mcp.ts` |
 | **Capture plugin** | Auto-logs every turn to FALDA's Stream (T0), no tool call needed | `integrations/opencode/plugin/falda-capture.ts` |
+
+`falda serve` is the recommended way to run FALDA for this integration: one
+process exposes the MCP endpoint (port `8079`, above) *and* the HTTP/JSON
+API (port `8077` — pool admin, `/distill`, and the recall-trace inspection
+routes in `docs/RECALL_TRACES.md`) *and* the background distillation worker,
+sharing one token file and one embedder. See "Why not the JSON gateway
+directly?" below for why agents specifically use the MCP surface.
 
 This is designed for **one FALDA deployment serving many containerized
 opencode agents**, where a single container may work across **several
@@ -17,13 +24,31 @@ tools address is whatever `X-Falda-Tenant` is set in the *project's own*
 `opencode.json` (see "Per-project opencode config" below), not something
 fixed for the whole container.
 
-## Why not the JSON gateway directly?
+## One server, two protocol surfaces
 
-The FALDA gateway (`src/gateway.ts`, port `8077`/`8078`) trusts a `tenant`
-field straight from the request body — fine on a private loopback/tailnet
-(see `docs/POOLS.md`), but not safe to expose to many containers over a
-shared network, since any caller could claim any tenant. The MCP server adds
-**token-based auth** for exactly that case — see `docs/MCP.md`.
+`falda serve` runs the HTTP/JSON API (`src/gateway.ts`, port `8077`) and the
+MCP endpoint (`src/mcp.ts`, port `8079`) in one process, against one shared
+`TokenStore`: both require `Authorization: Bearer <token>` and both SELECT
+the addressed tenant via the `X-Falda-Tenant` header (the token only
+*authorizes* which tenants it may select — see "Auth model" below). Neither
+surface trusts a tenant claim from the request body. Auth is identical
+either way; the surfaces differ in what they expose:
+
+- **MCP** (what this integration uses) — the compact, intention-level
+  `falda_*` tool set (`falda_recall`, `falda_remember`, `falda_forget`,
+  `falda_distill`, `falda_distill_status`, `falda_whoami`, plus
+  `falda_stream_add` for the capture plugin below) — see `docs/MCP.md`.
+  opencode (and other MCP clients) get typed tool schemas for free.
+- **HTTP/JSON** — the same tier-level operations as low-level routes, plus
+  pool administration (`/pools/*`) and recall-trace inspection/usage
+  reporting (`/recall/usage`, `/recalls/get`, `/recalls/metrics` —
+  `docs/RECALL_TRACES.md`) that are deliberately **not** exposed over MCP.
+  Used for admin/debug and for harness-level usage reporting, not by the
+  model.
+
+Both stay off the public internet — no TLS/rate-limiting of their own; bind
+to a private network/tailnet or Compose-internal network (see
+`proxy/README.md` if you need a public-facing front door with TLS).
 
 ## 1. Auth model in one paragraph
 
@@ -39,22 +64,19 @@ the same token but a different `X-Falda-Tenant`.
 
 ```bash
 # from a checkout of this repo
-cp falda_mcp_tokens.example.json falda_mcp_tokens.json
+cp falda_tokens.example.json falda_tokens.json
 #   -> fill in real tokens (e.g. `openssl rand -hex 24`), each with its
 #      tenants[] allow-list (and pools[] if it should reach shared pools)
+#   this one file is canonical — shared by the HTTP API and the MCP endpoint
 
 FALDA_ROOT=~/.falda/data \
-FALDA_MCP_PORT=8079 \
-FALDA_MCP_TOKENS=./falda_mcp_tokens.json \
+FALDA_TOKENS=./falda_tokens.json \
 FALDA_EMBED=local \            # or remote; see docs/INSTALL.md
-node --import tsx src/mcp.ts
+falda serve                    # or: node --import tsx src/server.ts
 
+curl -s localhost:8077/healthz   # HTTP API
 curl -s localhost:8079/healthz   # {"ok":true,"mcp":true}
 ```
-
-Keep the MCP server off the public internet (no TLS/rate-limiting of its
-own) — bind to a private network/tailnet, same posture as the gateway
-(see `proxy/README.md` if you need a public-facing front door with TLS).
 
 ## 2b. Docker / Compose (many containerized opencode agents, one FALDA)
 
@@ -62,8 +84,9 @@ For the "one FALDA instance behind several containerized opencode agents"
 deployment this whole integration targets, run FALDA as another service on
 the same Compose network as the agents rather than by hand. This repo ships
 a `Dockerfile` (multi-stage: builds `better-sqlite3` + TypeScript, then a
-slim `node:24-trixie-slim` runtime running `node dist/mcp.js`) at the repo
-root, purpose-built for the MCP server (not the gateway).
+slim `node:24-trixie-slim` runtime) at the repo root, running `falda serve`
+(`node dist/server.js`) by default — one process, both protocol surfaces,
+the distillation worker, and recall-trace pruning.
 
 Add a `falda` service to your agents' `docker-compose.yml`, alongside
 whatever LLM-proxy/other shared services they already depend on:
@@ -73,19 +96,26 @@ services:
   falda:
     build:
       context: /path/to/falda        # a checkout of this repo
-    image: local/falda-mcp:latest
+    image: local/falda:latest
     hostname: falda
     restart: unless-stopped
     init: true
     environment:
       FALDA_ROOT: /data
+      FALDA_PORT: "8077"
       FALDA_MCP_PORT: "8079"
-      FALDA_MCP_TOKENS: /run/falda/tokens.json
+      FALDA_TOKENS: /run/falda/tokens.json
       FALDA_EMBED: local             # see "Embeddings" below to use a real model
       FALDA_DIM: "768"
+      # Distillation (T0->T1->T2->T3) — any OpenAI-compatible chat model,
+      # decoupled from whatever model the agents themselves use:
+      FALDA_LLM_BASE_URL: "https://your-llm-proxy/v1"
+      FALDA_LLM_API_KEY: "${YOUR_LLM_API_KEY}"
+      FALDA_LLM_MODEL: "gpt-4.1-mini"
+      FALDA_WORKER_INTERVAL_MS: "900000"   # 15 min; auto-enqueues every self-store
     volumes:
-      - falda-data:/data                                       # persistent store
-      - /path/to/falda_mcp_tokens.json:/run/falda/tokens.json:ro # secret, host-only
+      - falda-data:/data                                  # persistent store
+      - /path/to/falda_tokens.json:/run/falda/tokens.json:ro # secret, host-only
     healthcheck:
       test: ["CMD", "node", "-e", "require('http').get('http://localhost:8079/healthz',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
       interval: 10s
@@ -106,15 +136,30 @@ Notes:
 
 - **Create the token file on the host first** — it is never baked into the
   image (`.dockerignore` excludes it) and must exist before `docker compose
-  up`, e.g. `cp falda_mcp_tokens.example.json /path/to/falda_mcp_tokens.json`
-  then fill in a real `openssl rand -hex 24` token. It's bind-mounted
-  read-only, so rotating it is just editing the host file — no rebuild.
+  up`, e.g. `cp falda_tokens.example.json /path/to/falda_tokens.json` then
+  fill in a real `openssl rand -hex 24` token. It's bind-mounted read-only,
+  so rotating it is just editing the host file — no rebuild. This one file
+  authenticates both the MCP endpoint and the HTTP API.
 - **Agents reach FALDA by service name**: `http://falda:8079/mcp`, the same
   way they'd reach any other shared service (e.g. an LLM proxy) on the
-  Compose network — no host port needs to be published.
+  Compose network. No host port needs to be published for agents to work;
+  publishing `127.0.0.1:8077:8077` (and/or `:8079`) is only useful for
+  host-side debugging (`curl`ing `/healthz`, `/recalls/metrics`, triggering
+  an out-of-cycle `/distill`).
 - **Persistent store**: `falda-data` is a named volume for `FALDA_ROOT`, so
-  atoms/stream survive `docker compose down`/image rebuilds. Use `docker
-  compose down -v` only if you intend to wipe memory.
+  atoms/stream/scenes/core survive `docker compose down`/image rebuilds —
+  along with `distill_queue.db` and `recall_traces.db` (recall-trace
+  telemetry, pruned on its own retention schedule; see
+  `docs/RECALL_TRACES.md`). Use `docker compose down -v` only if you intend
+  to wipe memory (and telemetry) entirely.
+- **Distillation runs in this same container** — there is no separate
+  gateway/worker service to bring up. The worker auto-enqueues every
+  self-store it finds on disk on each `FALDA_WORKER_INTERVAL_MS` tick and
+  drains the shared queue with `FALDA_LLM_*`. Tail `docker compose logs -f
+  falda` and confirm a clean `[falda-worker] enqueued ... / pass ...` cycle
+  before leaving it running unattended — see the README's "Distillation"
+  section in a downstream Compose repo (e.g. `docker-setups`) for the log
+  shapes to expect.
 - **Embeddings**: starts as `FALDA_EMBED=local` (deterministic, offline,
   weak recall — fine to confirm wiring). To use a real embedding model
   served by something else on the Compose network (e.g. an existing
@@ -137,6 +182,13 @@ Notes:
   `package-lock.json`, `tsconfig.json`, and `src/` (see `.dockerignore`);
   it does not need `docs/`, `test/`, `integrations/`, or the Python
   distiller.
+- **`command:` override**: the image's default `CMD` is `node dist/server.js`
+  (`falda serve`, both ports + worker). Pass `command: ["node",
+  "dist/server.js", "--no-mcp"]` if you only want the HTTP API + worker in a
+  given service (rare — MCP is what agents actually use). The legacy
+  standalone `dist/gateway.js`/`dist/mcp.js` entry points still exist for
+  deployments mid-migration but are not the recommended `command:` for new
+  setups.
 
 ## 3. Per-project opencode config
 
@@ -162,7 +214,7 @@ tenant:
 
 Two projects in the same container reuse the same token but set a different
 `X-Falda-Tenant` — as long as the token's `tenants` allow-list (in
-`falda_mcp_tokens.json`) includes both.
+`falda_tokens.json`) includes both.
 
 Add `AGENTS.md.snippet`'s contents to the project's `AGENTS.md` so the model
 knows to use the `falda_*` tools for recall.
@@ -313,7 +365,8 @@ FALDA side (admin-only — not exposed over MCP) and add it to each
 authorized token's `pools` allow-list:
 
 ```bash
-curl -s localhost:8078/pools/declare -d '{
+curl -s localhost:8077/pools/declare \
+  -H "Authorization: Bearer <fully-trusted-token>" -d '{
   "name": "shared-corpus",
   "members": {"proj-a": "readwrite", "proj-b": "read"},
   "description": "facts both projects contribute to / read"
@@ -326,9 +379,14 @@ always physically isolated per tenant — see `docs/POOLS.md`.
 
 ## 6. Tool reference
 
-See `docs/MCP.md` for the full tool table (recall/read across all four
-tiers; write for Stream + Atoms only — Scenes and Core stay read-only,
-curated by the distillation pipeline).
+See `docs/MCP.md` for the full tool table. By default the model sees a
+compact set — `falda_recall`, `falda_remember`, `falda_forget`,
+`falda_distill`, `falda_distill_status`, `falda_whoami` — plus
+`falda_stream_add` for the capture plugin's own use. Set
+`FALDA_MCP_TOOLSET=full` on the server to also expose the tier-specific
+tools (`falda_atoms_search`, `falda_scenes_search`, ...) for debugging;
+Scenes and Core stay read-only in either toolset, curated by the
+distillation pipeline.
 
 ## Checklist for setting up a new project's tenant
 
@@ -338,7 +396,7 @@ project you want FALDA memory for:
 1. Choose a tenant id for the project (e.g. the project's slug — doesn't
    need to match its directory name, but that's a reasonable default).
 2. Add that tenant id to the `tenants[]` allow-list of whichever bearer
-   token this container/host uses, in `falda_mcp_tokens.json` (one
+   token this container/host uses, in `falda_tokens.json` (one
    container's token commonly spans several projects/tenants).
 3. Add/merge `opencode.json` in the *project's own directory* (not the
    global config) with `mcp.falda` pointing at the FALDA MCP server, that

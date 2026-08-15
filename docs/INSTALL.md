@@ -74,6 +74,34 @@ is shared by both the HTTP API and the MCP endpoint.
 points (HTTP-only / MCP-only, each its own process) for deployments that
 haven't migrated — see `docs/API.md` and `docs/MCP.md`.
 
+## Running in Docker
+
+```bash
+cp falda_tokens.example.json falda_tokens.json   # fill in real tokens
+docker build -t local/falda:latest .
+docker run -d --name falda \
+  -p 127.0.0.1:8077:8077 -p 127.0.0.1:8079:8079 \
+  -v falda-data:/data \
+  -v "$PWD/falda_tokens.json:/run/falda/tokens.json:ro" \
+  -e FALDA_EMBED=local \
+  local/falda:latest
+
+curl -s localhost:8077/healthz
+curl -s localhost:8079/healthz
+```
+
+The image's default `CMD` is `node dist/server.js` (`falda serve`) — HTTP
+API + MCP + the distillation worker + recall-trace pruning, all in one
+container. `FALDA_ROOT=/data`, `FALDA_TOKENS=/run/falda/tokens.json`,
+`FALDA_PORT=8077`, `FALDA_MCP_PORT=8079`, and `FALDA_EMBED=local` are baked
+in as defaults (see the `Dockerfile`); override with `-e` as needed,
+including `FALDA_LLM_*` to point distillation at a real chat model (see
+`docs/API.md` "Distillation").
+
+For the "one FALDA instance behind several containerized agents" deployment
+(Compose, shared network, per-project tenants), see
+`integrations/opencode/README.md` §2b for the full recipe.
+
 ## Using it as a library
 
 ```bash

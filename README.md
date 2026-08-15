@@ -96,9 +96,11 @@ by design (MCP is the restricted agent-facing surface; HTTP additionally
 exposes pool-admin routes).
 
 For deployments where many agents (e.g. containerized opencode instances)
-share one FALDA over a network, point them at the MCP endpoint. See
+share one FALDA over a network, point them at the MCP endpoint. This repo
+ships a `Dockerfile` running `falda serve` by default (see
+[`docs/INSTALL.md`](docs/INSTALL.md) "Running in Docker"), and
 [`integrations/opencode/README.md`](integrations/opencode/README.md) for the
-opencode-specific setup (MCP config + auto-capture plugin).
+opencode-specific setup (Compose recipe, MCP config, auto-capture plugin).
 
 <details>
 <summary>Legacy standalone entry points (deprecated, kept for compatibility)</summary>

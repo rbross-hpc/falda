@@ -5,7 +5,9 @@ dist
 .github
 
 # Secrets — must never enter an image layer.
+falda_tokens.json
 falda_mcp_tokens.json
+falda_gateway_tokens.json
 proxy/falda_proxy_tokens.json
 proxy/falda_proxy.crt
 proxy/falda_proxy.key
@@ -18,7 +20,7 @@ example-blobs/
 *.db-shm
 *.log
 
-# Not needed to build the MCP server image.
+# Not needed to build the unified server image.
 test
 examples
 deck

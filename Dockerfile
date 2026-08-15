@@ -1,4 +1,4 @@
-# FALDA MCP server image — multi-stage build.
+# FALDA unified server image — multi-stage build.
 #
 # The builder stage compiles TypeScript and the better-sqlite3 native addon
 # under the exact Node version the runtime stage uses (both node:24), so the
@@ -7,9 +7,12 @@
 # deploy/launchd/*.plist.template (REPLACE_ME_NODE) doesn't apply here since
 # build and run are pinned to the same base image.
 #
-# Runs `node dist/mcp.js` (the compiled MCP server, src/mcp.ts) — NOT the
-# JSON gateway. See docs/MCP.md for the auth model and tool table, and
-# integrations/opencode/README.md for the Docker Compose recipe.
+# Runs `node dist/server.js` — `falda serve` (src/server.ts): the HTTP JSON
+# API, the MCP endpoint, the background distillation worker, and recall-trace
+# pruning, all in one process against one shared runtime (src/runtime.ts).
+# See docs/MCP.md / docs/API.md for the two protocol surfaces' auth model and
+# route/tool tables, and integrations/opencode/README.md for the Docker
+# Compose recipe (multi-agent deployment against one FALDA instance).
 
 # ---- builder ----
 FROM node:24-trixie AS builder
@@ -27,8 +30,9 @@ FROM node:24-trixie-slim AS runtime
 
 ENV NODE_ENV=production \
     FALDA_ROOT=/data \
+    FALDA_PORT=8077 \
     FALDA_MCP_PORT=8079 \
-    FALDA_MCP_TOKENS=/run/falda/tokens.json \
+    FALDA_TOKENS=/run/falda/tokens.json \
     FALDA_EMBED=local \
     FALDA_DIM=768
 
@@ -41,6 +45,6 @@ COPY --from=builder /app/package.json ./package.json
 RUN mkdir -p /data && chown -R node:node /data
 
 USER node
-EXPOSE 8079
+EXPOSE 8077 8079
 
-CMD ["node", "dist/mcp.js"]
+CMD ["node", "dist/server.js"]
