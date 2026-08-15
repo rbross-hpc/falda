@@ -1,30 +1,46 @@
 /**
- * FALDA auto-capture plugin for opencode.
+ * FALDA auto-capture + auto-recall plugin for opencode.
  *
- * Writes each user/assistant turn to the FALDA Stream (T0) as it happens, so
- * conversation history is captured for later distillation into atoms/scenes/
- * core — without requiring the model to call a tool for every turn (models
- * are unreliable at remembering to do that; this hook is not).
+ * Two independent features, sharing one credential-resolution path:
  *
- * opencode's Message objects carry no text/content themselves — text lives in
- * separate Part objects (message.part.updated events), linked back to their
- * parent message by `messageID`. So this plugin accumulates text parts per
- * message id as they stream in, then flushes the assembled text to FALDA
- * once the message settles (`message.updated` with an assistant message's
- * `time.completed` set, or immediately for a user message, which doesn't
- * stream).
+ * 1. Auto-capture: writes each user/assistant turn to the FALDA Stream (T0)
+ *    as it happens, so conversation history is captured for later
+ *    distillation into atoms/scenes/core — without requiring the model to
+ *    call a tool for every turn (models are unreliable at remembering to
+ *    do that; this hook is not).
+ *
+ *    opencode's Message objects carry no text/content themselves — text
+ *    lives in separate Part objects (message.part.updated events), linked
+ *    back to their parent message by `messageID`. So this plugin
+ *    accumulates text parts per message id as they stream in, then flushes
+ *    the assembled text to FALDA once the message settles (`message.updated`
+ *    with an assistant message's `time.completed` set, or immediately for a
+ *    user message, which doesn't stream).
+ *
+ * 2. Auto-recall: fires one `falda_recall` (mode: "auto", a smaller default
+ *    budget than an explicit call — see src/recall/budgets.ts) at the start
+ *    of each session and injects the result into that first user turn, so
+ *    the model has relevant memory *before* it decides whether to call
+ *    `falda_recall` itself. This uses the `chat.message` hook — documented,
+ *    non-experimental (see opencode's plugin Hooks type) — which fires with
+ *    the outgoing user message and lets a plugin push extra text parts onto
+ *    it before it reaches the LLM. Session-scoped, once only (first user
+ *    message), not per-turn — this is meant to prime a task, not replace
+ *    the model's own judgment about when to search memory further. Never
+ *    blocks the turn: wrapped in a short timeout, and any failure is
+ *    logged and swallowed rather than surfaced to the user.
  *
  * Tenant resolution — FALDA is meant to be scoped **per project**, not per
  * agent/container (see ../README.md "Per-project opencode config"): each
  * project sets its own tenant in its `opencode.json`'s `mcp.falda.headers`.
- * This plugin must capture to that *same* tenant, or recall (via the
- * `falda_*` MCP tools) and capture would silently diverge. So at plugin init
- * it asks opencode for the resolved config for this project's directory
+ * This plugin must capture/recall against that *same* tenant, or the two
+ * would silently diverge. So at plugin init it asks opencode for the
+ * resolved config for this project's directory
  * (`client.config.get({ query: { directory } })`, which returns the merged
  * global + project config — the same merge opencode itself uses to wire up
  * `mcp.falda`) and reuses its `mcp.falda.headers` (`Authorization`,
  * `X-Falda-Tenant`) and `url` directly. No separate credential, and no way
- * for capture to use a different tenant than recall for this project.
+ * for capture/recall to use a different tenant than the rest of this project.
  *
  * Falls back to the FALDA_MCP_URL/FALDA_MCP_TOKEN/FALDA_TENANT env vars only
  * if the resolved config has no `mcp.falda` entry (e.g. no opencode.json in
@@ -43,7 +59,8 @@
  *   opencode.json  mcp.falda.{url,headers.Authorization,headers.X-Falda-Tenant}
  *                  (per-project or global — see ../opencode.json.example)
  *   FALDA_MCP_URL / FALDA_MCP_TOKEN / FALDA_TENANT   fallback if no mcp.falda config resolves
- *   FALDA_CAPTURE  "0" to disable capture entirely (default: enabled)
+ *   FALDA_CAPTURE      "0" to disable capture entirely (default: enabled)
+ *   FALDA_AUTO_RECALL  "0" to disable auto-recall entirely (default: enabled)
  *
  * Install: copy this file to .opencode/plugins/falda-capture.ts (project) or
  * ~/.config/opencode/plugins/falda-capture.ts (global), and add a
@@ -101,11 +118,47 @@ async function callFaldaStreamAdd(creds: FaldaCreds, sessionId: string, role: st
   }
 }
 
+/**
+ * Fire one falda_recall(mode:"auto") for the given query and return its
+ * rendered context text, or undefined on any failure/timeout. Never throws
+ * — caller treats undefined as "nothing to inject", not an error.
+ */
+async function callFaldaAutoRecall(creds: FaldaCreds, query: string, timeoutMs: number): Promise<string | undefined> {
+  const transport = new StreamableHTTPClientTransport(new URL(creds.url), {
+    requestInit: { headers: { Authorization: `Bearer ${creds.token}`, "X-Falda-Tenant": creds.tenant } },
+  });
+  const client = new Client({ name: "opencode-falda-auto-recall", version: "1.0" });
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`falda_recall timed out after ${timeoutMs}ms`)), timeoutMs);
+  });
+  try {
+    await Promise.race([client.connect(transport), timeout]);
+    const result = await Promise.race([
+      client.callTool({ name: "falda_recall", arguments: { query, mode: "auto" } }),
+      timeout,
+    ]) as any;
+    const text = result?.content?.[0]?.text;
+    if (typeof text !== "string") return undefined;
+    const parsed = JSON.parse(text);
+    return typeof parsed?.context === "string" && parsed.context.trim() ? parsed.context : undefined;
+  } finally {
+    if (timer) clearTimeout(timer);
+    await client.close().catch(() => {});
+  }
+}
+
+const AUTO_RECALL_TIMEOUT_MS = 5000;
+
 export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
-  if (process.env.FALDA_CAPTURE === "0") return {};
+  const captureEnabled = process.env.FALDA_CAPTURE !== "0";
+  const autoRecallEnabled = process.env.FALDA_AUTO_RECALL !== "0";
+  if (!captureEnabled && !autoRecallEnabled) return {};
 
   // Resolved lazily on the first captured event (see "Lazy resolution"
   // above), not here — must never await server calls during plugin init.
+  // Shared by capture and auto-recall — one credential resolution per
+  // session for both features.
   let credsPromise: Promise<FaldaCreds | undefined> | undefined;
   let disabled = false; // set once creds resolve to undefined — stop accumulating
   function getCreds(): Promise<FaldaCreds | undefined> {
@@ -117,6 +170,10 @@ export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
     }
     return credsPromise;
   }
+
+  // sessionIDs that have already received their one auto-recall injection —
+  // fires once per session (first user message), not once per turn.
+  const autoRecalled = new Set<string>();
 
   // messageID -> accumulated text parts, until the message settles.
   const pending = new Map<string, PendingText>();
@@ -148,7 +205,7 @@ export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
   }
 
   return {
-    event: async ({ event }) => {
+    event: captureEnabled ? async ({ event }) => {
       if (disabled) return;
 
       if (event.type === "message.part.updated") {
@@ -174,6 +231,44 @@ export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
           settledRole.set(message.id, message.role);
         }
       }
-    },
+    } : undefined,
+
+    // Fires once per session (first user message only — see autoRecalled
+    // above), before the LLM sees the turn. Injects a small falda_recall
+    // (mode:"auto") result as an extra text part on the SAME user message,
+    // so it's part of what the model reads for this turn without being a
+    // separate assistant-visible tool call. Never blocks or fails the turn:
+    // any error/timeout just means nothing gets injected.
+    "chat.message": autoRecallEnabled ? async (input, output) => {
+      if (disabled) return;
+      const sessionID = input.sessionID;
+      if (!sessionID || autoRecalled.has(sessionID)) return;
+      autoRecalled.add(sessionID); // mark immediately — at most one attempt per session, even on failure
+
+      const query = output.parts
+        .filter((p: any) => p?.type === "text" && typeof p.text === "string")
+        .map((p: any) => p.text)
+        .join("\n")
+        .trim();
+      if (!query) return;
+
+      const creds = await getCreds();
+      if (!creds) return;
+
+      try {
+        const context = await callFaldaAutoRecall(creds, query, AUTO_RECALL_TIMEOUT_MS);
+        if (!context) return;
+        output.parts.push({
+          type: "text",
+          text: `<falda-auto-recall>\nThe following memory context was retrieved automatically for this task ` +
+            `(smaller budget than an explicit falda_recall call — call falda_recall yourself for a deeper search):\n\n` +
+            `${context}\n</falda-auto-recall>`,
+        } as any);
+      } catch (e) {
+        await client.app.log({
+          body: { service: "falda-capture", level: "warn", message: "auto-recall failed", extra: { error: String(e) } },
+        }).catch(() => {});
+      }
+    } : undefined,
   };
 };

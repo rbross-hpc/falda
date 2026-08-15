@@ -36,6 +36,11 @@
 #
 # Env:
 #   FALDA_CAPTURE      "0" disables capture plugin install (default: enabled)
+#   FALDA_AUTO_RECALL  "0" disables the plugin's per-session auto-recall at
+#                      runtime (default: enabled; read by the plugin itself,
+#                      not this entrypoint — no install step needed, unlike
+#                      FALDA_CAPTURE above). Pass it through to the agent
+#                      container's environment like any other runtime var.
 #   FALDA_PLUGIN_SRC   path to falda-capture.ts inside the container
 #                      (default below — set to wherever your FALDA checkout
 #                      is mounted; this is deployment-specific)
