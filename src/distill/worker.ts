@@ -25,10 +25,16 @@
  */
 import type { Database as DatabaseType } from "better-sqlite3";
 import type { PoolManager } from "../pools.js";
-import type { LLMFn } from "./llm.js";
+import type { LLMFnWithModel } from "./llm.js";
 import { claimNext, completeJob, failJob, enqueue, storeKeyFor } from "./queue.js";
 import { distillOnce } from "./core.js";
+import { PROMPT_VERSION } from "./prompts.js";
 import { pruneRecallTraces, resolveRetentionDays } from "../recall/retention.js";
+
+// package.json version, read once at module load — attached to every pass
+// this worker runs as distiller_version (falda distill inspect provenance).
+import pkg from "../../package.json" with { type: "json" };
+const DISTILLER_VERSION = (pkg as { version?: string }).version ?? "unknown";
 
 export interface DistillerHandle {
   stop(): void;
@@ -42,7 +48,7 @@ export interface DistillerOptions {
 export function startDistiller(
   queueDb: DatabaseType,
   pools: PoolManager,
-  llm: LLMFn,
+  llm: LLMFnWithModel,
   intervalMs = 60_000,
   opts: DistillerOptions = {},
 ): DistillerHandle {
@@ -55,7 +61,10 @@ export function startDistiller(
     const [tenant, poolName] = job.store_key.split(":", 2);
     try {
       const store = pools.resolve(tenant, poolName === "self" ? undefined : poolName, true);
-      await distillOnce(store, llm, { storeKey: job.store_key, verbose: false });
+      await distillOnce(store, llm, {
+        storeKey: job.store_key, verbose: false,
+        model: llm.model, promptVersion: PROMPT_VERSION, distillerVersion: DISTILLER_VERSION,
+      });
       completeJob(queueDb, job.id);
     } catch (e: any) {
       failJob(queueDb, job.id, String(e?.message ?? e));

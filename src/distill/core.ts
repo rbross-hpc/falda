@@ -45,6 +45,13 @@ export interface DistillOptions {
    *  and a new one created (reorganization). */
   sceneReorgThreshold?: number;
   verbose?: boolean;
+  /** Provenance recorded on the distillation_passes row (falda distill
+   *  inspect) — which LLM/prompt policy/code version produced this pass's
+   *  decisions. Purely informational; distillOnce behavior is unaffected
+   *  by these values. */
+  model?: string;
+  promptVersion?: string;
+  distillerVersion?: string;
 }
 
 export interface DistillResult {
@@ -259,6 +266,63 @@ export async function distillOnce(
   result.turns_processed = turns.length;
   log(`[distill] pass ${pid}: ${turns.length} turns (seq ${(afterSeq ?? 0) + 1}–${lastTurn.seq})`);
 
+  // Pass metadata + effect log (falda distill inspect, src/inspect/). Only
+  // real (non-empty-window) passes are instrumented — see the early return
+  // above for the no-new-turns case, which never reaches here. Best-effort:
+  // a telemetry write failure must never abort distillation itself.
+  try {
+    store.recordPassStart({
+      pass_id: pid, store_key: storeKey,
+      watermark_start: afterSeq, watermark_end: lastTurn.seq,
+      input_turn_count: turns.length,
+      model: opts.model, prompt_version: opts.promptVersion, distiller_version: opts.distillerVersion,
+    });
+  } catch { /* best-effort */ }
+
+  const sceneEffects = new Map<string, SceneEffectAccum>();
+
+  try {
+    return await distillOncePass(store, llm, db, {
+      storeKey, candidateLimit, topicSimilarityThreshold, sceneMatchThreshold, sceneReorgThreshold,
+      verbose, log, turns, afterSeq, lastTurn, pid, result, sceneEffects,
+    });
+  } catch (e) {
+    try {
+      store.recordPassComplete({ pass_id: pid, status: "failed", error: String((e as any)?.message ?? e) });
+    } catch { /* best-effort */ }
+    throw e;
+  }
+}
+
+interface SceneEffectAccum {
+  scene_kind: SceneKind;
+  title: string;
+  effect: "created" | "updated" | "retired" | "unchanged";
+  members_before: number;
+  members_after: number;
+  added: string[];
+  removed: string[];
+  summary_regenerated: boolean;
+  embedding_regenerated: boolean;
+}
+
+async function distillOncePass(
+  store: Falda,
+  llm: LLMFn,
+  db: import("better-sqlite3").Database,
+  ctx: {
+    storeKey: string; candidateLimit: number;
+    topicSimilarityThreshold: number; sceneMatchThreshold: number; sceneReorgThreshold: number;
+    verbose: boolean; log: (...args: any[]) => void;
+    turns: StreamTurn[]; afterSeq: number | null; lastTurn: StreamTurn;
+    pid: string; result: DistillResult; sceneEffects: Map<string, SceneEffectAccum>;
+  },
+): Promise<DistillResult> {
+  const {
+    storeKey, candidateLimit, topicSimilarityThreshold, sceneMatchThreshold, sceneReorgThreshold,
+    verbose, log, turns, lastTurn, pid, result, sceneEffects,
+  } = ctx;
+
   // ── L1: Extract + Consolidate (one atomic transaction) ────────────────────
 
   // ── L1 async work: LLM calls BEFORE the transaction ────────────────────────
@@ -354,7 +418,11 @@ export async function distillOnce(
           result.atoms_stored++;
           log(`[distill] stored atom ${atom.id}`);
         }
-        store.recordDecision({ id: op.decId, pass_id: pid, action: "store", atom_id: op.newId, rationale: op.rationale });
+        store.recordDecision({
+          id: op.decId, pass_id: pid, action: "store", atom_id: op.newId, rationale: op.rationale,
+          candidate_type: op.candidate.type, candidate_content: op.candidate.content,
+          candidate_confidence: op.candidate.confidence,
+        });
 
       } else if (op.action === "update") {
         const oldId = op.validTargetIds[0];
@@ -364,7 +432,11 @@ export async function distillOnce(
           store.supersedeAtom(oldId, op.newId);
           result.atoms_updated++;
         }
-        store.recordDecision({ id: op.decId, pass_id: pid, action: "update", atom_id: op.newId, target_ids: [oldId], rationale: op.rationale });
+        store.recordDecision({
+          id: op.decId, pass_id: pid, action: "update", atom_id: op.newId, target_ids: [oldId], rationale: op.rationale,
+          candidate_type: op.candidate.type, candidate_content: op.candidate.content,
+          candidate_confidence: op.candidate.confidence,
+        });
 
       } else if (op.action === "merge") {
         const atom = preparedAtoms.get(op.newId);
@@ -374,10 +446,21 @@ export async function distillOnce(
           store.mergeAtoms(op.validTargetIds, op.newId);
           result.atoms_merged++;
         }
-        store.recordDecision({ id: op.decId, pass_id: pid, action: "merge", atom_id: op.newId, target_ids: op.validTargetIds, rationale: op.rationale });
+        store.recordDecision({
+          id: op.decId, pass_id: pid, action: "merge", atom_id: op.newId, target_ids: op.validTargetIds, rationale: op.rationale,
+          candidate_type: op.candidate.type, candidate_content: op.candidate.content,
+          candidate_confidence: op.candidate.confidence,
+        });
 
       } else {
-        store.recordDecision({ id: op.decId, pass_id: pid, action: "skip", rationale: op.rationale });
+        // skip: no durable atom is ever created for this candidate, so the
+        // candidate_* columns on this row are the ONLY place its content
+        // survives (falda distill inspect's regression requirement).
+        store.recordDecision({
+          id: op.decId, pass_id: pid, action: "skip", rationale: op.rationale,
+          candidate_type: op.candidate.type, candidate_content: op.candidate.content,
+          candidate_confidence: op.candidate.confidence,
+        });
         result.atoms_skipped++;
       }
     }
@@ -390,6 +473,16 @@ export async function distillOnce(
   }
 
   // ── L2: Organize into scenes ──────────────────────────────────────────────
+
+  const setDiff = (before: string[], after: string[]) => ({
+    added: after.filter((id) => !before.includes(id)),
+    removed: before.filter((id) => !after.includes(id)),
+  });
+
+  const noteSceneEffect = (e: SceneEffectAccum & { scene_id: string }) => {
+    const { scene_id, ...rest } = e;
+    sceneEffects.set(scene_id, rest);
+  };
 
   // Episode scenes: deterministic projection of atom_evidence by session.
   const sessionRows = db.prepare(
@@ -411,6 +504,7 @@ export async function distillOnce(
     const existingEp = db.prepare(
       "SELECT * FROM scenes WHERE scene_id=?"
     ).get(sceneId) as any;
+    const prevAtomIds: string[] = existingEp ? JSON.parse(existingEp.atom_ids ?? "[]") : [];
 
     const provisional = `Session ${session_id}`;
 
@@ -424,6 +518,11 @@ export async function distillOnce(
           atom_ids: [],
           status: "retired",
         });
+        noteSceneEffect({
+          scene_id: sceneId, scene_kind: "episode", title: existingEp.title, effect: "retired",
+          members_before: prevAtomIds.length, members_after: 0,
+          added: [], removed: prevAtomIds, summary_regenerated: false, embedding_regenerated: false,
+        });
       }
       continue;
     }
@@ -434,6 +533,13 @@ export async function distillOnce(
       title: existingEp?.title ?? provisional,
       atom_ids: activeAtomIds,
       status: "active",
+    });
+    const { added, removed } = setDiff(prevAtomIds, activeAtomIds);
+    noteSceneEffect({
+      scene_id: sceneId, scene_kind: "episode", title: existingEp?.title ?? provisional,
+      effect: !existingEp ? "created" : (added.length || removed.length) ? "updated" : "unchanged",
+      members_before: prevAtomIds.length, members_after: activeAtomIds.length,
+      added, removed, summary_regenerated: false, embedding_regenerated: false,
     });
     result.scenes_derived++;
   }
@@ -496,6 +602,13 @@ export async function distillOnce(
             atom_ids: memberIds,
             status: "active",
           });
+          const { added, removed } = setDiff(prevAtoms, memberIds);
+          noteSceneEffect({
+            scene_id: bestMatch.scene_id, scene_kind: "topic", title: bestMatch.title,
+            effect: (added.length || removed.length) ? "updated" : "unchanged",
+            members_before: prevAtoms.length, members_after: memberIds.length,
+            added, removed, summary_regenerated: false, embedding_regenerated: false,
+          });
         } else {
           // Above reorg threshold: retire old, create new with lineage.
           const newScene = await store.upsertScene({
@@ -513,14 +626,29 @@ export async function distillOnce(
             status: "retired",
             superseded_by: [newScene.scene_id],
           });
+          noteSceneEffect({
+            scene_id: newScene.scene_id, scene_kind: "topic", title: newScene.title, effect: "created",
+            members_before: 0, members_after: memberIds.length,
+            added: memberIds, removed: [], summary_regenerated: false, embedding_regenerated: false,
+          });
+          noteSceneEffect({
+            scene_id: bestMatch.scene_id, scene_kind: "topic", title: bestMatch.title, effect: "retired",
+            members_before: prevAtoms.length, members_after: 0,
+            added: [], removed: prevAtoms, summary_regenerated: false, embedding_regenerated: false,
+          });
         }
       } else {
         // New cluster — create a new topic scene with a provisional title.
-        await store.upsertScene({
+        const newScene = await store.upsertScene({
           scene_kind: "topic",
           title: `Topic ${Date.now()}`,
           atom_ids: memberIds,
           status: "active",
+        });
+        noteSceneEffect({
+          scene_id: newScene.scene_id, scene_kind: "topic", title: newScene.title, effect: "created",
+          members_before: 0, members_after: memberIds.length,
+          added: memberIds, removed: [], summary_regenerated: false, embedding_regenerated: false,
         });
       }
       result.scenes_derived++;
@@ -529,12 +657,18 @@ export async function distillOnce(
     // Retire topic scenes with no matching cluster.
     for (const et of existingTopics) {
       if (!matchedExistingIds.has(et.scene_id)) {
+        const prevAtoms: string[] = JSON.parse(et.atom_ids ?? "[]");
         await store.upsertScene({
           scene_id: et.scene_id,
           scene_kind: "topic",
           title: et.title,
-          atom_ids: JSON.parse(et.atom_ids ?? "[]"),
+          atom_ids: prevAtoms,
           status: "retired",
+        });
+        noteSceneEffect({
+          scene_id: et.scene_id, scene_kind: "topic", title: et.title, effect: "retired",
+          members_before: prevAtoms.length, members_after: 0,
+          added: [], removed: prevAtoms, summary_regenerated: false, embedding_regenerated: false,
         });
       }
     }
@@ -576,6 +710,22 @@ export async function distillOnce(
       content_hash: newHash,
       status: "active",
     });
+
+    // Merge into whatever L2 already recorded for this scene (membership
+    // effect) rather than overwrite it — this loop only adds the
+    // title/summary/embedding-regeneration flags on top.
+    const finalTitle = newTitle || sc.title;
+    const renderChanged = finalTitle !== sc.title || newSummary !== (sc.summary ?? null);
+    const existingEffect = sceneEffects.get(sc.scene_id);
+    sceneEffects.set(sc.scene_id, {
+      scene_kind: sc.scene_kind, title: finalTitle,
+      effect: existingEffect?.effect ?? "unchanged",
+      members_before: existingEffect?.members_before ?? atomIds.length,
+      members_after: existingEffect?.members_after ?? atomIds.length,
+      added: existingEffect?.added ?? [], removed: existingEffect?.removed ?? [],
+      summary_regenerated: true,
+      embedding_regenerated: renderChanged,
+    });
   }
 
   // ── L3: Synthesize core ──────────────────────────────────────────────────
@@ -587,6 +737,10 @@ export async function distillOnce(
 
   const newCoreHash = store.computeCoreHash();
   const coreState = getCoreState(db, storeKey);
+  const oldCoreChars = store.readCore().length;
+
+  let coreEffect: "unchanged" | "regenerated" | "deleted" | "failed" = "unchanged";
+  let newCoreChars = oldCoreChars;
 
   // Check if any active scenes exist.
   const sceneCount = (db.prepare("SELECT COUNT(*) c FROM scenes WHERE status='active'").get() as any).c;
@@ -595,6 +749,7 @@ export async function distillOnce(
     const fp = join((store as any).blobDir, "core.md");
     try { if (existsSync(fp)) unlinkSync(fp); } catch {}
     clearCoreState(db, storeKey);
+    if (oldCoreChars > 0) { coreEffect = "deleted"; newCoreChars = 0; }
   } else {
     // Re-synthesize only if input structure changed since last synthesis.
     const finalScenes = db.prepare(
@@ -616,14 +771,34 @@ export async function distillOnce(
         store.writeCore(newCore);
         setCoreState(db, storeKey, newCoreHash);
         result.core_regenerated = true;
+        coreEffect = "regenerated";
+        newCoreChars = newCore.length;
         log(`[distill] L3 core synthesized`);
       } catch (e) {
+        coreEffect = "failed";
         log(`[distill] L3 core synthesis failed: ${e}`);
       }
     } else {
       log(`[distill] L3 core unchanged (input hash matches), skipping`);
     }
   }
+
+  // ── Persist the effect log + finalize pass metadata (best-effort) ────────
+  try {
+    for (const [scene_id, eff] of sceneEffects) {
+      store.recordSceneEffect({ pass_id: pid, scene_id, ...eff });
+    }
+    store.recordCoreEffect({
+      pass_id: pid, effect: coreEffect,
+      old_input_hash: coreState?.input_hash ?? null,
+      new_input_hash: coreEffect === "regenerated" ? newCoreHash : (coreState?.input_hash ?? null),
+      old_chars: oldCoreChars, new_chars: newCoreChars,
+    });
+    const candidateCount = (db.prepare(
+      "SELECT COUNT(*) c FROM consolidation_decisions WHERE pass_id=?"
+    ).get(pid) as any).c as number;
+    store.recordPassComplete({ pass_id: pid, status: "done", candidate_count: candidateCount });
+  } catch { /* best-effort — pass data itself already committed */ }
 
   return result;
 }

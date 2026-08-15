@@ -254,6 +254,69 @@ describe("distillOnce", () => {
     } finally { cleanup(s, blobDir); }
   });
 
+  test("skip action: candidate content/type/confidence survive on the decision row (falda distill inspect regression)", async () => {
+    const { s, blobDir } = makeStore();
+    try {
+      await s.addStream("sess-1", [{ role: "user", content: "hello world" }]);
+      const llm = makeMockLLM([
+        `{"type":"fact","content":"hello world","confidence":"low"}`,
+        `{"action":"skip","target_ids":[],"rationale":"Trivial content."}`,
+        "General session", "Brief interaction.",
+        "# Core\n\nNo durable knowledge yet.",
+      ]);
+      await distillOnce(s, llm, { storeKey: "test:self" });
+      const db = (s as any).db as Database.Database;
+      const row = db.prepare("SELECT * FROM consolidation_decisions WHERE action='skip'").get() as any;
+      assert.ok(row, "skip decision row exists");
+      // The candidate a skip decision described has no durable atom — these
+      // three columns are the ONLY place its content survives.
+      assert.equal(row.candidate_type, "fact");
+      assert.equal(row.candidate_content, "hello world");
+      assert.equal(row.candidate_confidence, "low");
+      assert.equal(row.atom_id, null, "no atom created for a skip");
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("distillOnce persists pass metadata, scene effects, and core effects (falda distill inspect)", async () => {
+    const { s, blobDir } = makeStore();
+    try {
+      await s.addStream("sess-1", [{ role: "user", content: "deploy in bin/release" }]);
+      const llm = makeMockLLM([
+        `{"type":"fact","content":"Deploy in bin/release.","confidence":"high"}`,
+        `{"action":"store","target_ids":[],"rationale":"New."}`,
+        "Deploy session", "Deploy discussed.",
+        "Deploy topic", "Deploy facts.",
+        "# Core\n\nDeploy in bin/release.",
+      ]);
+      const result = await distillOnce(s, llm, {
+        storeKey: "inspect-meta-test:self",
+        model: "gpt-4o-mini", promptVersion: "v-test", distillerVersion: "9.9.9",
+      });
+      const db = (s as any).db as Database.Database;
+
+      const pass = db.prepare("SELECT * FROM distillation_passes WHERE pass_id=?").get(result.pass_id) as any;
+      assert.ok(pass, "distillation_passes row written");
+      assert.equal(pass.status, "done");
+      assert.equal(pass.input_turn_count, 1);
+      assert.equal(pass.candidate_count, 1);
+      assert.equal(pass.model, "gpt-4o-mini");
+      assert.equal(pass.prompt_version, "v-test");
+      assert.equal(pass.distiller_version, "9.9.9");
+      assert.ok(pass.started_at);
+      assert.ok(pass.completed_at);
+
+      const sceneEffects = db.prepare("SELECT * FROM pass_scene_effects WHERE pass_id=?").all(result.pass_id) as any[];
+      assert.ok(sceneEffects.length >= 1, "at least one scene effect recorded");
+      assert.ok(sceneEffects.every((e) => e.effect === "created"), "first pass creates scenes");
+
+      const coreEffect = db.prepare("SELECT * FROM pass_core_effects WHERE pass_id=?").get(result.pass_id) as any;
+      assert.ok(coreEffect, "core effect recorded");
+      assert.equal(coreEffect.effect, "regenerated");
+      assert.equal(coreEffect.old_chars, 0);
+      assert.ok(coreEffect.new_chars > 0);
+    } finally { cleanup(s, blobDir); }
+  });
+
   test("consolidation_decisions are recorded idempotently under pass id", async () => {
     const { s, blobDir } = makeStore();
     try {

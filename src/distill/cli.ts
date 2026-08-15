@@ -15,6 +15,10 @@ import { PoolManager } from "../pools.js";
 import { selectEmbedder, probeEmbedder } from "../boot.js";
 import { distillOnce } from "./core.js";
 import { makeLLM } from "./llm.js";
+import { PROMPT_VERSION } from "./prompts.js";
+import pkg from "../../package.json" with { type: "json" };
+
+const DISTILLER_VERSION = (pkg as { version?: string }).version ?? "unknown";
 
 async function run(once: boolean, intervalMs: number): Promise<void> {
   const ROOT = process.env.FALDA_ROOT ?? "./falda-data";
@@ -36,7 +40,10 @@ async function run(once: boolean, intervalMs: number): Promise<void> {
     const store = pools.resolve(TENANT!, POOL, true);
     const storeKey = `${TENANT}:${POOL ?? "self"}`;
     try {
-      const result = await distillOnce(store, llm, { storeKey, verbose: true });
+      const result = await distillOnce(store, llm, {
+        storeKey, verbose: true,
+        model: llm.model, promptVersion: PROMPT_VERSION, distillerVersion: DISTILLER_VERSION,
+      });
       console.log(`[distill-cli] pass ${result.pass_id}: ${result.turns_processed} turns, ` +
         `${result.atoms_stored} stored, ${result.atoms_updated} updated, ${result.atoms_merged} merged`);
     } catch (e) {

@@ -16,12 +16,26 @@ export interface LLMConfig {
 
 export type LLMFn = (prompt: string) => Promise<string>;
 
-export function makeLLM(cfg: LLMConfig = {}): LLMFn {
+export interface LLMFnWithModel extends LLMFn {
+  /** Model id this function is configured to call — surfaced so callers
+   *  (distillOnce provenance, `falda distill inspect`) can record which
+   *  model produced a given pass without re-reading env directly. */
+  model: string;
+}
+
+/** Resolve the effective model id the same way makeLLM does, without
+ *  constructing a client — used by callers that only need the label
+ *  (e.g. the distill CLI/worker attaching provenance to a pass). */
+export function resolveLLMModel(cfg: LLMConfig = {}): string {
+  return cfg.model ?? process.env.FALDA_LLM_MODEL ?? "gpt-4o-mini";
+}
+
+export function makeLLM(cfg: LLMConfig = {}): LLMFnWithModel {
   const baseUrl = cfg.baseUrl ?? process.env.FALDA_LLM_BASE_URL ?? "http://localhost:11434/v1";
   const apiKey = cfg.apiKey ?? process.env.FALDA_LLM_API_KEY ?? "x";
-  const model = cfg.model ?? process.env.FALDA_LLM_MODEL ?? "gpt-4o-mini";
+  const model = resolveLLMModel(cfg);
 
-  return async function llm(prompt: string): Promise<string> {
+  const fn = async function llm(prompt: string): Promise<string> {
     const resp = await fetch(`${baseUrl}/chat/completions`, {
       method: "POST",
       headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
@@ -30,5 +44,7 @@ export function makeLLM(cfg: LLMConfig = {}): LLMFn {
     if (!resp.ok) throw new Error(`LLM ${resp.status}: ${await resp.text()}`);
     const j = (await resp.json()) as any;
     return j.choices[0].message.content as string;
-  };
+  } as LLMFnWithModel;
+  fn.model = model;
+  return fn;
 }

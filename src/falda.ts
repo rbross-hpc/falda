@@ -345,9 +345,55 @@ export class Falda {
         atom_id TEXT,
         target_ids TEXT,
         rationale TEXT,
-        decided_at TEXT NOT NULL
+        decided_at TEXT NOT NULL,
+        candidate_type TEXT,
+        candidate_content TEXT,
+        candidate_confidence TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_decisions_pass ON consolidation_decisions(pass_id);
+
+      CREATE TABLE IF NOT EXISTS distillation_passes (
+        pass_id TEXT PRIMARY KEY,
+        store_key TEXT NOT NULL,
+        watermark_start INTEGER,
+        watermark_end INTEGER,
+        started_at TEXT NOT NULL,
+        completed_at TEXT,
+        status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','done','failed')),
+        input_turn_count INTEGER,
+        candidate_count INTEGER,
+        error TEXT,
+        model TEXT,
+        prompt_version TEXT,
+        distiller_version TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_passes_store ON distillation_passes(store_key);
+      CREATE INDEX IF NOT EXISTS idx_passes_started ON distillation_passes(started_at);
+
+      CREATE TABLE IF NOT EXISTS pass_scene_effects (
+        pass_id TEXT NOT NULL,
+        scene_id TEXT NOT NULL,
+        scene_kind TEXT NOT NULL,
+        title TEXT,
+        effect TEXT NOT NULL CHECK(effect IN ('created','updated','retired','unchanged')),
+        members_before INTEGER NOT NULL DEFAULT 0,
+        members_after INTEGER NOT NULL DEFAULT 0,
+        added_json TEXT NOT NULL DEFAULT '[]',
+        removed_json TEXT NOT NULL DEFAULT '[]',
+        summary_regenerated INTEGER NOT NULL DEFAULT 0,
+        embedding_regenerated INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (pass_id, scene_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_pass_scene_effects_pass ON pass_scene_effects(pass_id);
+
+      CREATE TABLE IF NOT EXISTS pass_core_effects (
+        pass_id TEXT PRIMARY KEY,
+        effect TEXT NOT NULL CHECK(effect IN ('unchanged','regenerated','deleted','failed')),
+        old_input_hash TEXT,
+        new_input_hash TEXT,
+        old_chars INTEGER,
+        new_chars INTEGER
+      );
 
       CREATE TABLE IF NOT EXISTS scenes (
         scene_id TEXT PRIMARY KEY,
@@ -440,6 +486,18 @@ export class Falda {
           updated_at = COALESCE(updated_at, '${now}')
         WHERE priority IS NULL OR status IS NULL
       `);
+    }
+
+    // consolidation_decisions: add candidate_* columns for stores created
+    // before candidate persistence (falda distill inspect). Nullable —
+    // pre-existing rows (especially historical skip decisions) cannot be
+    // backfilled; the candidate they described is already unrecoverable.
+    if (this.tableExists("consolidation_decisions")) {
+      for (const col of ["candidate_type", "candidate_content", "candidate_confidence"]) {
+        if (!this.hasColumn("consolidation_decisions", col)) {
+          this.db.exec(`ALTER TABLE consolidation_decisions ADD COLUMN ${col} TEXT`);
+        }
+      }
     }
   }
 
@@ -799,17 +857,92 @@ export class Falda {
   recordDecision(d: {
     id: string; pass_id: string; action: string;
     atom_id?: string; target_ids?: string[]; rationale?: string;
+    candidate_type?: string; candidate_content?: string; candidate_confidence?: string;
   }): void {
     this.db.prepare(
       `INSERT OR IGNORE INTO consolidation_decisions
-       (id,pass_id,action,atom_id,target_ids,rationale,decided_at)
-       VALUES(?,?,?,?,?,?,?)`
+       (id,pass_id,action,atom_id,target_ids,rationale,decided_at,
+        candidate_type,candidate_content,candidate_confidence)
+       VALUES(?,?,?,?,?,?,?,?,?,?)`
     ).run(
       d.id, d.pass_id, d.action,
       d.atom_id ?? null,
       d.target_ids ? JSON.stringify(d.target_ids) : null,
       d.rationale ?? null,
       new Date().toISOString(),
+      d.candidate_type ?? null,
+      d.candidate_content ?? null,
+      d.candidate_confidence ?? null,
+    );
+  }
+
+  // ─── Distillation pass metadata / effect log (inspect surface) ────────────
+
+  recordPassStart(p: {
+    pass_id: string; store_key: string;
+    watermark_start: number | null; watermark_end: number | null;
+    input_turn_count: number;
+    model?: string; prompt_version?: string; distiller_version?: string;
+  }): void {
+    this.db.prepare(
+      `INSERT OR IGNORE INTO distillation_passes
+       (pass_id,store_key,watermark_start,watermark_end,started_at,status,
+        input_turn_count,model,prompt_version,distiller_version)
+       VALUES(?,?,?,?,?,'running',?,?,?,?)`
+    ).run(
+      p.pass_id, p.store_key, p.watermark_start, p.watermark_end,
+      new Date().toISOString(), p.input_turn_count,
+      p.model ?? null, p.prompt_version ?? null, p.distiller_version ?? null,
+    );
+  }
+
+  recordPassComplete(p: {
+    pass_id: string; status: "done" | "failed";
+    candidate_count?: number; error?: string;
+  }): void {
+    this.db.prepare(
+      `UPDATE distillation_passes SET completed_at=?,status=?,candidate_count=?,error=?
+       WHERE pass_id=?`
+    ).run(
+      new Date().toISOString(), p.status,
+      p.candidate_count ?? null, p.error ?? null,
+      p.pass_id,
+    );
+  }
+
+  recordSceneEffect(e: {
+    pass_id: string; scene_id: string; scene_kind: SceneKind; title: string;
+    effect: "created" | "updated" | "retired" | "unchanged";
+    members_before: number; members_after: number;
+    added?: string[]; removed?: string[];
+    summary_regenerated?: boolean; embedding_regenerated?: boolean;
+  }): void {
+    this.db.prepare(
+      `INSERT OR REPLACE INTO pass_scene_effects
+       (pass_id,scene_id,scene_kind,title,effect,members_before,members_after,
+        added_json,removed_json,summary_regenerated,embedding_regenerated)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?)`
+    ).run(
+      e.pass_id, e.scene_id, e.scene_kind, e.title, e.effect,
+      e.members_before, e.members_after,
+      JSON.stringify(e.added ?? []), JSON.stringify(e.removed ?? []),
+      e.summary_regenerated ? 1 : 0, e.embedding_regenerated ? 1 : 0,
+    );
+  }
+
+  recordCoreEffect(e: {
+    pass_id: string; effect: "unchanged" | "regenerated" | "deleted" | "failed";
+    old_input_hash?: string | null; new_input_hash?: string | null;
+    old_chars?: number | null; new_chars?: number | null;
+  }): void {
+    this.db.prepare(
+      `INSERT OR REPLACE INTO pass_core_effects
+       (pass_id,effect,old_input_hash,new_input_hash,old_chars,new_chars)
+       VALUES(?,?,?,?,?,?)`
+    ).run(
+      e.pass_id, e.effect,
+      e.old_input_hash ?? null, e.new_input_hash ?? null,
+      e.old_chars ?? null, e.new_chars ?? null,
     );
   }
 

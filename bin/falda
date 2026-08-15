@@ -32,6 +32,20 @@
 #                            model/dimension change".
 #                            ARGS: --root=DIR --tenant=T --pool=P
 #                            --dry-run --yes
+#   falda distill inspect [ARGS]
+#                            Read-only report of what distillation actually
+#                            decided (not merely whether it ran): extracted
+#                            candidates, store/update/merge/skip decisions
+#                            with rationale, T2 scene effects, T3 core
+#                            regeneration, and heuristic quality warnings.
+#                            Never mutates a store. See docs/OPERATIONS.md
+#                            "Reviewing distillation quality".
+#                            ARGS: --root=DIR --tenant=T --pool=P
+#                            --last=N --since=24h|7d --pass=ID
+#                            --action=store,update,merge,skip
+#                            --status=running|done|failed --random=N
+#                            --evidence --verbose --json
+#                            --export-fixture=out.json
 #   falda version           Print the package version.
 #   falda help              This help.
 #
@@ -108,6 +122,22 @@ case "$cmd" in
     ;;
   reembed)
     run_node_or_tsx "dist/reembed.js" "src/reembed.ts" "$@"
+    ;;
+  distill)
+    sub="${1:-}"; shift || true
+    case "$sub" in
+      inspect)
+        run_node_or_tsx "dist/inspect/cli.js" "src/inspect/cli.ts" "$@"
+        ;;
+      ""|help|--help|-h)
+        echo "falda distill: subcommands: inspect" >&2
+        exit 1
+        ;;
+      *)
+        echo "falda distill: unknown subcommand '$sub' (try: falda distill inspect)" >&2
+        exit 1
+        ;;
+    esac
     ;;
   version|--version|-v)
     node -p "require('$ROOT/package.json').version"
