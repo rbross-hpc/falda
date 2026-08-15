@@ -26,6 +26,18 @@ export const DEFAULT_AUTO_RECALL_BUDGET = 3500;
 export const DEFAULT_MAX_RECALL_BUDGET = 20000;
 
 /**
+ * Per-item character caps applied in assembleContext() (src/distill/context.ts)
+ * when admitting one T1 atom or T2 scene into the assembled context. Tier-
+ * specific rather than one global cap: T1 atoms are short, discrete facts —
+ * a large cap wastes budget an admitting loop could otherwise spend on more
+ * atoms; T2 scenes are episode/topic summaries that need more room to be
+ * useful at all. Deployment-tunable since "how verbose is a typical atom vs.
+ * scene" is corpus-dependent, not a universal constant.
+ */
+export const DEFAULT_ATOM_ITEM_CAP = 600;
+export const DEFAULT_SCENE_ITEM_CAP = 1800;
+
+/**
  * recallAtoms()'s legacy T1-only budget (src/falda.ts) — not on the live
  * assembleContext recall path (falda_recall / POST /recall); only exercised
  * by tests today. Lowered from its old hardcoded 12000 to align with the
@@ -54,4 +66,12 @@ export function resolveMaxRecallBudget(envValue: string | undefined = process.en
 
 export function resolveLegacyAtomBudget(envValue: string | undefined = process.env.FALDA_LEGACY_ATOM_BUDGET): number {
   return resolveIntEnv(envValue, DEFAULT_LEGACY_ATOM_BUDGET);
+}
+
+export function resolveAtomItemCap(envValue: string | undefined = process.env.FALDA_RECALL_ATOM_ITEM_CAP): number {
+  return resolveIntEnv(envValue, DEFAULT_ATOM_ITEM_CAP);
+}
+
+export function resolveSceneItemCap(envValue: string | undefined = process.env.FALDA_RECALL_SCENE_ITEM_CAP): number {
+  return resolveIntEnv(envValue, DEFAULT_SCENE_ITEM_CAP);
 }

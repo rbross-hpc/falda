@@ -986,6 +986,21 @@ query. The per-tier tools (`falda_atoms_search`, `falda_scenes_search`,
 ...) remain available under `FALDA_MCP_TOOLSET=full` for diagnostics/admin
 use — see `docs/MCP.md`.
 
+**Per-item caps are tier-specific, not one shared constant.** T1 atoms
+truncate at `FALDA_RECALL_ATOM_ITEM_CAP` (default 600 chars); T2 scenes
+truncate at the larger `FALDA_RECALL_SCENE_ITEM_CAP` (default 1800 chars) —
+see `src/recall/budgets.ts`. Atoms are short discrete facts, so a large cap
+wastes budget the admission loop could spend on more atoms instead; scenes
+carry a title+summary and need more room to be useful at all. (This
+replaced an earlier single global 2000-char cap shared by both tiers.)
+
+**Admission within a tier skips a non-fitting candidate rather than ending
+the tier.** If a higher-ranked atom or scene doesn't fit the tier's
+remaining budget, `assembleContext` marks the result `truncated` and moves
+on to the next-ranked candidate instead of stopping — so a large item
+ranked ahead of several small ones no longer leaves the rest of that tier's
+budget unused. (This replaced an earlier break-on-first-miss loop.)
+
 ### 8.10 Recall traces and usage feedback (§ recall-feedback-loop)
 
 Every `assembleContext()` call made through `falda_recall` / `POST
