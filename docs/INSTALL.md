@@ -127,6 +127,7 @@ const hits = await mem.recall("kukla", "what should I remember?");
 | `FALDA_EMBED_BASE_URL` | _(unset)_ | OpenAI-compatible `/v1/embeddings` base URL |
 | `FALDA_EMBED_API_KEY` | _(unset)_ | API key for the embedder, if required |
 | `FALDA_EMBED_MODEL` | `nomic-embed-text` | Embedding model id |
+| `FALDA_EMBED_STRICT` | _(unset)_ | `1` turns an unconfigured embedder (no `FALDA_EMBED`/`FALDA_EMBED_BASE_URL`) into a startup `FATAL` instead of the silent local-embedder fallback below — opt in for production |
 
 `FALDA_DB` (a single store's SQLite path) applies only when embedding
 `Falda` directly as a library, not to `falda serve`/`falda gateway`/`falda
@@ -144,7 +145,16 @@ Embedder selection precedence (all server entry points, via `src/runtime.ts`):
 - `FALDA_EMBED=local` → force the offline deterministic embedder.
 - `FALDA_EMBED=remote` → require a configured `/v1/embeddings` endpoint.
 - unset + `FALDA_EMBED_BASE_URL` present → remote.
-- unset + no base URL → offline local default.
+- unset + no base URL → offline local default (unless `FALDA_EMBED_STRICT=1`, which makes this case a startup FATAL instead — see `docs/OPERATIONS.md` "Startup embedding verification").
+
+Every server entry point also probes the configured remote embedder once at
+boot (calls it, checks the returned vector's length against `FALDA_DIM`)
+before locking that config into `EMBEDDING.json` — a down endpoint or a
+model/dimension mismatch fails boot immediately rather than corrupting
+recall later. Changing `FALDA_EMBED_MODEL`/`FALDA_DIM` on a store that
+already has data requires `falda reembed` to rebuild its vector indexes
+first — see `docs/OPERATIONS.md` "Re-embedding after a model/dimension
+change".
 
 > **Native addon / Node pinning.** `better-sqlite3` compiles a native addon
 > against the Node.js ABI of whatever `node` ran `npm install`. If you later

@@ -38,7 +38,7 @@ import { join as pathJoin } from "node:path";
 import { mkdirSync } from "node:fs";
 import Database from "better-sqlite3";
 import { PoolManager } from "./pools.js";
-import { selectEmbedder, enforceEmbeddingLock } from "./boot.js";
+import { selectEmbedder, enforceEmbeddingLock, probeEmbedder } from "./boot.js";
 import { TokenStore, requireTokenFile } from "./mcp_auth.js";
 import { initQueueSchema } from "./distill/queue.js";
 import { makeLLM, type LLMFn } from "./distill/llm.js";
@@ -81,17 +81,23 @@ function resolveTokensPath(explicit: string | undefined, label: string): string 
  * Build the shared runtime once. Call this exactly once per process
  * (src/server.ts does); every protocol adapter and the distillation worker
  * receive the same instance.
+ *
+ * Async since it probes the embedder over the network before locking in
+ * EMBEDDING.json (src/boot.ts probeEmbedder) — a down endpoint or dim
+ * mismatch fails boot here rather than corrupting recall silently later.
  */
-export function buildRuntime(cfg: RuntimeConfig = {}): FaldaRuntime {
+export async function buildRuntime(cfg: RuntimeConfig = {}): Promise<FaldaRuntime> {
   const label = cfg.label ?? "FALDA";
   const root = cfg.root ?? process.env.FALDA_ROOT ?? "./falda-data";
   const dim = cfg.dim ?? Number(process.env.FALDA_DIM ?? 768);
   const tokensPath = resolveTokensPath(cfg.tokensPath, label);
 
+  const embed = selectEmbedder(dim, label);
+  await probeEmbedder(embed, dim, label);
   enforceEmbeddingLock(root, dim, label);
   requireTokenFile(tokensPath, label);
 
-  const pools = new PoolManager({ root, embed: selectEmbedder(dim, label), dim });
+  const pools = new PoolManager({ root, embed, dim });
   const tokenStore = new TokenStore(tokensPath);
 
   mkdirSync(root, { recursive: true });

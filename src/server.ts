@@ -125,12 +125,12 @@ export function startMcp(runtime: FaldaRuntime, port: number, toolset?: ToolsetN
  * --no-mcp, and the distillation worker always (it is the canonical owner
  * of the queue regardless of which protocol surfaces are enabled).
  */
-export function serve(opts: ServeOptions = {}): ServeHandle {
+export async function serve(opts: ServeOptions = {}): Promise<ServeHandle> {
   const httpPort = opts.httpPort ?? Number(process.env.FALDA_PORT ?? 8077);
   const mcpPort = opts.mcpPort ?? Number(process.env.FALDA_MCP_PORT ?? 8079);
   const workerIntervalMs = opts.workerIntervalMs ?? Number(process.env.FALDA_WORKER_INTERVAL_MS ?? 60_000);
 
-  const runtime = buildRuntime({ label: "FALDA", ...opts.runtimeConfig });
+  const runtime = await buildRuntime({ label: "FALDA", ...opts.runtimeConfig });
 
   const httpServer = startHttpApi(runtime, httpPort);
   const mcpServer = opts.noMcp ? null : startMcp(runtime, mcpPort, opts.mcpToolset);
@@ -156,5 +156,5 @@ const IS_MAIN = process.argv[1]?.endsWith("server.js") || process.argv[1]?.endsW
 if (IS_MAIN) {
   const args = process.argv.slice(2);
   const noMcp = args.includes("--no-mcp");
-  serve({ noMcp });
+  serve({ noMcp }).catch((e) => { console.error(e); process.exit(1); });
 }

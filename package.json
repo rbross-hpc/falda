@@ -33,6 +33,7 @@
     "gateway": "tsx src/gateway.ts",
     "mcp": "tsx src/mcp.ts",
     "stats": "tsx src/stats.ts",
+    "reembed": "tsx src/reembed.ts",
     "example": "tsx examples/basic.ts",
     "install:falda": "bash install.sh"
   },
