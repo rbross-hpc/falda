@@ -1144,5 +1144,64 @@ export class Falda {
     return createHash("sha256").update(parts.join("||")).digest("hex");
   }
 
+  /**
+   * Rebuild every dense-vector index (T0 stream, T1 atoms, T2 scenes) from
+   * scratch using this store's currently configured embedder and dimension
+   * (this.embed / this.dim). Used by `falda reembed` when switching
+   * embedding models/dimensions (docs/OPERATIONS.md).
+   *
+   * Dimension is baked into the vec0 schema (`embedding float[${dim}]` —
+   * see initSchema above), so a dim change can't be done as a row rewrite:
+   * the *_vec tables are dropped and recreated at `this.dim` before
+   * repopulating. Safe to call even when only the model (not the dim)
+   * changed — the drop/recreate is just extra I/O in that case.
+   *
+   * Does not touch FTS indexes, content, or metadata — only the *_vec
+   * tables (plus scenes' render_hash, refreshed so a subsequent
+   * syncSceneRendering call doesn't immediately think another re-embed is
+   * needed). Not transactional across the whole store: if interrupted
+   * partway, re-run it — every step is idempotent (DROP/CREATE + full
+   * repopulation from the source-of-truth tables).
+   */
+  async reembedAll(onProgress?: (tier: "stream" | "atoms" | "scenes", done: number, total: number) => void): Promise<{
+    stream: number; atoms: number; scenes: number; dim: number;
+  }> {
+    const d = this.dim;
+    this.db.exec("DROP TABLE IF EXISTS atoms_vec");
+    this.db.exec("DROP TABLE IF EXISTS scenes_vec");
+    this.db.exec("DROP TABLE IF EXISTS stream_vec");
+    this.db.exec(`CREATE VIRTUAL TABLE atoms_vec USING vec0(id TEXT PRIMARY KEY, embedding float[${d}])`);
+    this.db.exec(`CREATE VIRTUAL TABLE scenes_vec USING vec0(scene_id TEXT PRIMARY KEY, embedding float[${d}])`);
+    this.db.exec(`CREATE VIRTUAL TABLE stream_vec USING vec0(id TEXT PRIMARY KEY, embedding float[${d}])`);
+
+    const atoms = this.db.prepare("SELECT id, content FROM atoms").all() as Array<{ id: string; content: string }>;
+    const insA = this.db.prepare("INSERT INTO atoms_vec(id,embedding) VALUES(?,?)");
+    for (let i = 0; i < atoms.length; i++) {
+      insA.run(atoms[i].id, this.vecBuf(await this.embed(atoms[i].content)));
+      onProgress?.("atoms", i + 1, atoms.length);
+    }
+
+    const scenes = this.db.prepare("SELECT scene_id, title, summary FROM scenes").all() as
+      Array<{ scene_id: string; title: string; summary: string | null }>;
+    const insS = this.db.prepare("INSERT INTO scenes_vec(scene_id,embedding) VALUES(?,?)");
+    const updRenderHash = this.db.prepare("UPDATE scenes SET render_hash=? WHERE scene_id=?");
+    for (let i = 0; i < scenes.length; i++) {
+      const sc = scenes[i];
+      const text = sc.summary ? `${sc.title}\n${sc.summary}` : sc.title;
+      insS.run(sc.scene_id, this.vecBuf(await this.embed(text)));
+      updRenderHash.run(computeRenderHash(sc.title, sc.summary), sc.scene_id);
+      onProgress?.("scenes", i + 1, scenes.length);
+    }
+
+    const turns = this.db.prepare("SELECT id, content FROM stream").all() as Array<{ id: string; content: string }>;
+    const insT = this.db.prepare("INSERT INTO stream_vec(id,embedding) VALUES(?,?)");
+    for (let i = 0; i < turns.length; i++) {
+      insT.run(turns[i].id, this.vecBuf(await this.embed(turns[i].content)));
+      onProgress?.("stream", i + 1, turns.length);
+    }
+
+    return { stream: turns.length, atoms: atoms.length, scenes: scenes.length, dim: d };
+  }
+
   close() { this.db.close(); }
 }

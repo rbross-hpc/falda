@@ -17,8 +17,9 @@ export { makeFaldaMcpServer, handleFaldaMcpRequest };
 
 const IS_MAIN = process.argv[1]?.endsWith("mcp.js") || process.argv[1]?.endsWith("mcp.ts");
 if (IS_MAIN) {
+  (async () => {
   const PORT = Number(process.env.FALDA_MCP_PORT ?? 8079);
-  const runtime = buildRuntime({ label: "FALDA MCP" });
+  const runtime = await buildRuntime({ label: "FALDA MCP" });
 
   createServer((req, res) => {
     if (req.method === "GET" && req.url === "/healthz") {
@@ -41,4 +42,5 @@ if (IS_MAIN) {
       }
     });
   }).listen(PORT, () => console.log(`FALDA MCP server listening on :${PORT} (root=${runtime.root})`));
+  })().catch((e) => { console.error(e); process.exit(1); });
 }

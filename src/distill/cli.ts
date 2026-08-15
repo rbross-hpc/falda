@@ -12,7 +12,7 @@
  *   FALDA_DIM             Embedding dimensionality (default: 768)
  */
 import { PoolManager } from "../pools.js";
-import { selectEmbedder } from "../boot.js";
+import { selectEmbedder, probeEmbedder } from "../boot.js";
 import { distillOnce } from "./core.js";
 import { makeLLM } from "./llm.js";
 
@@ -27,7 +27,9 @@ async function run(once: boolean, intervalMs: number): Promise<void> {
     process.exit(1);
   }
 
-  const pools = new PoolManager({ root: ROOT, embed: selectEmbedder(DIM, "distill-cli"), dim: DIM });
+  const embed = selectEmbedder(DIM, "distill-cli");
+  await probeEmbedder(embed, DIM, "distill-cli");
+  const pools = new PoolManager({ root: ROOT, embed, dim: DIM });
   const llm = makeLLM();
 
   const doPass = async () => {

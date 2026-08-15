@@ -317,10 +317,11 @@ export async function handleRequest(
  */
 const IS_MAIN = process.argv[1]?.endsWith("gateway.js") || process.argv[1]?.endsWith("gateway.ts");
 if (IS_MAIN) {
+  (async () => {
   const PORT = Number(process.env.FALDA_PORT ?? 8077);
   const WORKER_INTERVAL_MS = Number(process.env.FALDA_WORKER_INTERVAL_MS ?? 60_000);
 
-  const runtime = buildRuntime({ label: "FALDA gateway" });
+  const runtime = await buildRuntime({ label: "FALDA gateway" });
   startDistiller(runtime.queueDb, runtime.pools, runtime.llm, WORKER_INTERVAL_MS, {
     recallTraceDb: runtime.recallTraceDb,
   });
@@ -347,4 +348,5 @@ if (IS_MAIN) {
       }
     });
   }).listen(PORT, () => console.log(`FALDA gateway listening on :${PORT} (root=${runtime.root})`));
+  })().catch((e) => { console.error(e); process.exit(1); });
 }

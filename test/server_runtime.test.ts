@@ -28,7 +28,7 @@ function makeTokenFile(root: string, tokens: Record<string, any>): string {
   return p;
 }
 
-function makeTestRuntime(overrides: { tokens?: Record<string, any> } = {}): { runtime: FaldaRuntime; root: string } {
+async function makeTestRuntime(overrides: { tokens?: Record<string, any> } = {}): Promise<{ runtime: FaldaRuntime; root: string }> {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), "falda-runtime-"));
   const tokensPath = makeTokenFile(root, overrides.tokens ?? {
     "tok-shared": { tenants: ["proj-x"], pools: [], label: "shared" },
@@ -36,7 +36,7 @@ function makeTestRuntime(overrides: { tokens?: Record<string, any> } = {}): { ru
   });
   process.env.FALDA_EMBED = "local";
   process.env.FALDA_DIM = "32";
-  const runtime = buildRuntime({
+  const runtime = await buildRuntime({
     root: path.join(root, "data"),
     dim: 32,
     tokensPath,
@@ -53,8 +53,8 @@ function cleanupRuntime(runtime: FaldaRuntime, root: string) {
 // ─── 1. buildRuntime: single shared resources ─────────────────────────────────
 
 describe("buildRuntime", () => {
-  test("builds one PoolManager, one queueDb, one recallTraceDb, one LLM client, one TokenStore", () => {
-    const { runtime, root } = makeTestRuntime();
+  test("builds one PoolManager, one queueDb, one recallTraceDb, one LLM client, one TokenStore", async () => {
+    const { runtime, root } = await makeTestRuntime();
     try {
       assert.ok(runtime.pools, "pools present");
       assert.ok(runtime.tokenStore, "tokenStore present");
@@ -67,9 +67,9 @@ describe("buildRuntime", () => {
     } finally { cleanupRuntime(runtime, root); }
   });
 
-  test("two buildRuntime() calls do not share state (no hidden singleton)", () => {
-    const a = makeTestRuntime();
-    const b = makeTestRuntime();
+  test("two buildRuntime() calls do not share state (no hidden singleton)", async () => {
+    const a = await makeTestRuntime();
+    const b = await makeTestRuntime();
     try {
       assert.notEqual(a.runtime.pools, b.runtime.pools);
       assert.notEqual(a.runtime.queueDb, b.runtime.queueDb);
@@ -91,8 +91,8 @@ describe("HTTP and MCP share one runtime", () => {
   let httpPort: number;
   let mcpPort: number;
 
-  before(() => {
-    ({ runtime, root } = makeTestRuntime());
+  before(async () => {
+    ({ runtime, root } = await makeTestRuntime());
     httpServer = startHttpApi(runtime, 0);
     // "full" toolset: this suite exercises falda_atoms_search directly to
     // prove HTTP/MCP share one store — that tool lives in the advanced
@@ -252,7 +252,7 @@ describe("serve() with --no-mcp", () => {
     });
     let handle: ServeHandle | undefined;
     try {
-      handle = serve({
+      handle = await serve({
         httpPort: 0,
         mcpPort: 0,
         noMcp: true,
