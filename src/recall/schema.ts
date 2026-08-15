@@ -6,6 +6,11 @@
  */
 import type Database from "better-sqlite3";
 
+function hasColumn(db: Database.Database, table: string, column: string): boolean {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  return cols.some((c) => c.name === column);
+}
+
 export function initRecallTraceSchema(db: Database.Database): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS recall_traces (
@@ -35,4 +40,13 @@ export function initRecallTraceSchema(db: Database.Database): void {
     );
     CREATE INDEX IF NOT EXISTS idx_recall_trace_items_lookup ON recall_trace_items(recall_id, tier, item_id);
   `);
+
+  // mode: "explicit" (a deliberate falda_recall/POST /recall call) vs "auto"
+  // (an unattended per-task recall fired by a harness integration) — lets
+  // recall metrics distinguish the two budget tiers (src/recall/budgets.ts).
+  // Added after initial release; migrated in rather than a fresh column in
+  // CREATE TABLE so existing recall_traces.db files upgrade in place.
+  if (!hasColumn(db, "recall_traces", "mode")) {
+    db.exec(`ALTER TABLE recall_traces ADD COLUMN mode TEXT NOT NULL DEFAULT 'explicit'`);
+  }
 }

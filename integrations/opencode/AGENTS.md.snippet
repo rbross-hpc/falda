@@ -6,6 +6,11 @@ This project has a FALDA memory store connected via MCP (`falda_*` tools).
   query. It assembles the best available context across all memory tiers
   (facts, preferences, rules, past episodes, project core) in one call — you
   do not need to decide which tier to query.
+- A small amount of memory context may already be injected automatically at
+  the start of a session, wrapped in a `<falda-auto-recall>` block — this is
+  a smaller-budget, best-effort recall fired before you asked for anything,
+  not a substitute for calling `falda_recall` yourself. Call `falda_recall`
+  whenever you need more than what's already there.
 - When you learn something durable worth remembering long-term (a fact,
   preference, constraint, rule, or standing instruction — not a transient
   detail), call `falda_remember` with `{ content, type }`. The field is

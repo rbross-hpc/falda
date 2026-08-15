@@ -187,6 +187,9 @@ locally (Ollama, vLLM, llama.cpp) or against a self-hosted lab server.
 | `FALDA_PORT`            | `8077`                         | HTTP JSON API port                     |
 | `FALDA_MCP_PORT`        | `8079`                         | MCP endpoint port                      |
 | `FALDA_TOKENS`          | `./falda_tokens.json`          | canonical bearer-token file, shared by HTTP and MCP (required — see `docs/API.md`) |
+| `FALDA_RECALL_BUDGET`      | `6000`  | `falda_recall`/`POST /recall` default budget (chars) for a deliberate ("explicit") call |
+| `FALDA_AUTO_RECALL_BUDGET` | `3500`  | default budget for an unattended per-task recall (`mode: "auto"`) fired by a harness integration — kept smaller so it doesn't crowd out the task prompt |
+| `FALDA_RECALL_MAX_BUDGET`  | `20000` | hard ceiling on any requested `budget`, explicit or auto |
 
 `FALDA_DB`/`FALDA_BLOBS` (a single store's SQLite path/blob dir) apply only
 when embedding `Falda` directly as a library — see "As a library" above.

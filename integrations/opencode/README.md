@@ -7,7 +7,7 @@ FALDA ships both halves of the integration:
 | Piece | What it does | Where |
 |---|---|---|
 | **MCP endpoint** | Recall/remember/forget/distill tools (`falda_*`) the model calls directly | one facet of `falda serve` (`src/server.ts`), backed by `src/mcp.ts` |
-| **Capture plugin** | Auto-logs every turn to FALDA's Stream (T0), no tool call needed | `integrations/opencode/plugin/falda-capture.ts` |
+| **Capture plugin** | Auto-logs every turn to FALDA's Stream (T0), no tool call needed; also fires one small auto-recall per session before the model's first turn | `integrations/opencode/plugin/falda-capture.ts` |
 
 `falda serve` is the recommended way to run FALDA for this integration: one
 process exposes the MCP endpoint (port `8079`, above) *and* the HTTP/JSON
@@ -240,6 +240,17 @@ If you're running the plugin outside a full opencode project (no
 `FALDA_MCP_URL`/`FALDA_MCP_TOKEN`/`FALDA_TENANT` env vars instead.
 
 Set `FALDA_CAPTURE=0` to disable capture without removing the plugin.
+
+**Auto-recall** is a second, independent feature of the same plugin: once
+per session, before the model's first turn, it fires a small `falda_recall`
+(`mode: "auto"` — a smaller default budget than an explicit call, see
+`FALDA_AUTO_RECALL_BUDGET` in `docs/MCP.md`) and injects the result into
+that first user message, wrapped in a `<falda-auto-recall>` block so the
+model can tell it apart from its own tool calls. It never blocks the turn
+— a 5s timeout or any failure just means nothing gets injected, silently.
+Set `FALDA_AUTO_RECALL=0` to disable it independently of `FALDA_CAPTURE`.
+The model is still expected to call `falda_recall` itself for anything the
+auto-recall's smaller budget didn't surface (see `AGENTS.md.snippet`).
 
 > **Containerized deployments:** see §4b below for the entrypoint-based
 > auto-install pattern, dependency version tracking, and startup-deadlock

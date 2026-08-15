@@ -21,6 +21,7 @@ import * as sqliteVec from "sqlite-vec";
 import { randomUUID, createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { resolveLegacyAtomBudget } from "./recall/budgets.js";
 
 export type Embedder = (text: string) => Promise<number[]>;
 
@@ -58,7 +59,15 @@ const DEFAULT_WEIGHTS: RecallWeights = {
 };
 
 const PER_HIT_CHAR_LIMIT = 2000;
-const TOTAL_CHAR_BUDGET = 12000;
+// recallAtoms() below is a legacy T1-only recall path, superseded by
+// assembleContext() (src/distill/context.ts) for both falda_recall and
+// POST /recall (see src/recall/budgets.ts for that path's env-driven
+// budgets). recallAtoms() is exercised only by tests today — kept for
+// that coverage, not on the live recall surface. FALDA_LEGACY_ATOM_BUDGET
+// lets it be tuned without a rebuild; default lowered from its old
+// hardcoded 12000 to align with the new explicit-recall default (6000)
+// rather than carry forward an oversized, unreviewed ceiling.
+const TOTAL_CHAR_BUDGET = resolveLegacyAtomBudget();
 const PINNED_BUDGET_FRACTION = 0.25;
 const RRF_K = 60;
 

@@ -125,7 +125,7 @@ allow-list; omit for the tenant's private `self` store).
 
 | Tool | R/W | When to use |
 |---|---|---|
-| `falda_recall` | read | **Primary retrieval tool.** Search long-term memory for anything relevant to the current task — prior facts, preferences, constraints, instructions, or related episodes. Assembles cross-tier context (pinned atoms, ranked T1 atoms, T2 scenes, T3 core) under a character budget and returns `{recall_id, context, items, truncated}`. `recall_id` is a trace correlation key for later usage feedback (see `docs/RECALL_TRACES.md`) — best-effort, omitted rather than erroring if trace persistence fails. |
+| `falda_recall` | read | **Primary retrieval tool.** Search long-term memory for anything relevant to the current task — prior facts, preferences, constraints, instructions, or related episodes. Assembles cross-tier context (pinned atoms, ranked T1 atoms, T2 scenes, T3 core) under a character budget and returns `{recall_id, context, items, truncated}`. `budget` defaults to `FALDA_RECALL_BUDGET` (a deliberate call) or `FALDA_AUTO_RECALL_BUDGET` when `mode: "auto"` (an unattended per-task recall fired by a harness integration) — either way it's clamped to `FALDA_RECALL_MAX_BUDGET`. `recall_id` is a trace correlation key for later usage feedback (see `docs/RECALL_TRACES.md`) — best-effort, omitted rather than erroring if trace persistence fails. |
 | `falda_remember` | write | Save a durable fact, pattern, preference, constraint, or standing instruction for future sessions. Not for transient details relevant only to the current conversation. Content is immutable — a changed proposition becomes a new memory, never an edit of the old one. |
 | `falda_forget` | write | Stop recalling a previously stored memory (`atom_id` from `falda_remember`/a `falda_recall` hit). Logical forgetting only — moves it from active to archived; does not erase historical/provenance evidence. Not privacy erasure. |
 | `falda_distill` | write | Enqueue a distillation job for the addressed store; returns `{job_id, store_key}`. Async — a background worker already distills periodically, so this is for requesting an out-of-cycle run. |
@@ -199,6 +199,9 @@ API when run via `falda serve`). MCP-specific:
 | `FALDA_MCP_TOKENS` | **deprecated** fallback for `FALDA_TOKENS`, honored with a startup warning for the standalone `falda mcp` entry point only | — |
 | `FALDA_DIM` / `FALDA_EMBED*` | embedder selection, as in the HTTP API | — |
 | `FALDA_RECALL_TRACE_RETENTION_DAYS` | days to retain `recall_traces.db` rows (see `docs/RECALL_TRACES.md`); `<= 0` retains indefinitely | `90` |
+| `FALDA_RECALL_BUDGET` | `falda_recall`'s default budget for a deliberate call (`mode` omitted or `"explicit"`) | `6000` |
+| `FALDA_AUTO_RECALL_BUDGET` | `falda_recall`'s default budget when `mode: "auto"` — an unattended per-task recall fired by a harness integration; kept smaller by default | `3500` |
+| `FALDA_RECALL_MAX_BUDGET` | hard ceiling on any requested `budget`, explicit or auto | `20000` |
 
 ## opencode integration
 
