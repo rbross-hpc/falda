@@ -45,8 +45,12 @@
  *   /core/write      {content}                           -> {ok}
  *   /distill         {}                                  -> {job_id, store_key}
  *   /distill/status  {job_id}                             -> DistillJob | {error}
- *   /recall          {query, budget?}                     -> {recall_id?, items, truncated, total_chars}
+ *   /recall          {query, budget?, mode?}               -> {recall_id?, items, truncated, total_chars}
  *                       Cross-tier context assembly (assembleContext(), src/distill/context.ts).
+ *                       mode: "explicit" (default) or "auto" — selects which of
+ *                       FALDA_RECALL_BUDGET/FALDA_AUTO_RECALL_BUDGET is used when budget
+ *                       is omitted (see src/recall/budgets.ts). budget is always clamped
+ *                       to FALDA_RECALL_MAX_BUDGET regardless of mode.
  *                       Best-effort persists a recall_traces.db trace (src/recall/) — recall_id
  *                       is omitted, never errors, if trace persistence fails.
  *
@@ -76,9 +80,13 @@
  * equivalent to `falda serve --no-mcp`.
  *
  * Env: see src/runtime.ts for the canonical set (FALDA_ROOT, FALDA_DIM,
- * FALDA_EMBED*, FALDA_TOKENS, FALDA_LLM_*). Gateway-specific:
+ *   FALDA_EMBED*, FALDA_TOKENS, FALDA_LLM_*). Gateway-specific:
  *   FALDA_PORT               Port to listen on (default 8077).
  *   FALDA_WORKER_INTERVAL_MS Distillation worker interval, ms (default 60000).
+ *   FALDA_RECALL_BUDGET       Default /recall budget, explicit mode (default 6000).
+ *   FALDA_AUTO_RECALL_BUDGET  Default /recall budget, auto mode (default 3500).
+ *   FALDA_RECALL_MAX_BUDGET   Hard ceiling on any requested budget (default 20000).
+ *   See src/recall/budgets.ts for the two-tier rationale.
  */
 import { createServer } from "node:http";
 import Database from "better-sqlite3";
@@ -89,11 +97,19 @@ import { enqueue, storeKeyFor, getJobAuthorized } from "./distill/queue.js";
 import { buildRuntime } from "./runtime.js";
 import { startDistiller } from "./distill/worker.js";
 import { assembleContext, DEFAULT_TIER_BUDGETS } from "./distill/context.js";
+import { resolveAutoRecallBudget, resolveMaxRecallBudget, resolveRecallBudget } from "./recall/budgets.js";
 import { buildPolicySnapshot } from "./recall/policy.js";
 import { createRecallTrace, getRecallTraceAuthorized } from "./recall/traces.js";
 import { reportRecallUsage } from "./recall/usage.js";
 import { computeRecallMetrics } from "./recall/metrics.js";
 import { RecallTraceError } from "./recall/types.js";
+
+// Recall budgets — see src/recall/budgets.ts for the two-tier rationale
+// (explicit vs. auto) and FALDA_RECALL_BUDGET/FALDA_AUTO_RECALL_BUDGET/
+// FALDA_RECALL_MAX_BUDGET env vars. Resolved once at module load.
+const RECALL_DEFAULT_BUDGET = resolveRecallBudget();
+const RECALL_AUTO_DEFAULT_BUDGET = resolveAutoRecallBudget();
+const RECALL_MAX_BUDGET = resolveMaxRecallBudget();
 
 /** Routes that mutate the addressed store (need readwrite on a shared pool). */
 const WRITE_ROUTES = new Set([
@@ -145,7 +161,9 @@ async function handleData(
   const store = pools.resolve(tenant, pool, WRITE_ROUTES.has(route));
   switch (route) {
     case "/recall": {
-      const budget = b.budget ?? 6000;
+      const mode: "explicit" | "auto" = b.mode === "auto" ? "auto" : "explicit";
+      const defaultBudget = mode === "auto" ? RECALL_AUTO_DEFAULT_BUDGET : RECALL_DEFAULT_BUDGET;
+      const budget = Math.min(b.budget ?? defaultBudget, RECALL_MAX_BUDGET);
       const assembled = await assembleContext(store, b.query, budget);
       let recall_id: string | undefined;
       if (recallTraceDb) {
@@ -157,6 +175,7 @@ async function handleData(
             query: b.query,
             requested_budget: budget,
             used_budget: assembled.total_chars,
+            mode,
             policy_snapshot: buildPolicySnapshot(store.getRecallWeights(), DEFAULT_TIER_BUDGETS),
             items: assembled.items,
           });

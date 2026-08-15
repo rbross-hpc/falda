@@ -5,11 +5,15 @@ import { storeKeyFor } from "../../distill/queue.js";
 import { TokenStore } from "../../mcp_auth.js";
 import { buildPolicySnapshot } from "../../recall/policy.js";
 import { createRecallTrace } from "../../recall/traces.js";
+import {
+  MIN_RECALL_BUDGET,
+  resolveAutoRecallBudget,
+  resolveMaxRecallBudget,
+  resolveRecallBudget,
+} from "../../recall/budgets.js";
 import { ctxFromExtra, errorResult, poolArg, storeFor, textResult, type ToolDeps } from "../context.js";
 
-const DEFAULT_BUDGET = 6000;
-const MIN_BUDGET = 500;
-const MAX_BUDGET = 20000;
+const MIN_BUDGET = MIN_RECALL_BUDGET;
 
 function renderContext(ctx: Awaited<ReturnType<typeof assembleContext>>): string {
   const sections: string[] = [];
@@ -21,6 +25,10 @@ function renderContext(ctx: Awaited<ReturnType<typeof assembleContext>>): string
 }
 
 export function registerRecall(server: McpServer, deps: ToolDeps): void {
+  const defaultBudget = resolveRecallBudget();
+  const autoDefaultBudget = resolveAutoRecallBudget();
+  const maxBudget = resolveMaxRecallBudget();
+
   server.registerTool(
     "falda_recall",
     {
@@ -33,17 +41,23 @@ export function registerRecall(server: McpServer, deps: ToolDeps): void {
         "something you need to act on).",
       inputSchema: {
         query: z.string(),
-        budget: z.number().int().min(MIN_BUDGET).max(MAX_BUDGET).optional()
-          .describe(`Approximate character budget for the assembled context (default ${DEFAULT_BUDGET}).`),
+        budget: z.number().int().min(MIN_BUDGET).max(maxBudget).optional()
+          .describe(`Approximate character budget for the assembled context (default ${defaultBudget}).`),
+        mode: z.enum(["explicit", "auto"]).optional()
+          .describe(
+            "\"explicit\" (default) for a deliberate call; \"auto\" for an unattended per-task " +
+            `recall fired by a harness integration — uses a smaller default budget (${autoDefaultBudget}) ` +
+            "when budget is omitted.",
+          ),
         pool: poolArg,
       },
     },
-    async ({ query, budget, pool }, extra) => {
+    async ({ query, budget, mode, pool }, extra) => {
       try {
         const ctx = ctxFromExtra(deps.tokenStore, extra);
         const checkedPool = TokenStore.requirePool(ctx.principal, pool);
         const store = storeFor(deps, ctx, pool, false);
-        const effectiveBudget = budget ?? DEFAULT_BUDGET;
+        const effectiveBudget = budget ?? (mode === "auto" ? autoDefaultBudget : defaultBudget);
         const assembled = await assembleContext(store, query, effectiveBudget);
 
         let recall_id: string | undefined;
@@ -56,6 +70,7 @@ export function registerRecall(server: McpServer, deps: ToolDeps): void {
               query,
               requested_budget: effectiveBudget,
               used_budget: assembled.total_chars,
+              mode: mode ?? "explicit",
               policy_snapshot: buildPolicySnapshot(store.getRecallWeights(), DEFAULT_TIER_BUDGETS),
               items: assembled.items,
             });

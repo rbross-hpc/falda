@@ -36,6 +36,7 @@ recall_traces
   query               TEXT NOT NULL
   requested_budget    INTEGER
   used_budget         INTEGER               -- assembleContext()'s total_chars
+  mode                TEXT NOT NULL         -- "explicit" | "auto", default 'explicit'
   policy_snapshot     TEXT NOT NULL         -- JSON, see below
   created_at          TEXT NOT NULL
 
@@ -50,6 +51,14 @@ recall_trace_items
   usage      TEXT NOT NULL DEFAULT 'unknown'  -- "unknown" | "used" | "unused"
   PRIMARY KEY (recall_id, ordinal)
 ```
+
+`mode` distinguishes a deliberate call (`"explicit"` — the model chose to
+call `falda_recall`) from an unattended per-task recall a harness
+integration fires automatically (`"auto"`) — see `src/recall/budgets.ts`
+and `FALDA_RECALL_BUDGET`/`FALDA_AUTO_RECALL_BUDGET` (`docs/MCP.md`). The
+two use different default budgets when the caller doesn't supply one
+explicitly, so `by_source`/`by_rank` usage metrics can eventually be split
+by `mode` to tell whether auto-recall is pulling its weight.
 
 Only items that actually made it into the assembled context are recorded
 — candidates cut by the tier budget are not (yet) captured. That means

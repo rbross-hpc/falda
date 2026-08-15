@@ -294,10 +294,27 @@ describe("recall traces: HTTP surface (auth + ownership)", () => {
     assert.equal(typeof res.body.truncated, "boolean");
     assert.ok(res.body.items.some((it: any) => it.id));
 
+    const inspectMode = await call("tok-a", "proj-a", "/recalls/get", { recall_id: res.body.recall_id });
+    assert.equal(inspectMode.body.mode, "explicit", "mode omitted on the request defaults to explicit");
+
     const inspect = await call("tok-a", "proj-a", "/recalls/get", { recall_id: res.body.recall_id });
     assert.equal(inspect.status, 200);
     assert.equal(inspect.body.query, "gateway recall fact");
     assert.ok(Array.isArray(inspect.body.items));
+  });
+
+  test("POST /recall mode:auto uses a smaller default budget than explicit, and is persisted on the trace", async () => {
+    const explicitRes = await call("tok-a", "proj-a", "/recall", { query: "gateway recall fact" });
+    const autoRes = await call("tok-a", "proj-a", "/recall", { query: "gateway recall fact", mode: "auto" });
+
+    const explicitTrace = await call("tok-a", "proj-a", "/recalls/get", { recall_id: explicitRes.body.recall_id });
+    const autoTrace = await call("tok-a", "proj-a", "/recalls/get", { recall_id: autoRes.body.recall_id });
+    assert.equal(explicitTrace.body.mode, "explicit");
+    assert.equal(autoTrace.body.mode, "auto");
+    assert.ok(
+      autoTrace.body.requested_budget < explicitTrace.body.requested_budget,
+      "mode:auto requests a smaller budget than the default explicit call",
+    );
   });
 
   test("/recalls/get: cross-tenant recall_id is not found (no oracle)", async () => {

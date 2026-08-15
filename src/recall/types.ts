@@ -13,6 +13,7 @@
 import type { RecallItem } from "../distill/context.js";
 
 export type UsageState = "unknown" | "used" | "unused";
+export type RecallMode = "explicit" | "auto";
 
 export interface PolicySnapshot {
   weights: { recency: number; priority: number; confidence: number };
@@ -29,6 +30,7 @@ export interface RecallTrace {
   query: string;
   requested_budget: number;
   used_budget: number;
+  mode: RecallMode;
   policy_snapshot: PolicySnapshot;
   created_at: string;
 }
@@ -57,6 +59,8 @@ export interface CreateRecallTraceInput {
   query: string;
   requested_budget: number;
   used_budget: number;
+  /** Defaults to "explicit" if omitted — see src/recall/budgets.ts. */
+  mode?: RecallMode;
   policy_snapshot: PolicySnapshot;
   items: RecallItem[];
 }

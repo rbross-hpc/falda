@@ -9,7 +9,7 @@
 import { randomUUID } from "node:crypto";
 import type Database from "better-sqlite3";
 import type { RecallItem } from "../distill/context.js";
-import type { CreateRecallTraceInput, RecallTraceView, UsageState } from "./types.js";
+import type { CreateRecallTraceInput, RecallMode, RecallTraceView, UsageState } from "./types.js";
 
 /**
  * Persist a completed recall as a trace. Returns the new recall_id.
@@ -21,11 +21,12 @@ export function createRecallTrace(db: Database.Database, input: CreateRecallTrac
   const now = new Date().toISOString();
   const tx = db.transaction((items: RecallItem[]) => {
     db.prepare(
-      `INSERT INTO recall_traces(recall_id,store_key,tenant,pool,query,requested_budget,used_budget,policy_snapshot,created_at)
-       VALUES(?,?,?,?,?,?,?,?,?)`
+      `INSERT INTO recall_traces(recall_id,store_key,tenant,pool,query,requested_budget,used_budget,mode,policy_snapshot,created_at)
+       VALUES(?,?,?,?,?,?,?,?,?,?)`
     ).run(
       recall_id, input.store_key, input.tenant, input.pool, input.query,
-      input.requested_budget, input.used_budget, JSON.stringify(input.policy_snapshot), now,
+      input.requested_budget, input.used_budget, input.mode ?? "explicit",
+      JSON.stringify(input.policy_snapshot), now,
     );
     const ins = db.prepare(
       `INSERT INTO recall_trace_items(recall_id,ordinal,tier,item_id,source,score,chars,usage)
@@ -63,6 +64,7 @@ export function getRecallTraceAuthorized(
     query: trace.query,
     requested_budget: trace.requested_budget,
     used_budget: trace.used_budget,
+    mode: (trace.mode ?? "explicit") as RecallMode,
     policy_snapshot: JSON.parse(trace.policy_snapshot),
     created_at: trace.created_at,
     items: rows.map((r) => ({

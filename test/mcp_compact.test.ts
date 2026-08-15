@@ -233,6 +233,26 @@ test("5. falda_recall assembles cross-tier context with structured items", async
   });
 });
 
+test("5b. falda_recall mode:auto defaults to a smaller budget than explicit, and is recorded on the trace", async () => {
+  await withClient(defaultPort, "tok-a", "proj-a", async (client) => {
+    const explicit = textOf(await client.callTool({
+      name: "falda_recall", arguments: { query: "cryostat units" },
+    }));
+    const auto = textOf(await client.callTool({
+      name: "falda_recall", arguments: { query: "cryostat units", mode: "auto" },
+    }));
+
+    const explicitTrace = getRecallTraceAuthorized(recallTraceDb, explicit.recall_id, "proj-a:self")!;
+    const autoTrace = getRecallTraceAuthorized(recallTraceDb, auto.recall_id, "proj-a:self")!;
+    assert.equal(explicitTrace.mode, "explicit", "omitted mode defaults to explicit");
+    assert.equal(autoTrace.mode, "auto");
+    assert.ok(
+      autoTrace.requested_budget < explicitTrace.requested_budget,
+      "automatic per-task recall requests a smaller budget than an explicit call",
+    );
+  });
+});
+
 test("6. cross-tenant isolation holds for falda_recall/falda_remember", async () => {
   await withClient(defaultPort, "tok-b", "proj-b", async (client) => {
     await client.callTool({ name: "falda_remember", arguments: { content: "proj-b secret via remember", type: "fact" } });
