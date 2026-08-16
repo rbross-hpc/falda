@@ -960,26 +960,45 @@ what "retired"/"deleted" does and does not mean.
 
 ### 8.8 Triggers
 
-Distillation runs off a **per-store job queue**, never inline on a write.
-Multiple surfaces can enqueue a job for a store:
+Distillation runs off a **per-store priority job queue** (`src/distill/queue.ts`),
+never inline on a write. Two enqueue paths feed the same queue, at two
+priority levels:
 
-- a **gateway-internal timer** (interval-based),
-- the gateway's `POST /distill` route,
-- the MCP tool `falda_distill`,
-- a CLI backfill (`--once`).
+- **Passive** (`PRIORITY_PASSIVE`, the default): a **sweep timer**
+  (`FALDA_SWEEP_INTERVAL_MS`, default 5 min) auto-enqueues every known
+  self-store.
+- **Explicit** (`PRIORITY_EXPLICIT`): the gateway's `POST /distill` route or
+  the MCP tool `falda_distill`. An explicit enqueue that coalesces with an
+  already-pending passive job for the same store *upgrades* that job's
+  priority in place rather than creating a duplicate row.
 
 A single **in-gateway background worker** drains the queue and calls the
 distill core directly against the resolved store (`PoolManager`) — no
-self-HTTP call, no bearer token to itself. The MCP server only *enqueues*;
-it never runs extraction/consolidation/scene/core writes in-process,
-preserving the rule that T2/T3 are curated by distillation, not by freehand
-agent tool calls.
+self-HTTP call, no bearer token to itself. Draining runs on its own timer
+(`FALDA_DRAIN_INTERVAL_MS`, default 1 min), claiming the single
+highest-priority ready job per tick — this is the passive-backlog
+throughput ceiling: with N self-stores each waiting on the sweep alone, a
+given store is drained roughly every N drain ticks. Explicit enqueues are
+not subject to that ceiling: they additionally **wake** the worker
+immediately, which drains every currently-ready explicit-priority job in a
+bounded loop rather than waiting for the next timed tick — passive jobs are
+untouched by a wake and still only drain on the timed tick. `FALDA_WORKER_INTERVAL_MS`
+is a deprecated single-value fallback that sets both timers when the split
+vars are unset.
 
-`falda_distill` is **asynchronous**: it returns a job id, not a completion
-result. A companion tool, `falda_distill_status`, allows polling. There is
-no synchronous "distill now, then read the fresh core" guarantee — an agent
-that needs freshly-distilled context must poll or accept eventual
-consistency.
+The MCP server only *enqueues*; it never runs extraction/consolidation/
+scene/core writes in-process, preserving the rule that T2/T3 are curated by
+distillation, not by freehand agent tool calls.
+
+`falda_distill` is **asynchronous**: it returns a job id immediately after
+enqueueing (and triggering the wake) — not a completion result. A companion
+tool, `falda_distill_status`, allows polling; the `DistillJob` it returns
+also exposes `priority`/`origin` (`sweep | http | mcp`) for operator
+visibility. There is no synchronous "distill now, then read the fresh core"
+guarantee — an agent that needs freshly-distilled context must poll or
+accept eventual consistency (wake substantially shortens the typical wait
+relative to the old single-interval design, but does not make it
+synchronous).
 
 kioku additionally fires L1 on session **ramp/idle/final** events and
 regenerates L2/L3 on every underlying change (debounced). FALDA's first
