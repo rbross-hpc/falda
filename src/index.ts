@@ -31,8 +31,12 @@ export type {
   /** @deprecated use RecallItem */
   ContextHit,
 } from "./distill/context.js";
-export { enqueue, getJob, getJobAuthorized, storeKeyFor, listJobs } from "./distill/queue.js";
-export type { DistillJob, JobStatus } from "./distill/queue.js";
+export { enqueue, getJob, getJobAuthorized, storeKeyFor, listJobs, PRIORITY_PASSIVE, PRIORITY_EXPLICIT } from "./distill/queue.js";
+export type { DistillJob, JobStatus, JobOrigin, EnqueueOptions, ClaimOptions } from "./distill/queue.js";
+export { startDistiller, resolveWorkerIntervals } from "./distill/worker.js";
+export type { DistillerHandle, DistillerOptions } from "./distill/worker.js";
+export { Histogram, MetricsRegistry, DEFAULT_BUCKET_BOUNDS_MS } from "./metrics.js";
+export type { HistogramBucket, HistogramSnapshot, MetricsSnapshot } from "./metrics.js";
 export { initRecallTraceSchema } from "./recall/schema.js";
 export { createRecallTrace, getRecallTraceAuthorized } from "./recall/traces.js";
 export { reportRecallUsage } from "./recall/usage.js";

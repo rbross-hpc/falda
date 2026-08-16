@@ -100,7 +100,10 @@
  * Env: see src/runtime.ts for the canonical set (FALDA_ROOT, FALDA_DIM,
  *   FALDA_EMBED*, FALDA_TOKENS, FALDA_LLM_*). Gateway-specific:
  *   FALDA_PORT               Port to listen on (default 8077).
- *   FALDA_WORKER_INTERVAL_MS Distillation worker interval, ms (default 60000).
+ *   FALDA_DRAIN_INTERVAL_MS  Distillation drain cadence, ms (default 60000).
+ *   FALDA_SWEEP_INTERVAL_MS  Passive-enqueue-sweep cadence, ms (default 300000).
+ *   FALDA_WORKER_INTERVAL_MS Deprecated fallback for both of the above — see
+ *                            src/distill/worker.ts's resolveWorkerIntervals.
  *   FALDA_RECALL_BUDGET       Default /recall budget, explicit mode (default 6000).
  *   FALDA_AUTO_RECALL_BUDGET  Default /recall budget, auto mode (default 3500).
  *   FALDA_RECALL_MAX_BUDGET   Hard ceiling on any requested budget (default 20000).
@@ -111,10 +114,11 @@ import Database from "better-sqlite3";
 import { PoolManager, PoolError } from "./pools.js";
 import { TokenStore, AuthError, parseBearer, type Principal } from "./mcp_auth.js";
 import { StreamConflictError, AtomImmutabilityError, AtomTypeError } from "./falda.js";
-import { enqueue, storeKeyFor, getJobAuthorized } from "./distill/queue.js";
+import { enqueue, storeKeyFor, getJobAuthorized, PRIORITY_EXPLICIT } from "./distill/queue.js";
 import { buildRuntime } from "./runtime.js";
-import { startDistiller } from "./distill/worker.js";
+import { startDistiller, resolveWorkerIntervals } from "./distill/worker.js";
 import { assembleContext, DEFAULT_TIER_BUDGETS } from "./distill/context.js";
+import type { MetricsRegistry } from "./metrics.js";
 import { resolveAutoRecallBudget, resolveMaxRecallBudget, resolveRecallBudget } from "./recall/budgets.js";
 import { buildPolicySnapshot } from "./recall/policy.js";
 import { createRecallTrace, getRecallTraceAuthorized, getLatestRecallTraceForStore } from "./recall/traces.js";
@@ -156,6 +160,8 @@ async function handleData(
   b: any,
   queueDb: Database.Database | undefined,
   recallTraceDb: Database.Database | undefined,
+  metrics: MetricsRegistry | undefined,
+  wakeDistiller: (() => void) | undefined,
 ) {
   const tenant = TokenStore.requireTenant(principal, headerValue(headers, "x-falda-tenant"));
   const pool = TokenStore.requirePool(principal, b.pool);
@@ -205,7 +211,9 @@ async function handleData(
       const mode: "explicit" | "auto" = b.mode === "auto" ? "auto" : "explicit";
       const defaultBudget = mode === "auto" ? RECALL_AUTO_DEFAULT_BUDGET : RECALL_DEFAULT_BUDGET;
       const budget = Math.min(b.budget ?? defaultBudget, RECALL_MAX_BUDGET);
+      const recallStartedAt = Date.now();
       const assembled = await assembleContext(store, query, budget);
+      metrics?.recall_ms.observe(Date.now() - recallStartedAt);
       let recall_id: string | undefined;
       if (recallTraceDb) {
         try {
@@ -264,7 +272,13 @@ async function handleData(
       // from the request body, to prevent cross-tenant enqueue.
       const storeKey = storeKeyFor(tenant, pool ?? undefined);
       if (!queueDb) return { error: "distillation queue not initialized" };
-      const jobId = enqueue(queueDb, storeKey);
+      const jobId = enqueue(queueDb, storeKey, { priority: PRIORITY_EXPLICIT, origin: "http" });
+      // Immediately drain, rather than waiting for the next timed tick —
+      // see src/distill/worker.ts's wake(). Undefined only for the legacy
+      // standalone gateway entry point if it somehow starts without a
+      // worker (it always does today), or a future surface that enqueues
+      // without owning a worker.
+      wakeDistiller?.();
       return { job_id: jobId, store_key: storeKey };
     }
     case "/distill/status": {
@@ -306,6 +320,8 @@ export async function handleRequest(
   b: any,
   queueDb?: Database.Database,
   recallTraceDb?: Database.Database,
+  metrics?: MetricsRegistry,
+  wakeDistiller?: () => void,
 ): Promise<{ status: number; body: any }> {
   try {
     const principal = tokenStore.authenticate(parseBearer(headers["authorization"]));
@@ -314,7 +330,7 @@ export async function handleRequest(
       if (out === undefined) return { status: 404, body: { error: "unknown route" } };
       return { status: 200, body: out };
     }
-    const out = await handleData(pools, principal, headers, route, b, queueDb, recallTraceDb);
+    const out = await handleData(pools, principal, headers, route, b, queueDb, recallTraceDb, metrics, wakeDistiller);
     if (out === undefined) return { status: 404, body: { error: "unknown route" } };
     return { status: 200, body: out };
   } catch (e: any) {
@@ -366,12 +382,22 @@ const IS_MAIN = process.argv[1]?.endsWith("gateway.js") || process.argv[1]?.ends
 if (IS_MAIN) {
   (async () => {
   const PORT = Number(process.env.FALDA_PORT ?? 8077);
-  const WORKER_INTERVAL_MS = Number(process.env.FALDA_WORKER_INTERVAL_MS ?? 60_000);
+  const resolvedEnv = resolveWorkerIntervals();
+  if (resolvedEnv.usingDeprecatedFallback) {
+    console.warn(
+      "falda gateway: FALDA_WORKER_INTERVAL_MS is deprecated — set FALDA_DRAIN_INTERVAL_MS " +
+      "and FALDA_SWEEP_INTERVAL_MS instead (see src/distill/worker.ts).",
+    );
+  }
 
   const runtime = await buildRuntime({ label: "FALDA gateway" });
-  startDistiller(runtime.queueDb, runtime.pools, runtime.llm, WORKER_INTERVAL_MS, {
+  const distiller = startDistiller(runtime.queueDb, runtime.pools, runtime.llm, undefined, {
+    drainIntervalMs: resolvedEnv.drainIntervalMs,
+    sweepIntervalMs: resolvedEnv.sweepIntervalMs,
     recallTraceDb: runtime.recallTraceDb,
+    metrics: runtime.metrics,
   });
+  runtime.wakeDistiller = () => distiller.wake();
 
   createServer((req, res) => {
     if (req.method === "GET" && req.url === "/healthz") {
@@ -385,7 +411,8 @@ if (IS_MAIN) {
       try {
         const parsed = body ? JSON.parse(body) : {};
         const { status, body: out } = await handleRequest(
-          runtime.pools, runtime.tokenStore, req.headers, req.url ?? "", parsed, runtime.queueDb, runtime.recallTraceDb,
+          runtime.pools, runtime.tokenStore, req.headers, req.url ?? "", parsed,
+          runtime.queueDb, runtime.recallTraceDb, runtime.metrics, runtime.wakeDistiller,
         );
         res.writeHead(status, { "content-type": "application/json" });
         res.end(JSON.stringify(out));

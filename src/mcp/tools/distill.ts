@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { TokenStore } from "../../mcp_auth.js";
-import { enqueue, storeKeyFor, getJobAuthorized } from "../../distill/queue.js";
+import { enqueue, storeKeyFor, getJobAuthorized, PRIORITY_EXPLICIT } from "../../distill/queue.js";
 import { ctxFromExtra, errorResult, poolArg, textResult, type ToolDeps } from "../context.js";
 
 export function registerDistill(server: McpServer, deps: ToolDeps): void {
@@ -21,7 +21,13 @@ export function registerDistill(server: McpServer, deps: ToolDeps): void {
         const checkedPool = TokenStore.requirePool(ctx.principal, pool);
         const callerKey = storeKeyFor(ctx.tenant, checkedPool ?? undefined);
         if (!deps.queueDb) return errorResult(new Error("distillation queue not available on this server"));
-        const jobId = enqueue(deps.queueDb, callerKey);
+        const jobId = enqueue(deps.queueDb, callerKey, { priority: PRIORITY_EXPLICIT, origin: "mcp" });
+        // Drain immediately rather than waiting for the next timed tick —
+        // see src/distill/worker.ts's wake(). Undefined for the legacy
+        // standalone `falda mcp` entry point (no worker of its own); the
+        // job still enqueues correctly and drains on whatever process (if
+        // any) owns the shared queue.
+        deps.wakeDistiller?.();
         return textResult({ job_id: jobId, store_key: callerKey });
       } catch (e) { return errorResult(e); }
     },

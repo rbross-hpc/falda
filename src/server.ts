@@ -31,8 +31,10 @@
  *                        src/mcp/registry.ts.
  *
  * Config (see src/runtime.ts for the full list): FALDA_ROOT, FALDA_DIM,
- * FALDA_EMBED*, FALDA_TOKENS (canonical — one token file for both
- * surfaces), FALDA_LLM_*, FALDA_WORKER_INTERVAL_MS.
+ *   FALDA_EMBED*, FALDA_TOKENS (canonical — one token file for both
+ *   surfaces), FALDA_LLM_*, FALDA_DRAIN_INTERVAL_MS, FALDA_SWEEP_INTERVAL_MS
+ *   (FALDA_WORKER_INTERVAL_MS is a deprecated fallback for both — see
+ *   src/distill/worker.ts's resolveWorkerIntervals).
  *
  * CLI flags:
  *   falda serve             HTTP API + MCP + distillation worker (default)
@@ -43,7 +45,7 @@ import { PoolError } from "./pools.js";
 import { AuthError, parseBearer } from "./mcp_auth.js";
 import { handleRequest } from "./gateway.js";
 import { handleFaldaMcpRequest } from "./mcp.js";
-import { startDistiller, type DistillerHandle } from "./distill/worker.js";
+import { startDistiller, resolveWorkerIntervals, type DistillerHandle } from "./distill/worker.js";
 import { buildRuntime, type FaldaRuntime, type RuntimeConfig } from "./runtime.js";
 import type { ToolsetName } from "./mcp/registry.js";
 import type { Server } from "node:http";
@@ -51,7 +53,11 @@ import type { Server } from "node:http";
 export interface ServeOptions {
   httpPort?: number;
   mcpPort?: number;
+  /** Deprecated: sets both drain and sweep cadence when the split options
+   *  below are omitted. Prefer drainIntervalMs/sweepIntervalMs. */
   workerIntervalMs?: number;
+  drainIntervalMs?: number;
+  sweepIntervalMs?: number;
   noMcp?: boolean;
   mcpToolset?: ToolsetName;
   runtimeConfig?: RuntimeConfig;
@@ -79,7 +85,8 @@ export function startHttpApi(runtime: FaldaRuntime, port: number): Server {
       try {
         const parsed = body ? JSON.parse(body) : {};
         const { status, body: out } = await handleRequest(
-          runtime.pools, runtime.tokenStore, req.headers, req.url ?? "", parsed, runtime.queueDb, runtime.recallTraceDb,
+          runtime.pools, runtime.tokenStore, req.headers, req.url ?? "", parsed,
+          runtime.queueDb, runtime.recallTraceDb, runtime.metrics, runtime.wakeDistiller,
         );
         res.writeHead(status, { "content-type": "application/json" });
         res.end(JSON.stringify(out));
@@ -108,6 +115,7 @@ export function startMcp(runtime: FaldaRuntime, port: number, toolset?: ToolsetN
     }
     handleFaldaMcpRequest(runtime.pools, runtime.tokenStore, req, res, runtime.queueDb, {
       toolset, recallTraceDb: runtime.recallTraceDb,
+      metrics: runtime.metrics, wakeDistiller: runtime.wakeDistiller,
     }).catch((e) => {
       console.error("[falda-mcp] fatal:", e);
       if (!res.headersSent) {
@@ -124,19 +132,38 @@ export function startMcp(runtime: FaldaRuntime, port: number, toolset?: ToolsetN
  * Bring up the unified server: one runtime, HTTP API always, MCP unless
  * --no-mcp, and the distillation worker always (it is the canonical owner
  * of the queue regardless of which protocol surfaces are enabled).
+ *
+ * The distiller is started BEFORE the HTTP/MCP listeners so that
+ * runtime.wakeDistiller is populated before any request could possibly rely
+ * on it (an explicit falda_distill/POST /distill landing before the worker
+ * exists would otherwise silently fall back to the timed drain for that one
+ * call — starting order-of-operations avoids that race entirely).
  */
 export async function serve(opts: ServeOptions = {}): Promise<ServeHandle> {
   const httpPort = opts.httpPort ?? Number(process.env.FALDA_PORT ?? 8077);
   const mcpPort = opts.mcpPort ?? Number(process.env.FALDA_MCP_PORT ?? 8079);
-  const workerIntervalMs = opts.workerIntervalMs ?? Number(process.env.FALDA_WORKER_INTERVAL_MS ?? 60_000);
+  const resolvedEnv = resolveWorkerIntervals();
+  if (resolvedEnv.usingDeprecatedFallback) {
+    console.warn(
+      "falda serve: FALDA_WORKER_INTERVAL_MS is deprecated — set FALDA_DRAIN_INTERVAL_MS " +
+      "(drain cadence, default 60000) and FALDA_SWEEP_INTERVAL_MS (passive-enqueue cadence, " +
+      "default 300000) instead. FALDA_WORKER_INTERVAL_MS still sets both until removed.",
+    );
+  }
+  const drainIntervalMs = opts.drainIntervalMs ?? opts.workerIntervalMs ?? resolvedEnv.drainIntervalMs;
+  const sweepIntervalMs = opts.sweepIntervalMs ?? opts.workerIntervalMs ?? resolvedEnv.sweepIntervalMs;
 
   const runtime = await buildRuntime({ label: "FALDA", ...opts.runtimeConfig });
 
+  const distiller = startDistiller(runtime.queueDb, runtime.pools, runtime.llm, undefined, {
+    drainIntervalMs, sweepIntervalMs,
+    recallTraceDb: runtime.recallTraceDb,
+    metrics: runtime.metrics,
+  });
+  runtime.wakeDistiller = () => distiller.wake();
+
   const httpServer = startHttpApi(runtime, httpPort);
   const mcpServer = opts.noMcp ? null : startMcp(runtime, mcpPort, opts.mcpToolset);
-  const distiller = startDistiller(runtime.queueDb, runtime.pools, runtime.llm, workerIntervalMs, {
-    recallTraceDb: runtime.recallTraceDb,
-  });
 
   return {
     runtime,

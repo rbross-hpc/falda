@@ -50,7 +50,9 @@ export function registerRecall(server: McpServer, deps: ToolDeps): void {
         const checkedPool = TokenStore.requirePool(ctx.principal, pool);
         const store = storeFor(deps, ctx, pool, false);
         const effectiveBudget = budget ?? (mode === "auto" ? autoDefaultBudget : defaultBudget);
+        const recallStartedAt = Date.now();
         const assembled = await assembleContext(store, query, effectiveBudget);
+        deps.metrics?.recall_ms.observe(Date.now() - recallStartedAt);
 
         let recall_id: string | undefined;
         if (deps.recallTraceDb) {
