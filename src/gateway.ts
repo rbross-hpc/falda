@@ -88,6 +88,14 @@
  *   /pools/list      {}                                            -> {pools}
  *   /pools/mine      {tenant}                                      -> {pools}
  *
+ *   /metrics         {}                                             -> MetricsSnapshot
+ *                       Since-process-startup timing histograms (src/metrics.ts):
+ *                       distill_pending_ms, distill_service_ms, recall_ms. Fixed
+ *                       predetermined bins, no raw samples retained, resets on
+ *                       restart. Process-global — not addressed by {tenant, pool} —
+ *                       any authenticated token may read it. Backs
+ *                       `falda stats --section=timing` (src/stats.ts).
+ *
  *   /healthz         (GET, unauthenticated)                        -> {ok, tiers}
  *
  * Prefer `falda serve` (src/server.ts) for new deployments — it starts this
@@ -329,6 +337,14 @@ export async function handleRequest(
       const out = handlePool(pools, principal, route, b);
       if (out === undefined) return { status: 404, body: { error: "unknown route" } };
       return { status: 200, body: out };
+    }
+    // /metrics is process-global (not addressed by {tenant, pool}) — any
+    // authenticated principal may read it (auth already enforced above by
+    // tokenStore.authenticate), matching /healthz's "up or not" spirit but
+    // requiring a token since these are operational timing numbers, not a
+    // public liveness probe. See src/metrics.ts.
+    if (route === "/metrics") {
+      return { status: 200, body: metrics?.snapshot() ?? { error: "metrics not initialized" } };
     }
     const out = await handleData(pools, principal, headers, route, b, queueDb, recallTraceDb, metrics, wakeDistiller);
     if (out === undefined) return { status: 404, body: { error: "unknown route" } };

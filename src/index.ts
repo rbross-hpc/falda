@@ -37,6 +37,14 @@ export { startDistiller, resolveWorkerIntervals } from "./distill/worker.js";
 export type { DistillerHandle, DistillerOptions } from "./distill/worker.js";
 export { Histogram, MetricsRegistry, DEFAULT_BUCKET_BOUNDS_MS } from "./metrics.js";
 export type { HistogramBucket, HistogramSnapshot, MetricsSnapshot } from "./metrics.js";
+export { renderHistogram, renderMetricsSnapshot } from "./metrics_render.js";
+export {
+  buildStatsReport, renderHuman as renderStatsHuman, listAllStores, inspectStore,
+} from "./stats.js";
+export type {
+  StatsOptions, StatsReport, Section as StatsSection, TimingReport,
+  StoreRef, StoreReport, StoreReportError, QueueReport, RecallReport, LayoutReport,
+} from "./stats.js";
 export { initRecallTraceSchema } from "./recall/schema.js";
 export { createRecallTrace, getRecallTraceAuthorized } from "./recall/traces.js";
 export { reportRecallUsage } from "./recall/usage.js";

@@ -93,27 +93,27 @@ describe("stats: store enumeration + inspection", () => {
     assert.equal(report.atoms.active, 0);
   });
 
-  test("buildStatsReport --tenant filter scopes to one self store", () => {
-    const report = buildStatsReport({ root, tenant: "kukla" });
+  test("buildStatsReport --tenant filter scopes to one self store", async () => {
+    const report = await buildStatsReport({ root, tenant: "kukla" });
     assert.equal(report.stores.length, 1);
     assert.equal(report.stores[0].store.label, "kukla:self");
   });
 
-  test("buildStatsReport --pool filter scopes to one pool store", () => {
-    const report = buildStatsReport({ root, pool: "shared-corpus" });
+  test("buildStatsReport --pool filter scopes to one pool store", async () => {
+    const report = await buildStatsReport({ root, pool: "shared-corpus" });
     assert.equal(report.stores.length, 1);
     assert.equal(report.stores[0].store.label, "shared-corpus:pool");
   });
 
-  test("buildStatsReport --section limits which sections run", () => {
-    const report = buildStatsReport({ root, sections: ["stores"] });
+  test("buildStatsReport --section limits which sections run", async () => {
+    const report = await buildStatsReport({ root, sections: ["stores"] });
     assert.equal(report.stores.length, 2);
     assert.equal(report.queue.present, false);
     assert.deepEqual(report.sections, ["stores"]);
   });
 
-  test("renderHuman only prints requested sections", () => {
-    const report = buildStatsReport({ root, sections: ["queue"] });
+  test("renderHuman only prints requested sections", async () => {
+    const report = await buildStatsReport({ root, sections: ["queue"] });
     const text = renderHuman(report);
     assert.ok(text.includes("## Distillation queue"));
     assert.ok(!text.includes("## Stores"));
@@ -128,7 +128,7 @@ describe("stats: distillation queue health", () => {
   before(() => { root = makeTempRoot(); });
   after(() => fs.rmSync(root, { recursive: true, force: true }));
 
-  test("reports counts by status and flags dead jobs as an error warning", () => {
+  test("reports counts by status and flags dead jobs as an error warning", async () => {
     const queueDb = new Database(path.join(root, "distill_queue.db"));
     queueDb.pragma("busy_timeout = 5000");
     initQueueSchema(queueDb);
@@ -138,7 +138,7 @@ describe("stats: distillation queue health", () => {
       .run("boom", deadId);
     queueDb.close();
 
-    const report = buildStatsReport({ root });
+    const report = await buildStatsReport({ root });
     assert.equal(report.queue.present, true);
     assert.equal(report.queue.by_status.pending, 1);
     assert.equal(report.queue.by_status.dead, 1);
@@ -150,7 +150,7 @@ describe("stats: distillation queue health", () => {
     );
   });
 
-  test("stale pending job surfaces a warn-level warning", () => {
+  test("stale pending job surfaces a warn-level warning", async () => {
     const staleRoot = makeTempRoot();
     try {
       const queueDb = new Database(path.join(staleRoot, "distill_queue.db"));
@@ -160,7 +160,7 @@ describe("stats: distillation queue health", () => {
       queueDb.prepare("UPDATE distill_jobs SET created_at=? WHERE id=?").run(oldTs, id);
       queueDb.close();
 
-      const report = buildStatsReport({ root: staleRoot });
+      const report = await buildStatsReport({ root: staleRoot });
       assert.ok(
         report.warnings.some((w) => w.level === "warn" && w.message.includes("waiting")),
         "stale pending job surfaces a warning",
@@ -170,10 +170,10 @@ describe("stats: distillation queue health", () => {
     }
   });
 
-  test("no queue db present is reported cleanly, not an error", () => {
+  test("no queue db present is reported cleanly, not an error", async () => {
     const emptyRoot = makeTempRoot();
     try {
-      const report = buildStatsReport({ root: emptyRoot, sections: ["queue"] });
+      const report = await buildStatsReport({ root: emptyRoot, sections: ["queue"] });
       assert.equal(report.queue.present, false);
       assert.deepEqual(report.queue.by_status, {});
     } finally {
@@ -183,7 +183,7 @@ describe("stats: distillation queue health", () => {
 });
 
 describe("stats: recall metrics", () => {
-  test("aggregates trace/item counts per store_key", () => {
+  test("aggregates trace/item counts per store_key", async () => {
     const root = makeTempRoot();
     try {
       const db = new Database(path.join(root, "recall_traces.db"));
@@ -205,7 +205,7 @@ describe("stats: recall metrics", () => {
       });
       db.close();
 
-      const report = buildStatsReport({ root, sections: ["recall"] });
+      const report = await buildStatsReport({ root, sections: ["recall"] });
       assert.equal(report.recall.present, true);
       assert.equal(report.recall.by_store.length, 1);
       assert.equal(report.recall.by_store[0].store_key, "kukla:self");
@@ -216,10 +216,10 @@ describe("stats: recall metrics", () => {
     }
   });
 
-  test("no recall_traces.db present is reported cleanly", () => {
+  test("no recall_traces.db present is reported cleanly", async () => {
     const root = makeTempRoot();
     try {
-      const report = buildStatsReport({ root, sections: ["recall"] });
+      const report = await buildStatsReport({ root, sections: ["recall"] });
       assert.equal(report.recall.present, false);
       assert.deepEqual(report.recall.by_store, []);
     } finally {
@@ -229,7 +229,7 @@ describe("stats: recall metrics", () => {
 });
 
 describe("stats: layout + embedding lock", () => {
-  test("flags a dim mismatch between EMBEDDING.json and current env as an error", () => {
+  test("flags a dim mismatch between EMBEDDING.json and current env as an error", async () => {
     const root = makeTempRoot();
     try {
       fs.writeFileSync(
@@ -239,7 +239,7 @@ describe("stats: layout + embedding lock", () => {
       const prevDim = process.env.FALDA_DIM;
       process.env.FALDA_DIM = "32";
       try {
-        const report = buildStatsReport({ root, sections: ["layout"] });
+        const report = await buildStatsReport({ root, sections: ["layout"] });
         assert.equal(report.layout.embedding_lock.present, true);
         assert.equal(report.layout.embedding_lock.dim, 768);
         assert.ok(
@@ -254,13 +254,13 @@ describe("stats: layout + embedding lock", () => {
     }
   });
 
-  test("missing token file surfaces a warn-level warning with the resolved path", () => {
+  test("missing token file surfaces a warn-level warning with the resolved path", async () => {
     const root = makeTempRoot();
     try {
       const prevTokens = process.env.FALDA_TOKENS;
       process.env.FALDA_TOKENS = path.join(root, "does-not-exist-tokens.json");
       try {
-        const report = buildStatsReport({ root, sections: ["layout"] });
+        const report = await buildStatsReport({ root, sections: ["layout"] });
         assert.equal(report.layout.tokens_file.present, false);
         assert.ok(report.warnings.some((w) => w.level === "warn" && w.message.includes("no token file found")));
       } finally {
@@ -271,10 +271,10 @@ describe("stats: layout + embedding lock", () => {
     }
   });
 
-  test("empty root: no stores found surfaces a warn-level warning, exit stays non-error", () => {
+  test("empty root: no stores found surfaces a warn-level warning, exit stays non-error", async () => {
     const root = makeTempRoot();
     try {
-      const report = buildStatsReport({ root });
+      const report = await buildStatsReport({ root });
       assert.ok(report.warnings.some((w) => w.level === "warn" && w.message.includes("no stores found")));
       assert.ok(!report.warnings.some((w) => w.level === "error"));
     } finally {

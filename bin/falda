@@ -17,13 +17,21 @@
 #   falda smoke             Run the offline smoke test.
 #   falda build             Compile TypeScript -> dist/.
 #   falda health [PORT]     Curl the HTTP API's /healthz endpoint.
-#   falda stats [ARGS]      Read-only, offline report of everything under
-#                            FALDA_ROOT: tier counts per store, distillation
-#                            queue health, recall metrics, layout/config, and
+#   falda stats [ARGS]      Read-only report of everything under FALDA_ROOT:
+#                            tier counts per store, distillation queue
+#                            health, recall metrics, layout/config, and
 #                            warnings (e.g. dead-lettered jobs, embedding-lock
-#                            mismatch). No running server or token needed.
+#                            mismatch). No running server or token needed —
+#                            EXCEPT --section=timing, which fetches
+#                            since-startup timing histograms (distill queue
+#                            pending time, distill service time, recall
+#                            time) from a RUNNING falda serve's /metrics
+#                            route; degrades to a warning (not a crash) if
+#                            no server/token is available. Every other
+#                            section stays fully offline.
 #                            ARGS: --root=DIR --tenant=T --pool=P
-#                            --section=stores|queue|recall|layout --json
+#                            --section=stores|queue|recall|layout|timing
+#                            --url=BASE --token=TOK --json
 #   falda reembed [ARGS]    Rebuild dense-vector indexes for every store (or
 #                            one --tenant/--pool) using the currently
 #                            configured embedder/dim, then update
