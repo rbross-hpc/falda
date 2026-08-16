@@ -110,5 +110,13 @@ export async function handleFaldaMcpRequest(
   const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
   res.on("close", () => { transport.close(); server.close(); });
   await server.connect(transport);
-  await transport.handleRequest(req, res);
+  // mcp_request_ms (src/metrics.ts) — whole-request wall time for every MCP
+  // request (handshake/list calls included, not just tool calls), tagged by
+  // whether a distillation pass was in flight at observation time.
+  const requestStartedAt = Date.now();
+  try {
+    await transport.handleRequest(req, res);
+  } finally {
+    opts?.metrics?.mcp_request_ms.observe(Date.now() - requestStartedAt, opts.metrics.distillActive());
+  }
 }

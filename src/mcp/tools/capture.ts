@@ -35,7 +35,9 @@ export function registerStreamAdd(server: McpServer, deps: ToolDeps): void {
     async ({ session_id, messages, pool }, extra) => {
       try {
         const ctx = ctxFromExtra(deps.tokenStore, extra);
+        const addStartedAt = Date.now();
         const accepted_ids = await storeFor(deps, ctx, pool, true).addStream(session_id, messages);
+        if (deps.metrics) deps.metrics.stream_add_ms.observe(Date.now() - addStartedAt, deps.metrics.distillActive());
         return textResult({ accepted_ids, total_count: messages.length });
       } catch (e) { return errorResult(e); }
     },

@@ -35,8 +35,8 @@ export { enqueue, getJob, getJobAuthorized, storeKeyFor, listJobs, PRIORITY_PASS
 export type { DistillJob, JobStatus, JobOrigin, EnqueueOptions, ClaimOptions } from "./distill/queue.js";
 export { startDistiller, resolveWorkerIntervals } from "./distill/worker.js";
 export type { DistillerHandle, DistillerOptions } from "./distill/worker.js";
-export { Histogram, MetricsRegistry, DEFAULT_BUCKET_BOUNDS_MS } from "./metrics.js";
-export type { HistogramBucket, HistogramSnapshot, MetricsSnapshot } from "./metrics.js";
+export { Histogram, TaggedHistogram, MetricsRegistry, DEFAULT_BUCKET_BOUNDS_MS } from "./metrics.js";
+export type { HistogramBucket, HistogramSnapshot, TaggedHistogramSnapshot, MetricsSnapshot } from "./metrics.js";
 export { renderHistogram, renderMetricsSnapshot } from "./metrics_render.js";
 export {
   buildStatsReport, renderHuman as renderStatsHuman, listAllStores, inspectStore,

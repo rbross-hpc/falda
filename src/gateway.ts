@@ -90,11 +90,16 @@
  *
  *   /metrics         {}                                             -> MetricsSnapshot
  *                       Since-process-startup timing histograms (src/metrics.ts):
- *                       distill_pending_ms, distill_service_ms, recall_ms. Fixed
- *                       predetermined bins, no raw samples retained, resets on
- *                       restart. Process-global — not addressed by {tenant, pool} —
- *                       any authenticated token may read it. Backs
- *                       `falda stats --section=timing` (src/stats.ts).
+ *                       distill_pending_ms, distill_service_ms, recall_ms (plain
+ *                       histograms), plus http_request_ms, mcp_request_ms,
+ *                       stream_add_ms (each split into {active, idle} by whether a
+ *                       distillation pass was in flight at observation time — see
+ *                       src/metrics.ts's TaggedHistogram). Fixed predetermined bins,
+ *                       no raw samples retained, resets on restart. Process-global —
+ *                       not addressed by {tenant, pool} — any authenticated token may
+ *                       read it (the /metrics call itself is not counted in
+ *                       http_request_ms). Backs `falda stats --section=timing`
+ *                       (src/stats.ts).
  *
  *   /healthz         (GET, unauthenticated)                        -> {ok, tiers}
  *
@@ -247,10 +252,12 @@ async function handleData(
         items: assembled.items, truncated: assembled.truncated, total_chars: assembled.total_chars,
       };
     }
-    case "/stream/add":
-      return store.addStream(b.session_id, b.messages ?? []).then((ids) => ({
-        accepted_ids: ids, total_count: (b.messages ?? []).length,
-      }));
+    case "/stream/add": {
+      const addStartedAt = Date.now();
+      const ids = await store.addStream(b.session_id, b.messages ?? []);
+      metrics?.stream_add_ms.observe(Date.now() - addStartedAt, metrics.distillActive());
+      return { accepted_ids: ids, total_count: (b.messages ?? []).length };
+    }
     case "/stream/query":    return store.queryStream(b);
     case "/stream/search":   return { messages: await store.searchStream(b.query, b.limit) };
     case "/stream/delete":   return store.deleteStream(b);
@@ -331,6 +338,11 @@ export async function handleRequest(
   metrics?: MetricsRegistry,
   wakeDistiller?: () => void,
 ): Promise<{ status: number; body: any }> {
+  // Foreground request latency (src/metrics.ts's http_request_ms) — whole
+  // handleRequest wall time, tagged by whether a distillation pass was in
+  // flight. /metrics itself is excluded (self-measurement/liveness-probe
+  // noise, not a real data route) — /healthz never reaches this function.
+  const requestStartedAt = Date.now();
   try {
     const principal = tokenStore.authenticate(parseBearer(headers["authorization"]));
     if (route.startsWith("/pools/")) {
@@ -376,6 +388,10 @@ export async function handleRequest(
       return { status: 404, body: { error: e.message } };
     }
     return { status: 500, body: { error: String(e?.message ?? e) } };
+  } finally {
+    if (route !== "/metrics") {
+      metrics?.http_request_ms.observe(Date.now() - requestStartedAt, metrics.distillActive());
+    }
   }
 }
 
