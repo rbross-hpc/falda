@@ -359,19 +359,34 @@ distill inspect`), and do not need to be interpreted by API callers.
   "started_at": "2026-08-16T00:00:00.000Z",
   "recall_ms": { "count": 12, "min": 3, "max": 410, "mean": 55.2, "buckets": [...] },
   "distill_pending_ms": { ... },
-  "distill_service_ms": { ... }
+  "distill_service_ms": { ... },
+  "http_request_ms": { "active": { ... }, "idle": { ... } },
+  "mcp_request_ms": { "active": { ... }, "idle": { ... } },
+  "stream_add_ms": { "active": { ... }, "idle": { ... } }
 }
 ```
 
 Since-process-startup timing histograms (`src/metrics.ts`): `recall_ms`
 (`assembleContext` wall time, observed on every `falda_recall`/`POST
 /recall`), `distill_pending_ms` (queue enqueue → claim), and
-`distill_service_ms` (`distillOnce` wall time). Fixed predetermined bins, no
-raw samples retained (fixed memory footprint) — hence count/min/max/mean
-rather than percentiles. Resets to zero on every `falda serve` restart —
-this is in-process telemetry, not a durable store. Process-global (not
-addressed by `{tenant, pool}`): any authenticated token may read it. Backs
-`falda stats --section=timing` (`docs/OPERATIONS.md`).
+`distill_service_ms` (`distillOnce` wall time) are plain histograms. Fixed
+predetermined bins, no raw samples retained (fixed memory footprint) — hence
+count/min/max/mean rather than percentiles.
+
+`http_request_ms` (whole `handleRequest` wall time for every gateway route
+except `/metrics` itself), `mcp_request_ms` (whole MCP request wall time,
+including handshake/list calls), and `stream_add_ms` (`addStream` wall time,
+observed at both the HTTP `/stream/add` and MCP `falda_stream_add` entry
+points) are each a `TaggedHistogram`: `{ active, idle }`, split by whether a
+distillation pass (`distillOnce`) was in flight at the moment of
+observation. This is the foreground-latency signal for "is a running distill
+pass stalling requests?" — `active` and `idle` are each themselves the same
+count/min/max/mean/buckets shape as a plain histogram.
+
+Resets to zero on every `falda serve` restart — this is in-process
+telemetry, not a durable store. Process-global (not addressed by `{tenant,
+pool}`): any authenticated token may read it. Backs `falda stats
+--section=timing` (`docs/OPERATIONS.md`).
 
 ## Pool admin
 

@@ -55,6 +55,12 @@ test("/metrics with a valid token (no tenant header needed -- process-global) re
   assert.equal(res.body.recall_ms.count, 1);
   assert.equal(res.body.distill_pending_ms.count, 0);
   assert.equal(res.body.distill_service_ms.count, 0);
+  assert.equal(res.body.http_request_ms.active.count, 0);
+  assert.equal(res.body.http_request_ms.idle.count, 0);
+  assert.equal(res.body.mcp_request_ms.active.count, 0);
+  assert.equal(res.body.mcp_request_ms.idle.count, 0);
+  assert.equal(res.body.stream_add_ms.active.count, 0);
+  assert.equal(res.body.stream_add_ms.idle.count, 0);
 });
 
 test("/metrics with no registry wired returns a soft error body, not a crash", async () => {
@@ -63,4 +69,50 @@ test("/metrics with no registry wired returns a soft error body, not a crash", a
   );
   assert.equal(res.status, 200);
   assert.ok(res.body.error);
+});
+
+test("/metrics requests themselves are excluded from http_request_ms (no self-measurement)", async () => {
+  const localMetrics = new MetricsRegistry();
+  for (let i = 0; i < 3; i++) {
+    await handleRequest(pools, tokenStore, { authorization: "Bearer tok-a" }, "/metrics", {}, undefined, undefined, localMetrics);
+  }
+  const snap = localMetrics.snapshot();
+  assert.equal(snap.http_request_ms.active.count, 0);
+  assert.equal(snap.http_request_ms.idle.count, 0);
+});
+
+test("a real data route observes http_request_ms, tagged idle when no distill pass is active", async () => {
+  const localMetrics = new MetricsRegistry();
+  await handleRequest(
+    pools, tokenStore, { authorization: "Bearer tok-a", "x-falda-tenant": "proj-a" },
+    "/core/read", {}, undefined, undefined, localMetrics,
+  );
+  const snap = localMetrics.snapshot();
+  assert.equal(snap.http_request_ms.idle.count, 1);
+  assert.equal(snap.http_request_ms.active.count, 0);
+});
+
+test("http_request_ms tags active when a distillation pass is in flight", async () => {
+  const localMetrics = new MetricsRegistry();
+  localMetrics.distillStarted();
+  await handleRequest(
+    pools, tokenStore, { authorization: "Bearer tok-a", "x-falda-tenant": "proj-a" },
+    "/core/read", {}, undefined, undefined, localMetrics,
+  );
+  localMetrics.distillFinished();
+  const snap = localMetrics.snapshot();
+  assert.equal(snap.http_request_ms.active.count, 1);
+  assert.equal(snap.http_request_ms.idle.count, 0);
+});
+
+test("/stream/add observes stream_add_ms in addition to http_request_ms", async () => {
+  const localMetrics = new MetricsRegistry();
+  await handleRequest(
+    pools, tokenStore, { authorization: "Bearer tok-a", "x-falda-tenant": "proj-a" },
+    "/stream/add", { session_id: "s1", messages: [{ role: "user", content: "hi" }] },
+    undefined, undefined, localMetrics,
+  );
+  const snap = localMetrics.snapshot();
+  assert.equal(snap.stream_add_ms.idle.count, 1);
+  assert.equal(snap.http_request_ms.idle.count, 1);
 });

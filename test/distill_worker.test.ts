@@ -227,6 +227,42 @@ describe("startDistiller: metrics instrumentation", () => {
         assert.equal(metrics.distill_pending_ms.snapshot().count, 1);
         assert.equal(metrics.distill_service_ms.snapshot().count, 1);
         assert.equal(metrics.recall_ms.snapshot().count, 0, "recall metric untouched by distill activity");
+        assert.equal(metrics.distillActive(), false, "distillActive() must be false again once the pass has finished");
+      } finally {
+        distiller.stop();
+      }
+    } finally { cleanup(root); }
+  });
+
+  test("distillActive() is true for the duration of a pass, observable by a concurrent foreground observation", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      const store = pools.resolve("proj-x", undefined, true);
+      // distillOnce takes a "no new turns" early return (and never calls the
+      // LLM at all) unless there's actually a turn to process — give it one.
+      await store.addStream("sess-1", [{ role: "user", content: "hello world" }]);
+      enqueue(queueDb, "proj-x:self");
+
+      let sawActiveDuringPass = false;
+      const metrics = new MetricsRegistry();
+      const slowLlm: LLMFnWithModel = Object.assign(
+        async () => {
+          sawActiveDuringPass = metrics.distillActive();
+          await new Promise((r) => setTimeout(r, 30));
+          throw new Error("stub LLM — intentionally fails after a delay");
+        },
+        { model: "stub" },
+      );
+      const distiller = startDistiller(queueDb, pools, slowLlm, undefined, {
+        drainIntervalMs: 20, sweepIntervalMs: 10_000, metrics,
+      });
+      try {
+        await waitFor(() => metrics.distill_service_ms.snapshot().count > 0, 2000);
+        assert.equal(sawActiveDuringPass, true, "distillActive() must be true while the pass's LLM call is in flight");
+        assert.equal(metrics.distillActive(), false, "distillActive() must be false again once the pass has finished");
       } finally {
         distiller.stop();
       }

@@ -5,7 +5,7 @@
  * than reading anything off disk — these numbers are in-process,
  * since-startup counters with no durable backing store.
  */
-import type { HistogramSnapshot, MetricsSnapshot } from "./metrics.js";
+import type { HistogramSnapshot, MetricsSnapshot, TaggedHistogramSnapshot } from "./metrics.js";
 
 const BAR_WIDTH = 30;
 
@@ -42,6 +42,17 @@ export function renderHistogram(name: string, snap: HistogramSnapshot): string[]
   return lines;
 }
 
+/** Render a TaggedHistogram (src/metrics.ts) as its two split sub-charts —
+ *  reuses renderHistogram itself, just called twice with distinguishing
+ *  labels. */
+function renderTaggedHistogram(name: string, snap: TaggedHistogramSnapshot): string[] {
+  return [
+    ...renderHistogram(`${name} [distill_active=true]`, snap.active),
+    "",
+    ...renderHistogram(`${name} [distill_active=false]`, snap.idle),
+  ];
+}
+
 export function renderMetricsSnapshot(snap: MetricsSnapshot): string {
   const lines: string[] = [];
   lines.push(`Since: ${snap.started_at} (process start — counters reset on restart)`);
@@ -51,5 +62,11 @@ export function renderMetricsSnapshot(snap: MetricsSnapshot): string {
   lines.push(...renderHistogram("distill_pending_ms (enqueue -> claim)", snap.distill_pending_ms));
   lines.push("");
   lines.push(...renderHistogram("distill_service_ms (distillOnce wall time)", snap.distill_service_ms));
+  lines.push("");
+  lines.push(...renderTaggedHistogram("http_request_ms (gateway handleRequest wall time)", snap.http_request_ms));
+  lines.push("");
+  lines.push(...renderTaggedHistogram("mcp_request_ms (MCP transport.handleRequest wall time)", snap.mcp_request_ms));
+  lines.push("");
+  lines.push(...renderTaggedHistogram("stream_add_ms (addStream wall time)", snap.stream_add_ms));
   return lines.join("\n");
 }

@@ -147,6 +147,11 @@ export function startDistiller(
     }
     const [tenant, poolName] = job.store_key.split(":", 2);
     const startedAt = Date.now();
+    // distillStarted/distillFinished bracket the one place a distillation
+    // pass actually runs — this is the source of truth every foreground
+    // http_request_ms/mcp_request_ms/stream_add_ms observation tags itself
+    // against (MetricsRegistry.distillActive(), src/metrics.ts).
+    opts.metrics?.distillStarted();
     try {
       const store = pools.resolve(tenant, poolName === "self" ? undefined : poolName, true);
       await distillOnce(store, llm, {
@@ -158,6 +163,7 @@ export function startDistiller(
       failJob(queueDb, job.id, String(e?.message ?? e));
     } finally {
       opts.metrics?.distill_service_ms.observe(Date.now() - startedAt);
+      opts.metrics?.distillFinished();
     }
   };
 

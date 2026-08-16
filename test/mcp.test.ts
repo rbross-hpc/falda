@@ -28,11 +28,15 @@ import { PoolManager } from "../src/pools.js";
 import { makeLocalEmbedder } from "../src/embedder.js";
 import { TokenStore } from "../src/mcp_auth.js";
 import { handleFaldaMcpRequest } from "../src/mcp.js";
+import { MetricsRegistry } from "../src/metrics.js";
+import type { McpServerOpts } from "../src/mcp/server.js";
 
-function startTestServer(pools: PoolManager, tokenStore: TokenStore): Promise<{ server: Server; port: number }> {
+function startTestServer(
+  pools: PoolManager, tokenStore: TokenStore, opts: McpServerOpts = { toolset: "full" },
+): Promise<{ server: Server; port: number }> {
   return new Promise((resolve) => {
     const httpServer = createServer((req, res) => {
-      handleFaldaMcpRequest(pools, tokenStore, req, res, undefined, { toolset: "full" }).catch((e) => {
+      handleFaldaMcpRequest(pools, tokenStore, req, res, undefined, opts).catch((e) => {
         console.error(e);
         if (!res.headersSent) { res.writeHead(500); res.end(JSON.stringify({ error: String(e) })); }
       });
@@ -158,4 +162,36 @@ test("6. falda_whoami: echoes only the resolved tenant, nothing sensitive", asyn
     const who = textOf(await client.callTool({ name: "falda_whoami", arguments: {} }));
     assert.equal(who.tenant, "proj-z", "whoami reflects the selected tenant for a wildcard principal");
   });
+});
+
+test("7. mcp_request_ms: every MCP request is observed, tagged idle when no distill pass is active", async () => {
+  const metrics = new MetricsRegistry();
+  const { server: metricsServer, port: metricsPort } = await startTestServer(pools, tokenStore, { toolset: "full", metrics });
+  try {
+    await withClient(metricsPort, "tok-a", "proj-a", async (client) => {
+      await client.callTool({ name: "falda_whoami", arguments: {} });
+    });
+    const snap = metrics.snapshot();
+    assert.ok(snap.mcp_request_ms.idle.count >= 1, "at least the whoami call plus MCP handshake requests were observed");
+    assert.equal(snap.mcp_request_ms.active.count, 0);
+  } finally {
+    metricsServer.close();
+  }
+});
+
+test("8. mcp_request_ms: tagged active while a distillation pass is in flight", async () => {
+  const metrics = new MetricsRegistry();
+  const { server: metricsServer, port: metricsPort } = await startTestServer(pools, tokenStore, { toolset: "full", metrics });
+  try {
+    metrics.distillStarted();
+    await withClient(metricsPort, "tok-a", "proj-a", async (client) => {
+      await client.callTool({ name: "falda_whoami", arguments: {} });
+    });
+    metrics.distillFinished();
+    const snap = metrics.snapshot();
+    assert.ok(snap.mcp_request_ms.active.count >= 1);
+    assert.equal(snap.mcp_request_ms.idle.count, 0);
+  } finally {
+    metricsServer.close();
+  }
 });
