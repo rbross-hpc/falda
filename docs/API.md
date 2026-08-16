@@ -324,21 +324,54 @@ list and example queries.
 ```
 → `{ "job_id": "...", "store_key": "..." }`
 
-Enqueues a distillation job for the addressed store. `store_key` is always
-derived from the authenticated tenant + pool (never from a body field) to
-prevent cross-tenant enqueue. Duplicate pending jobs for the same store are
-coalesced (returns existing job id). Asynchronous — does not wait for
+Enqueues a distillation job for the addressed store, at EXPLICIT priority
+(claimed ahead of the worker's own passive-sweep jobs — see
+`src/distill/queue.ts`), and immediately wakes the worker to drain it rather
+than waiting for the next scheduled drain tick. `store_key` is always derived
+from the authenticated tenant + pool (never from a body field) to prevent
+cross-tenant enqueue. Duplicate pending jobs for the same store are
+coalesced — a second explicit enqueue on top of an already-pending passive
+job upgrades that job's priority in place rather than creating a duplicate
+(returns the existing job id either way). Asynchronous — does not wait for
 distillation to complete. Drained by the single in-process distillation
 worker started by `falda serve` (or `falda gateway`) — see the README's
-"Distillation" section.
+"Distillation" section and `FALDA_DRAIN_INTERVAL_MS`/`FALDA_SWEEP_INTERVAL_MS`.
 
 ### `POST /distill/status`
 ```json
 { "job_id": "..." }
 ```
-→ DistillJob object (`{ id, store_key, status, attempts, next_attempt_at, error, ... }`)
+→ DistillJob object (`{ id, store_key, status, attempts, next_attempt_at, error, priority, origin, ... }`)
 
-Status values: `pending | running | done | dead`.
+Status values: `pending | running | done | dead`. `priority` distinguishes an
+explicit request (`falda_distill`/`POST /distill`) from the worker's own
+passive sweep; `origin` records which surface enqueued it (`sweep | http |
+mcp`) — both are informational, surfaced for operator visibility (e.g. `falda
+distill inspect`), and do not need to be interpreted by API callers.
+
+### `POST /metrics`
+```json
+{}
+```
+→ `MetricsSnapshot`:
+```json
+{
+  "started_at": "2026-08-16T00:00:00.000Z",
+  "recall_ms": { "count": 12, "min": 3, "max": 410, "mean": 55.2, "buckets": [...] },
+  "distill_pending_ms": { ... },
+  "distill_service_ms": { ... }
+}
+```
+
+Since-process-startup timing histograms (`src/metrics.ts`): `recall_ms`
+(`assembleContext` wall time, observed on every `falda_recall`/`POST
+/recall`), `distill_pending_ms` (queue enqueue → claim), and
+`distill_service_ms` (`distillOnce` wall time). Fixed predetermined bins, no
+raw samples retained (fixed memory footprint) — hence count/min/max/mean
+rather than percentiles. Resets to zero on every `falda serve` restart —
+this is in-process telemetry, not a durable store. Process-global (not
+addressed by `{tenant, pool}`): any authenticated token may read it. Backs
+`falda stats --section=timing` (`docs/OPERATIONS.md`).
 
 ## Pool admin
 

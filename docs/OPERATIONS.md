@@ -9,12 +9,13 @@ distillation jobs, a stale pending backlog, an embedding-lock mismatch, a
 missing token file, an empty store).
 
 ```bash
-falda stats                                   # human-readable, everything
-falda stats --json                            # machine-readable, everything
+falda stats                                   # human-readable, everything OFFLINE (see below)
+falda stats --json                            # machine-readable, everything offline
 falda stats --tenant=my-agent                 # scope to one tenant's self store
 falda stats --pool=shared-corpus              # scope to one shared pool
 falda stats --section=queue,recall            # only these sections
 FALDA_ROOT=/data falda stats                  # point at a specific root
+falda stats --section=timing --token=<tok>    # since-startup timing histograms (needs a running falda serve)
 ```
 
 Or directly: `tsx src/stats.ts [args]` / `node dist/stats.js [args]` /
@@ -51,6 +52,19 @@ Because of all of the above, `falda stats` can run concurrently with a live
 `falda serve` process without contention risk beyond ordinary SQLite
 read-concurrency (WAL mode, which every `Falda` store already uses).
 
+**Exception: `--section=timing`.** Since-startup timing histograms
+(`src/metrics.ts`) live only in the memory of a running `falda serve`
+process — they are not written to disk, by design (they reset on every
+restart). This one section therefore breaks the "always offline" rule: it
+makes an authenticated `POST /metrics` call against a running server
+(`--url`/`FALDA_URL`, default `http://localhost:8077`, and
+`--token`/`FALDA_TOKEN`). If no server is reachable or the token is
+rejected, the section reports `unavailable` with a reason and the report
+still completes normally (a warning, not a crash) — every other section is
+unaffected. `timing` is never included unless explicitly requested via
+`--section=timing` (or a list containing it), so a plain `falda stats`
+never makes a network call.
+
 ## Sections
 
 | Section  | Reports |
@@ -59,8 +73,11 @@ read-concurrency (WAL mode, which every `Falda` store already uses).
 | `queue`  | `distill_jobs` grouped by status (`pending`/`running`/`done`/`dead`), the full dead-letter list (store_key, attempts, error), and the oldest pending job's age. |
 | `recall` | Per `store_key`: trace count and item count from `recall_traces.db` (see `docs/RECALL_TRACES.md`). Coarser than `computeRecallMetrics()` (no usage-rate breakdown) — this is an inventory view, not the tuning view `/recalls/metrics` gives one authenticated tenant. |
 | `layout` | Presence of `distill_queue.db`, `recall_traces.db`, `pools.json` (+ pool count), `EMBEDDING.json` (+ locked model/dim), and the resolved token file path. |
+| `timing` | **Live server only** (see above) — since-process-startup histograms for `recall_ms` (assembleContext wall time), `distill_pending_ms` (queue enqueue → claim), and `distill_service_ms` (distillOnce wall time). Fixed predetermined bins, no percentiles (raw samples aren't retained) — count/min/max/mean per histogram. Resets on every `falda serve` restart. |
 
-Omit `--section` to run all four.
+Omit `--section` to run the four offline sections (`stores`, `queue`,
+`recall`, `layout`). `timing` is opt-in only — pass it explicitly (e.g.
+`--section=timing` or `--section=queue,timing`).
 
 ## Warnings
 

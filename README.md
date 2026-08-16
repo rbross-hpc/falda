@@ -151,11 +151,16 @@ uses any OpenAI-compatible chat model to:
   hysteresis).
 - **T2 → T3**: synthesize a core document from the active scene structure.
 
-Distillation is triggered by: an interval timer inside `falda serve` (which
-also auto-enqueues every known self-store, so distillation runs continuously
-with no external trigger required), a `POST /distill` HTTP call, or the
-`falda_distill` MCP tool. Each trigger enqueues a job; the single in-process
-worker drains the queue.
+Distillation is triggered two ways, both landing in one priority queue drained
+by the single in-process worker inside `falda serve`:
+- **Passive**: a sweep timer auto-enqueues every known self-store
+  (`FALDA_SWEEP_INTERVAL_MS`, default 5 min), and a separate drain timer
+  (`FALDA_DRAIN_INTERVAL_MS`, default 1 min) processes one ready job per tick —
+  distillation runs continuously with no external trigger required.
+- **Explicit**: a `POST /distill` HTTP call or the `falda_distill` MCP tool
+  enqueues at a higher priority than passive jobs (so it's claimed first) and
+  immediately wakes the worker to drain it, rather than waiting for the next
+  drain tick.
 
 ```bash
 # Trigger a distillation pass on demand (falda serve must be running):
@@ -175,7 +180,9 @@ FALDA_TENANT=my-agent FALDA_LLM_BASE_URL=http://localhost:8000/v1 \
 | `FALDA_LLM_BASE_URL`    | `http://localhost:11434/v1` | chat-completions endpoint |
 | `FALDA_LLM_API_KEY`     | `x`                         | bearer token for chat endpoint |
 | `FALDA_LLM_MODEL`       | `gpt-4o-mini`               | extraction/synthesis model id |
-| `FALDA_WORKER_INTERVAL_MS` | `60000`                  | distillation worker poll interval |
+| `FALDA_DRAIN_INTERVAL_MS`  | `60000`                  | how often the worker drains one ready job from the queue |
+| `FALDA_SWEEP_INTERVAL_MS`  | `300000`                 | how often the worker auto-enqueues every self-store, and prunes `recall_traces.db` |
+| `FALDA_WORKER_INTERVAL_MS` | *(unset)*                | **deprecated**: sets both of the above when they're unset — set the split vars instead |
 
 ---
 
@@ -220,8 +227,8 @@ mcp` themselves:
 
 | Env var        | Default                   | Notes |
 |----------------|----------------------------|-------|
-| `FALDA_URL`    | `http://localhost:8077`   | server base URL for `falda show recall` |
-| `FALDA_TOKEN`  | *(unset)*                  | bearer token for `falda show recall` — **not** the same as `FALDA_TOKENS` above (that's the server's token *file*; this is a single token *value* a client sends) |
+| `FALDA_URL`    | `http://localhost:8077`   | server base URL for `falda show recall` and `falda stats --section=timing` |
+| `FALDA_TOKEN`  | *(unset)*                  | bearer token for `falda show recall` and `falda stats --section=timing` — **not** the same as `FALDA_TOKENS` above (that's the server's token *file*; this is a single token *value* a client sends) |
 
 ---
 
