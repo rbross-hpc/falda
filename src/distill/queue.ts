@@ -6,6 +6,10 @@ import Database from "better-sqlite3";
 
 export type JobStatus = "pending" | "running" | "done" | "dead";
 
+/** Origin of an enqueue call — informational only, surfaced by `falda distill
+ *  inspect`/stats; does not affect drain order (priority does). */
+export type JobOrigin = "sweep" | "http" | "mcp";
+
 export interface DistillJob {
   id: string;
   store_key: string;
@@ -15,11 +19,22 @@ export interface DistillJob {
   error: string | null;
   created_at: string;
   updated_at: string;
+  priority: number;
+  origin: JobOrigin;
 }
 
 const BASE_BACKOFF_MS = 30_000;
 const MAX_BACKOFF_MS = 900_000;
 const MAX_ATTEMPTS = 8;
+
+/** Priority of a job auto-enqueued by the worker's periodic sweep
+ *  (src/distill/worker.ts's enqueueAll) — the default. */
+export const PRIORITY_PASSIVE = 0;
+/** Priority of a job enqueued on demand (falda_distill / POST /distill) —
+ *  higher than passive so it's claimed first and can trigger an immediate
+ *  wake (src/distill/worker.ts's wake()) rather than waiting for the next
+ *  scheduled drain tick. */
+export const PRIORITY_EXPLICIT = 10;
 
 export function initQueueSchema(db: Database.Database): void {
   db.exec(`
@@ -34,34 +49,86 @@ export function initQueueSchema(db: Database.Database): void {
       updated_at TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS idx_jobs_store_status ON distill_jobs(store_key, status);
-    CREATE INDEX IF NOT EXISTS idx_jobs_pending ON distill_jobs(status, next_attempt_at)
+  `);
+
+  // Migration: add priority/origin to pre-existing distill_jobs tables.
+  // Additive only — existing rows default to passive-sweep semantics, which
+  // matches how every job was enqueued before this feature existed.
+  const cols = (db.prepare("PRAGMA table_info(distill_jobs)").all() as any[]).map((r: any) => r.name);
+  if (!cols.includes("priority")) {
+    db.exec(`ALTER TABLE distill_jobs ADD COLUMN priority INTEGER NOT NULL DEFAULT ${PRIORITY_PASSIVE}`);
+  }
+  if (!cols.includes("origin")) {
+    db.exec(`ALTER TABLE distill_jobs ADD COLUMN origin TEXT NOT NULL DEFAULT 'sweep'`);
+  }
+
+  // Recreated (not IF NOT EXISTS-guarded at the old name) so upgrades from a
+  // pre-priority schema pick up the new sort key without a separate DROP.
+  db.exec(`
+    DROP INDEX IF EXISTS idx_jobs_pending;
+    CREATE INDEX IF NOT EXISTS idx_jobs_pending ON distill_jobs(status, priority, next_attempt_at)
       WHERE status='pending';
   `);
 }
 
-/** Enqueue a distillation job for a store. Coalesces: if a pending job already
- *  exists for this store_key, returns the existing id rather than creating a duplicate. */
-export function enqueue(db: Database.Database, storeKey: string): string {
+export interface EnqueueOptions {
+  priority?: number;
+  origin?: JobOrigin;
+}
+
+/**
+ * Enqueue a distillation job for a store. Coalesces: if a pending job
+ * already exists for this store_key, returns the existing id rather than
+ * creating a duplicate — EXCEPT if the incoming priority is higher than the
+ * existing pending job's, in which case the existing row is upgraded in
+ * place (priority + origin) so an explicit request jumps ahead of a passive
+ * one already queued, without creating a second row for the same store.
+ */
+export function enqueue(db: Database.Database, storeKey: string, opts: EnqueueOptions = {}): string {
+  const priority = opts.priority ?? PRIORITY_PASSIVE;
+  const origin = opts.origin ?? "sweep";
+
   const existing = db.prepare(
-    "SELECT id FROM distill_jobs WHERE store_key=? AND status='pending' LIMIT 1"
-  ).get(storeKey) as { id: string } | undefined;
-  if (existing) return existing.id;
+    "SELECT id, priority FROM distill_jobs WHERE store_key=? AND status='pending' LIMIT 1"
+  ).get(storeKey) as { id: string; priority: number } | undefined;
+  if (existing) {
+    if (priority > existing.priority) {
+      db.prepare(
+        "UPDATE distill_jobs SET priority=?,origin=?,updated_at=? WHERE id=?"
+      ).run(priority, origin, new Date().toISOString(), existing.id);
+    }
+    return existing.id;
+  }
 
   const id = `job-${storeKey}-${Date.now()}`;
   const now = new Date().toISOString();
   db.prepare(
-    `INSERT INTO distill_jobs(id,store_key,status,attempts,next_attempt_at,error,created_at,updated_at)
-     VALUES(?,?,'pending',0,?,null,?,?)`
-  ).run(id, storeKey, now, now, now);
+    `INSERT INTO distill_jobs(id,store_key,status,attempts,next_attempt_at,error,created_at,updated_at,priority,origin)
+     VALUES(?,?,'pending',0,?,null,?,?,?,?)`
+  ).run(id, storeKey, now, now, now, priority, origin);
   return id;
 }
 
-/** Claim the next ready pending job. Returns null if none are available. */
-export function claimNext(db: Database.Database): DistillJob | null {
+export interface ClaimOptions {
+  /** Only claim a job whose priority is >= this floor. Used by the wake path
+   *  (src/distill/worker.ts) to drain explicit-priority jobs without also
+   *  picking up passive-sweep jobs that should wait for the next tick. */
+  minPriority?: number;
+}
+
+/** Claim the next ready job, highest priority first (ties broken by
+ *  next_attempt_at). Returns null if none are available (or none meet
+ *  opts.minPriority). */
+export function claimNext(db: Database.Database, opts: ClaimOptions = {}): DistillJob | null {
   const now = new Date().toISOString();
+  const where = opts.minPriority !== undefined
+    ? "status='pending' AND next_attempt_at<=? AND priority>=?"
+    : "status='pending' AND next_attempt_at<=?";
+  const args = opts.minPriority !== undefined ? [now, opts.minPriority] : [now];
   const job = db.prepare(
-    `SELECT * FROM distill_jobs WHERE status='pending' AND next_attempt_at<=? ORDER BY next_attempt_at LIMIT 1`
-  ).get(now) as DistillJob | undefined;
+    `SELECT * FROM distill_jobs WHERE ${where}
+     ORDER BY priority DESC, next_attempt_at ASC, rowid ASC LIMIT 1`
+  ).get(...args) as DistillJob | undefined;
   if (!job) return null;
   db.prepare(
     "UPDATE distill_jobs SET status='running',attempts=attempts+1,updated_at=? WHERE id=?"
