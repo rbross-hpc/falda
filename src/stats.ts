@@ -23,15 +23,27 @@
  *
  * Usage:
  *   tsx src/stats.ts [--root=<dir>] [--tenant=<t>] [--pool=<p>]
- *                     [--section=stores|queue|recall|layout]
+ *                     [--section=stores|queue|recall|layout|timing]
  *                     [--json]
  *
  * Env (same precedence as src/runtime.ts, no other env required):
  *   FALDA_ROOT   Pool root dir (default ./falda-data)
+ *
+ * The "timing" section is the one exception to "offline, no running server
+ * needed": since-startup timing histograms (src/metrics.ts) live in the
+ * memory of a RUNNING `falda serve` process, not on disk, so this section
+ * fetches them from that process's /metrics route (src/gateway.ts) instead
+ * of reading a store file. It degrades gracefully (a warning, not a crash)
+ * when no server is reachable or no token is configured — every other
+ * section remains fully offline.
+ *   FALDA_URL    Base URL of the running falda server (default http://localhost:8077)
+ *   FALDA_TOKEN  Bearer token for the /metrics fetch (falls back to --token)
  */
 import Database from "better-sqlite3";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { MetricsSnapshot } from "./metrics.js";
+import { renderMetricsSnapshot } from "./metrics_render.js";
 
 // ─── types ──────────────────────────────────────────────────────────────────
 
@@ -101,7 +113,17 @@ export interface Warning {
   message: string;
 }
 
-export type Section = "stores" | "queue" | "recall" | "layout";
+export type Section = "stores" | "queue" | "recall" | "layout" | "timing";
+
+export interface TimingReport {
+  /** True only if a snapshot was successfully fetched from a running
+   *  server's /metrics route. False means "unavailable," not "empty." */
+  available: boolean;
+  /** Human-readable reason when !available (server unreachable, no token,
+   *  non-200 response, etc). Undefined when available. */
+  unavailable_reason?: string;
+  snapshot?: MetricsSnapshot;
+}
 
 export interface StatsReport {
   generated_at: string;
@@ -111,6 +133,7 @@ export interface StatsReport {
   queue: QueueReport;
   recall: RecallReport;
   layout: LayoutReport;
+  timing: TimingReport;
   warnings: Warning[];
 }
 
@@ -328,11 +351,50 @@ export interface StatsOptions {
   tenant?: string;
   pool?: string;
   sections?: Section[];
+  /** Base URL of a running falda server, for the "timing" section only
+   *  (default: FALDA_URL env or http://localhost:8077). */
+  url?: string;
+  /** Bearer token for the "timing" section's /metrics fetch (default:
+   *  FALDA_TOKEN env). */
+  token?: string;
 }
 
+// "timing" is deliberately NOT in the default section set: every other
+// section is a pure offline filesystem read, and a plain `falda stats`
+// (no --section) must keep working with no server running and no token —
+// timing is opt-in via --section=timing (or --section=...,timing).
 const ALL_SECTIONS = ["stores", "queue", "recall", "layout"] as const;
+const REQUESTABLE_SECTIONS = [...ALL_SECTIONS, "timing"] as const;
 
-export function buildStatsReport(opts: StatsOptions = {}): StatsReport {
+const DEFAULT_TIMING_UNAVAILABLE: TimingReport = { available: false, unavailable_reason: "not requested" };
+
+/** Fetch a MetricsSnapshot from a running server's /metrics route. Never
+ *  throws — network/auth/parse failures all resolve to `available: false`
+ *  with a human-readable reason, since a stats report must never crash
+ *  because the operator's env doesn't have a server up. */
+async function fetchTimingReport(url: string, token: string | undefined): Promise<TimingReport> {
+  const headers: Record<string, string> = {};
+  if (token) headers.authorization = `Bearer ${token}`;
+  let res: Response;
+  try {
+    res = await fetch(new URL("/metrics", url), { method: "POST", headers, body: "{}" });
+  } catch (e: any) {
+    return { available: false, unavailable_reason: `could not reach ${url} (${e?.message ?? e}) — is falda serve running?` };
+  }
+  if (res.status === 401 || res.status === 403) {
+    return { available: false, unavailable_reason: `${res.status} unauthorized — set FALDA_TOKEN or pass --token` };
+  }
+  if (res.status !== 200) {
+    return { available: false, unavailable_reason: `server returned ${res.status}` };
+  }
+  const body = await res.json().catch(() => null) as MetricsSnapshot | { error: string } | null;
+  if (!body || "error" in body) {
+    return { available: false, unavailable_reason: (body as any)?.error ?? "malformed /metrics response" };
+  }
+  return { available: true, snapshot: body as MetricsSnapshot };
+}
+
+export async function buildStatsReport(opts: StatsOptions = {}): Promise<StatsReport> {
   const root = opts.root ?? process.env.FALDA_ROOT ?? "./falda-data";
   const sections = opts.sections?.length ? opts.sections : [...ALL_SECTIONS];
   const warnings: Warning[] = [];
@@ -352,11 +414,21 @@ export function buildStatsReport(opts: StatsOptions = {}): StatsReport {
     ? inspectLayout(root, warnings)
     : { root, root_exists: fs.existsSync(root), queue_db: { path: "", present: false }, recall_traces_db: { path: "", present: false }, pools_json: { path: "", present: false, pool_count: 0 }, embedding_lock: { path: "", present: false }, tokens_file: { path: "", present: false } };
 
+  let timing = DEFAULT_TIMING_UNAVAILABLE;
+  if (sections.includes("timing")) {
+    const url = opts.url ?? process.env.FALDA_URL ?? "http://localhost:8077";
+    const token = opts.token ?? process.env.FALDA_TOKEN;
+    timing = await fetchTimingReport(url, token);
+    if (!timing.available) {
+      warnings.push({ level: "warn", message: `timing section unavailable: ${timing.unavailable_reason}` });
+    }
+  }
+
   if (allStores.length === 0 && sections.includes("stores")) {
     warnings.push({ level: "warn", message: `no stores found under ${root} (no tenants/, no declared pools) — has anything been written yet?` });
   }
 
-  return { generated_at: new Date().toISOString(), root, sections, stores, queue, recall, layout, warnings };
+  return { generated_at: new Date().toISOString(), root, sections, stores, queue, recall, layout, timing, warnings };
 }
 
 // ─── human-readable rendering ───────────────────────────────────────────────
@@ -425,6 +497,15 @@ export function renderHuman(report: StatsReport): string {
     lines.push(`  token file:        ${report.layout.tokens_file.present ? "present" : "absent"} (${report.layout.tokens_file.path})`);
   }
 
+  if (report.sections.includes("timing")) {
+    lines.push("", "## Timing (live server, since process startup)");
+    if (!report.timing.available) {
+      lines.push(`  (unavailable — ${report.timing.unavailable_reason})`);
+    } else {
+      for (const line of renderMetricsSnapshot(report.timing.snapshot!).split("\n")) lines.push(`  ${line}`);
+    }
+  }
+
   if (report.warnings.length) {
     lines.push("", "## Warnings");
     for (const w of report.warnings) lines.push(`  [${w.level.toUpperCase()}] ${w.message}`);
@@ -444,11 +525,13 @@ function parseArgs(argv: string[]): StatsOptions & { json: boolean } {
     else if (arg.startsWith("--root=")) opts.root = arg.slice("--root=".length);
     else if (arg.startsWith("--tenant=")) opts.tenant = arg.slice("--tenant=".length);
     else if (arg.startsWith("--pool=")) opts.pool = arg.slice("--pool=".length);
+    else if (arg.startsWith("--url=")) opts.url = arg.slice("--url=".length);
+    else if (arg.startsWith("--token=")) opts.token = arg.slice("--token=".length);
     else if (arg.startsWith("--section=")) {
       const requested = arg.slice("--section=".length).split(",").map((s) => s.trim());
       for (const s of requested) {
-        if (!(ALL_SECTIONS as readonly string[]).includes(s)) {
-          console.error(`falda stats: unknown --section '${s}' (valid: ${ALL_SECTIONS.join(", ")})`);
+        if (!(REQUESTABLE_SECTIONS as readonly string[]).includes(s)) {
+          console.error(`falda stats: unknown --section '${s}' (valid: ${REQUESTABLE_SECTIONS.join(", ")})`);
           process.exit(1);
         }
       }
@@ -456,7 +539,9 @@ function parseArgs(argv: string[]): StatsOptions & { json: boolean } {
     } else if (arg === "--help" || arg === "-h") {
       console.log(
         "Usage: falda stats [--root=DIR] [--tenant=T] [--pool=P] " +
-        "[--section=stores|queue|recall|layout[,...]] [--json]",
+        "[--section=stores|queue|recall|layout|timing[,...]] [--json]\n" +
+        "  --section=timing requires a running `falda serve` — --url=BASE / FALDA_URL\n" +
+        "  and --token=TOK / FALDA_TOKEN (default url http://localhost:8077).",
       );
       process.exit(0);
     } else {
@@ -470,12 +555,13 @@ function parseArgs(argv: string[]): StatsOptions & { json: boolean } {
 const IS_MAIN = process.argv[1]?.endsWith("stats.js") || process.argv[1]?.endsWith("stats.ts");
 if (IS_MAIN) {
   const { json, ...statsOpts } = parseArgs(process.argv.slice(2));
-  const report = buildStatsReport(statsOpts);
-  if (json) {
-    console.log(JSON.stringify(report, null, 2));
-  } else {
-    console.log(renderHuman(report));
-  }
-  const hasErrors = report.warnings.some((w) => w.level === "error");
-  process.exitCode = hasErrors ? 1 : 0;
+  buildStatsReport(statsOpts).then((report) => {
+    if (json) {
+      console.log(JSON.stringify(report, null, 2));
+    } else {
+      console.log(renderHuman(report));
+    }
+    const hasErrors = report.warnings.some((w) => w.level === "error");
+    process.exitCode = hasErrors ? 1 : 0;
+  }).catch((e) => { console.error(e); process.exitCode = 1; });
 }
