@@ -153,10 +153,13 @@ uses any OpenAI-compatible chat model to:
 
 Distillation is triggered two ways, both landing in one priority queue drained
 by the single in-process worker inside `falda serve`:
-- **Passive**: a sweep timer auto-enqueues every known self-store
-  (`FALDA_SWEEP_INTERVAL_MS`, default 5 min), and a separate drain timer
-  (`FALDA_DRAIN_INTERVAL_MS`, default 1 min) processes one ready job per tick —
-  distillation runs continuously with no external trigger required.
+- **Passive**: a sweep timer (`FALDA_SWEEP_INTERVAL_MS`, default 5 min)
+  auto-enqueues every known self-store that has an undistilled turn
+  (comparing the store's latest turn to its distillation watermark — a
+  store with nothing new since its last pass is skipped, not re-enqueued),
+  and a separate drain timer (`FALDA_DRAIN_INTERVAL_MS`, default 1 min)
+  processes one ready job per tick — distillation runs continuously with no
+  external trigger required, without wasting drain ticks on idle stores.
 - **Explicit**: a `POST /distill` HTTP call or the `falda_distill` MCP tool
   enqueues at a higher priority than passive jobs (so it's claimed first) and
   immediately wakes the worker to drain it, rather than waiting for the next

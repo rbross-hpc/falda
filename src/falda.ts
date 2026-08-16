@@ -597,6 +597,17 @@ export class Falda {
     ).all(afterSeq, p.limit ?? 50) as StreamTurn[];
   }
 
+  /**
+   * The highest `seq` in the stream (0 for an empty store). Cheap indexed
+   * aggregate — used to decide whether a store has ANY undistilled turn by
+   * comparing against the distillation watermark, without reading the
+   * turns themselves (src/distill/worker.ts's sweep gate).
+   */
+  streamHeadSeq(): number {
+    const row = this.db.prepare("SELECT COALESCE(MAX(seq),0) AS m FROM stream").get() as { m: number };
+    return row.m;
+  }
+
   async searchStream(query: string, limit = 10): Promise<StreamHit[]> {
     return this.hybridStream(query, limit);
   }

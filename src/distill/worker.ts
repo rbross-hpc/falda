@@ -7,11 +7,19 @@
  * worker" process required.
  *
  * Three responsibilities, on TWO independent timers:
- *   1. Enqueue (sweep): discover every self-store on disk and enqueue it at
- *      PASSIVE priority (coalescing dedups so a tenant with a pending job is
- *      never double-queued). This makes distillation happen automatically
- *      with no external trigger. Runs on sweepIntervalMs — deliberately
- *      slower than the drain, since sweeping is cheap discovery, not work.
+ *   1. Enqueue (sweep): discover every self-store on disk and enqueue, at
+ *      PASSIVE priority, only those with an undistilled turn — i.e.
+ *      streamHeadSeq() > the store's distillation watermark (never-
+ *      distilled stores have no watermark row, treated as 0, so a store
+ *      with any turns at all enqueues once; a backlogged store whose
+ *      watermark trails its head stays enqueued across sweeps until it
+ *      catches up). A store with nothing new since its last pass is
+ *      skipped entirely — no queue row, no wasted drain tick (coalescing
+ *      also dedups, so a tenant with a pending job is never double-queued).
+ *      This makes distillation happen automatically with no external
+ *      trigger, without enqueuing idle stores. Runs on sweepIntervalMs —
+ *      deliberately slower than the drain, since sweeping is cheap
+ *      discovery, not work.
  *   2. Drain: claim the next ready job (highest priority first — see
  *      src/distill/queue.ts) and run distillOnce() against its store. Runs
  *      on drainIntervalMs, ONE job per tick — this is the passive-backlog
@@ -47,6 +55,7 @@ import type { LLMFnWithModel } from "./llm.js";
 import { claimNext, completeJob, failJob, enqueue, storeKeyFor, type DistillJob, PRIORITY_EXPLICIT } from "./queue.js";
 import { distillOnce } from "./core.js";
 import { PROMPT_VERSION } from "./prompts.js";
+import { getWatermark, initWatermarkSchema } from "./watermark.js";
 import { pruneRecallTraces, resolveRetentionDays } from "../recall/retention.js";
 import type { MetricsRegistry } from "../metrics.js";
 
@@ -180,19 +189,47 @@ export function startDistiller(
     }
   };
 
-  // Enqueue: discover every self-store on disk and enqueue it at passive
-  // priority (the default — see src/distill/queue.ts's PRIORITY_PASSIVE).
+  // Enqueue: discover every self-store on disk and enqueue, at passive
+  // priority (see src/distill/queue.ts's PRIORITY_PASSIVE), only those with
+  // an undistilled turn (streamHeadSeq() > watermark). A store with nothing
+  // new since its last pass is skipped — no queue row, no wasted drain
+  // tick. Fail-open on a read error for one store: enqueue it rather than
+  // risk silently stranding it (the coalescing enqueue() below is cheap and
+  // idempotent, so a false-positive enqueue costs at most one no-op drain).
   const enqueueAll = () => {
     const tenants = pools.listSelfTenants();
+    let enqueued = 0;
     for (const tenant of tenants) {
+      const storeKey = storeKeyFor(tenant, undefined);
       try {
-        enqueue(queueDb, storeKeyFor(tenant, undefined));
+        const store = pools.resolve(tenant, undefined, false);
+        let hasNewTurns: boolean;
+        try {
+          const db = (store as any).db as import("better-sqlite3").Database;
+          // A store that has never been distilled has no distill_watermark
+          // table yet — initialize it (idempotent, matches distillOnce's own
+          // call) rather than treating "table missing" as a read failure.
+          initWatermarkSchema(db);
+          const head = store.streamHeadSeq();
+          const wm = getWatermark(db, storeKey);
+          hasNewTurns = head > (wm?.last_processed_seq ?? 0);
+        } catch (e) {
+          console.error(`[falda-worker] sweep gate check failed for ${tenant}, enqueuing anyway:`, e);
+          hasNewTurns = true;
+        }
+        if (hasNewTurns) {
+          enqueue(queueDb, storeKey);
+          enqueued++;
+        }
       } catch (e) {
         console.error(`[falda-worker] enqueue failed for tenant ${tenant}:`, e);
       }
     }
     if (tenants.length > 0) {
-      console.log(`[falda-worker] enqueued ${tenants.length} self-store(s): ${tenants.join(", ")}`);
+      console.log(
+        `[falda-worker] swept ${tenants.length} self-store(s): ${enqueued} enqueued, ` +
+        `${tenants.length - enqueued} up-to-date`,
+      );
     }
   };
 
