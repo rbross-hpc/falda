@@ -8,6 +8,7 @@
 import { z } from "zod";
 import type { PoolManager } from "../pools.js";
 import { TokenStore, parseBearer, type Principal } from "../mcp_auth.js";
+import type { MetricsRegistry } from "../metrics.js";
 
 export interface RequestCtx { tenant: string; principal: Principal; }
 
@@ -16,6 +17,15 @@ export interface ToolDeps {
   tokenStore: TokenStore;
   queueDb?: import("better-sqlite3").Database;
   recallTraceDb?: import("better-sqlite3").Database;
+  /** Since-startup timing histograms (src/metrics.ts). Undefined only in
+   *  tests that don't wire a registry — instrumentation is best-effort. */
+  metrics?: MetricsRegistry;
+  /** Immediately drains ready explicit-priority distill jobs — see
+   *  src/distill/worker.ts's wake(). Undefined for the legacy standalone
+   *  `falda mcp` entry point, which has no worker of its own; falda_distill
+   *  still enqueues correctly, it just falls back to whatever process (if
+   *  any) owns the shared queue's timed drain. */
+  wakeDistiller?: () => void;
 }
 
 export const poolArg = z.string().optional().describe(

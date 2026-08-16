@@ -55,12 +55,18 @@ import type { PoolManager } from "../pools.js";
 import { TokenStore, AuthError, parseBearer } from "../mcp_auth.js";
 import { toolsFor, resolveToolset, type ToolsetName } from "./registry.js";
 import type { ToolDeps } from "./context.js";
+import type { MetricsRegistry } from "../metrics.js";
 
 export interface McpServerOpts {
   toolset?: ToolsetName;
   /** Recall-trace store (src/recall/). Omit to disable trace capture for
    *  this server instance — falda_recall still works, just untraced. */
   recallTraceDb?: Database.Database;
+  /** Since-startup timing histograms (src/metrics.ts). */
+  metrics?: MetricsRegistry;
+  /** Immediately drains ready explicit-priority distill jobs — see
+   *  src/distill/worker.ts's wake() and src/runtime.ts's wakeDistiller. */
+  wakeDistiller?: () => void;
 }
 
 export function makeFaldaMcpServer(
@@ -70,7 +76,12 @@ export function makeFaldaMcpServer(
   opts?: McpServerOpts,
 ): McpServer {
   const server = new McpServer({ name: "falda", version: "0.1.0" });
-  const deps: ToolDeps = { pools, tokenStore, queueDb, recallTraceDb: opts?.recallTraceDb };
+  const deps: ToolDeps = {
+    pools, tokenStore, queueDb,
+    recallTraceDb: opts?.recallTraceDb,
+    metrics: opts?.metrics,
+    wakeDistiller: opts?.wakeDistiller,
+  };
   const toolset = resolveToolset(opts?.toolset);
   for (const register of toolsFor(toolset)) register(server, deps);
   return server;

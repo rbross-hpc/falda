@@ -43,6 +43,7 @@ import { TokenStore, requireTokenFile } from "./mcp_auth.js";
 import { initQueueSchema } from "./distill/queue.js";
 import { makeLLM, type LLMFnWithModel } from "./distill/llm.js";
 import { initRecallTraceSchema } from "./recall/schema.js";
+import { MetricsRegistry } from "./metrics.js";
 
 export interface RuntimeConfig {
   root?: string;
@@ -59,6 +60,19 @@ export interface FaldaRuntime {
   queueDb: Database.Database;
   recallTraceDb: Database.Database;
   llm: LLMFnWithModel;
+  /** Since-startup timing histograms (src/metrics.ts) — shared by every
+   *  surface (HTTP, MCP, distillation worker) so /metrics reflects the
+   *  whole process's activity, not one surface's. */
+  metrics: MetricsRegistry;
+  /** Set by src/server.ts (and the legacy gateway.ts entry point) once the
+   *  distillation worker has started, since the worker itself is
+   *  constructed AFTER the runtime (it needs runtime.queueDb). Calling it
+   *  drains ready explicit-priority distill jobs immediately rather than
+   *  waiting for the next timed drain tick — see src/distill/worker.ts's
+   *  wake(). Undefined if no worker is running in this process (e.g. a
+   *  bare MCP-only or HTTP-only legacy entry point) — callers must treat
+   *  it as optional and simply fall back to the timed drain in that case. */
+  wakeDistiller?: () => void;
   close(): void;
 }
 
@@ -115,8 +129,9 @@ export async function buildRuntime(cfg: RuntimeConfig = {}): Promise<FaldaRuntim
   initRecallTraceSchema(recallTraceDb);
 
   const llm = makeLLM();
+  const metrics = new MetricsRegistry();
 
-  return {
+  const runtime: FaldaRuntime = {
     root,
     dim,
     pools,
@@ -124,10 +139,13 @@ export async function buildRuntime(cfg: RuntimeConfig = {}): Promise<FaldaRuntim
     queueDb,
     recallTraceDb,
     llm,
+    metrics,
+    wakeDistiller: undefined,
     close() {
       pools.closeAll();
       queueDb.close();
       recallTraceDb.close();
     },
   };
+  return runtime;
 }
