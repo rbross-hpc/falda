@@ -17,9 +17,10 @@ import * as path from "node:path";
 import { PoolManager } from "../src/pools.js";
 import { makeLocalEmbedder } from "../src/embedder.js";
 import {
-  initQueueSchema, enqueue, getJob, PRIORITY_EXPLICIT, PRIORITY_PASSIVE,
+  initQueueSchema, enqueue, getJob, listJobs, PRIORITY_EXPLICIT, PRIORITY_PASSIVE,
 } from "../src/distill/queue.js";
 import { startDistiller, resolveWorkerIntervals } from "../src/distill/worker.js";
+import { initWatermarkSchema, setWatermark } from "../src/distill/watermark.js";
 import { MetricsRegistry } from "../src/metrics.js";
 import type { LLMFnWithModel } from "../src/distill/llm.js";
 
@@ -249,6 +250,138 @@ describe("startDistiller: metrics instrumentation", () => {
         distiller.wake();
         await waitFor(() => metrics.distill_service_ms.snapshot().count > 0, 2000);
         assert.equal(metrics.distill_service_ms.snapshot().count, 1);
+      } finally {
+        distiller.stop();
+      }
+    } finally { cleanup(root); }
+  });
+});
+
+describe("startDistiller: sweep gate (only enqueue stores with undistilled turns)", () => {
+  test("a store with no turns at all is never enqueued by the sweep", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      pools.resolve("proj-empty", undefined, true); // materialize, zero turns
+
+      const distiller = startDistiller(queueDb, pools, failingLlm, undefined, {
+        drainIntervalMs: 60_000, sweepIntervalMs: 20,
+      });
+      try {
+        // Give a couple of sweep ticks a chance to run.
+        await new Promise((r) => setTimeout(r, 100));
+        assert.equal(listJobs(queueDb, "proj-empty:self").length, 0, "no job ever created for an empty store");
+      } finally {
+        distiller.stop();
+      }
+    } finally { cleanup(root); }
+  });
+
+  test("a never-distilled store with turns is enqueued once (no watermark row = seq 0)", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      const store = pools.resolve("proj-new", undefined, true);
+      await store.addStream("sess-1", [{ role: "user", content: "first turn ever" }]);
+
+      const distiller = startDistiller(queueDb, pools, failingLlm, undefined, {
+        drainIntervalMs: 60_000, sweepIntervalMs: 20,
+      });
+      try {
+        const enqueuedOk = await waitFor(() => listJobs(queueDb, "proj-new:self").length > 0, 1000);
+        assert.ok(enqueuedOk, "never-distilled store with turns is enqueued");
+      } finally {
+        distiller.stop();
+      }
+    } finally { cleanup(root); }
+  });
+
+  test("a store fully caught up (watermark == head) is NOT re-enqueued by later sweeps", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      const store = pools.resolve("proj-caughtup", undefined, true);
+      await store.addStream("sess-1", [{ role: "user", content: "already distilled turn" }]);
+      // Simulate "already fully distilled": watermark == head seq.
+      const db = (store as any).db;
+      initWatermarkSchema(db);
+      const head = store.streamHeadSeq();
+      setWatermark(db, "proj-caughtup:self", "some-turn-id", new Date().toISOString(), head);
+
+      const distiller = startDistiller(queueDb, pools, failingLlm, undefined, {
+        drainIntervalMs: 60_000, sweepIntervalMs: 15,
+      });
+      try {
+        // Let several sweep ticks pass.
+        await new Promise((r) => setTimeout(r, 120));
+        assert.equal(listJobs(queueDb, "proj-caughtup:self").length, 0, "caught-up store stays un-enqueued");
+      } finally {
+        distiller.stop();
+      }
+    } finally { cleanup(root); }
+  });
+
+  test("a backlogged store (watermark behind head) stays enqueued across sweeps until caught up", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      const store = pools.resolve("proj-backlog", undefined, true);
+      await store.addStream("sess-1", [
+        { role: "user", content: "turn one" },
+        { role: "user", content: "turn two" },
+      ]);
+      const db = (store as any).db;
+      initWatermarkSchema(db);
+      // Watermark behind head: only "turn one" processed so far.
+      setWatermark(db, "proj-backlog:self", "turn-one-id", new Date().toISOString(), 1);
+
+      const distiller = startDistiller(queueDb, pools, failingLlm, undefined, {
+        drainIntervalMs: 60_000, sweepIntervalMs: 20,
+      });
+      try {
+        const enqueuedOk = await waitFor(() => listJobs(queueDb, "proj-backlog:self").length > 0, 1000);
+        assert.ok(enqueuedOk, "backlogged store is enqueued even though it has been distilled before");
+      } finally {
+        distiller.stop();
+      }
+    } finally { cleanup(root); }
+  });
+
+  test("mixed fleet: only stores with undistilled turns are enqueued in one sweep", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+
+      pools.resolve("proj-idle", undefined, true); // no turns at all
+
+      const caughtUp = pools.resolve("proj-caught", undefined, true);
+      await caughtUp.addStream("sess-1", [{ role: "user", content: "old news" }]);
+      const caughtDb = (caughtUp as any).db;
+      initWatermarkSchema(caughtDb);
+      setWatermark(caughtDb, "proj-caught:self", "id", new Date().toISOString(), caughtUp.streamHeadSeq());
+
+      const fresh = pools.resolve("proj-fresh", undefined, true);
+      await fresh.addStream("sess-1", [{ role: "user", content: "brand new turn" }]);
+
+      const distiller = startDistiller(queueDb, pools, failingLlm, undefined, {
+        drainIntervalMs: 60_000, sweepIntervalMs: 20,
+      });
+      try {
+        const ok = await waitFor(() => listJobs(queueDb, "proj-fresh:self").length > 0, 1000);
+        assert.ok(ok, "fresh store gets enqueued");
+        await new Promise((r) => setTimeout(r, 60)); // let a couple more ticks pass
+        assert.equal(listJobs(queueDb, "proj-idle:self").length, 0, "idle store never enqueued");
+        assert.equal(listJobs(queueDb, "proj-caught:self").length, 0, "caught-up store never enqueued");
       } finally {
         distiller.stop();
       }

@@ -966,7 +966,16 @@ priority levels:
 
 - **Passive** (`PRIORITY_PASSIVE`, the default): a **sweep timer**
   (`FALDA_SWEEP_INTERVAL_MS`, default 5 min) auto-enqueues every known
-  self-store.
+  self-store that has at least one undistilled turn — i.e.
+  `Falda.streamHeadSeq() > the store's distill_watermark.last_processed_seq`
+  (a never-distilled store has no watermark row, treated as seq 0, so any
+  store with turns at all enqueues on its first sweep; a store whose
+  watermark has caught up to its head is skipped, not re-enqueued, until a
+  new turn arrives; a backlogged store — head still ahead of watermark
+  after a pass, e.g. more turns than one `windowSize` — stays enqueued
+  across sweeps until it catches up). A store's own gate check failing
+  (e.g. a transient read error) fails OPEN — it enqueues anyway rather than
+  risk silently stranding that store.
 - **Explicit** (`PRIORITY_EXPLICIT`): the gateway's `POST /distill` route or
   the MCP tool `falda_distill`. An explicit enqueue that coalesces with an
   already-pending passive job for the same store *upgrades* that job's

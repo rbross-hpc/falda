@@ -187,3 +187,25 @@ describe("distill watermark: seq-based cursor", () => {
     } finally { cleanup(s, blobDir); }
   });
 });
+
+describe("Falda.streamHeadSeq", () => {
+  test("returns 0 for an empty store", () => {
+    const { s, blobDir } = makeStore();
+    try {
+      assert.equal(s.streamHeadSeq(), 0);
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("returns the highest seq after turns are added", async () => {
+    const { s, blobDir } = makeStore();
+    try {
+      await s.addStream("sess-1", [
+        { role: "user", content: "first" },
+        { role: "user", content: "second" },
+      ]);
+      assert.equal(s.streamHeadSeq(), 2);
+      await s.addStream("sess-2", [{ role: "user", content: "third" }]);
+      assert.equal(s.streamHeadSeq(), 3, "seq is global across sessions, monotonically increasing");
+    } finally { cleanup(s, blobDir); }
+  });
+});
