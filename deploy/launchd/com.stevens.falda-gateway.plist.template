@@ -7,16 +7,28 @@
          better-sqlite3` (native ABI). Mismatch => ERR_DLOPEN_FAILED. -->
     <string>REPLACE_ME_NODE</string>
     <string>REPLACE_ME_FALDA_CHECKOUT/node_modules/.bin/tsx</string>
-    <string>REPLACE_ME_FALDA_CHECKOUT/src/gateway.ts</string>
+    <!-- src/server.ts is the unified server (falda serve): HTTP API (:8077),
+         MCP endpoint (:8079), and distillation worker, one shared runtime.
+         See bin/falda's `serve` help for the flag that disables the MCP
+         listener (HTTP API + worker only), if ever needed here. -->
+    <string>REPLACE_ME_FALDA_CHECKOUT/src/server.ts</string>
   </array>
   <key>WorkingDirectory</key><string>REPLACE_ME_FALDA_CHECKOUT</string>
   <key>EnvironmentVariables</key><dict>
     <key>PATH</key><string>REPLACE_ME_NODE_BINDIR:/usr/bin:/bin</string>
-    <key>FALDA_DB</key><string>REPLACE_ME_HOME/.falda/falda.db</string>
-    <key>FALDA_BLOBS</key><string>REPLACE_ME_HOME/.falda/blobs</string>
+    <!-- FALDA_ROOT: pool root dir (tenants/, pools/, distill_queue.db, etc.) —
+         falda serve addresses stores through this + the pool layer, not a
+         single FALDA_DB file. See docs/POOLS.md. -->
+    <key>FALDA_ROOT</key><string>REPLACE_ME_HOME/.falda/data</string>
     <key>FALDA_EMBED</key><string>local</string>
     <!-- FALDA_EMBED: 'local' for embedded model, 'remote' for API; see INSTALL -->
     <key>FALDA_PORT</key><string>8077</string>
+    <key>FALDA_MCP_PORT</key><string>8079</string>
+    <!-- FALDA_TOKENS: falda serve refuses to boot without a valid token file
+         — see docs/API.md "Authentication". Create it before first load:
+         cp falda_tokens.example.json REPLACE_ME_HOME/.falda/falda_tokens.json
+         then replace the placeholder tokens (openssl rand -hex 24). -->
+    <key>FALDA_TOKENS</key><string>REPLACE_ME_HOME/.falda/falda_tokens.json</string>
   </dict>
   <key>StandardOutPath</key><string>REPLACE_ME_HOME/.falda/gateway.log</string>
   <key>StandardErrorPath</key><string>REPLACE_ME_HOME/.falda/gateway.log</string>
