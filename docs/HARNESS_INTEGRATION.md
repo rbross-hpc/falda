@@ -333,7 +333,7 @@ one used for `npm install`/`npm rebuild better-sqlite3`),
 |---|---|---|---|
 | `com.stevens.nats-broker.plist.template` | `com.stevens.nats-broker` | `/opt/homebrew/bin/nats-server` | Broker itself; Kukla's host |
 | `com.stevens.nats-subscriber.plist.template` | `com.stevens.nats-subscriber` | sibline venv Python 3.13 | Needs `nats-py`; 3.11+ isoformat native |
-| `com.stevens.falda-gateway.plist.template` | `com.stevens.falda-gateway` | Pinned `node` (same as `npm rebuild`) | ABI must match — see `REPLACE_ME_NODE` |
+| `com.stevens.falda-gateway.plist.template` | `com.stevens.falda-gateway` | Pinned `node` (same as `npm rebuild`) | ABI must match — see `REPLACE_ME_NODE`. Runs the unified `falda serve` (`src/server.ts`): HTTP API on `:8077` **and** MCP on `:8079`, plus the distillation worker — despite the "gateway" label, which is kept for install continuity. |
 | `com.stevens.falda-tap.plist.template` | `com.stevens.falda-tap` | `/usr/bin/python3` (system) | stdlib only, no deps |
 
 > **Why three interpreters?** Deliberately different: the broker is a Go binary;
@@ -364,12 +364,14 @@ gateway runs pinned Node (native ABI dependency via `better-sqlite3`). Do not
    nvm use 24                            # pin the node you'll run under
    npm ci
    npm rebuild better-sqlite3           # SAME node as runtime (ABI must match)
-   mkdir -p ~/.falda/blobs
+   mkdir -p ~/.falda/data
+   cp falda_tokens.example.json ~/.falda/falda_tokens.json   # fill in real tokens
    cp deploy/launchd/com.stevens.falda-gateway.plist.template \
       ~/Library/LaunchAgents/com.stevens.falda-gateway.plist
    # set REPLACE_ME_NODE = $(which node) under the pinned nvm version
    launchctl load ~/Library/LaunchAgents/com.stevens.falda-gateway.plist
    curl -s localhost:8077/healthz       # {"ok":true,...}
+   curl -s localhost:8079/healthz       # {"ok":true,"mcp":true} -- MCP endpoint
 
 3. Sibline subscriber (Hermes side):
    python3.13 -m venv ~/.hermes/venvs/sibline
