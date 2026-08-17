@@ -386,7 +386,18 @@ export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
       try {
         const context = await callFaldaAutoRecall(creds, query, AUTO_RECALL_TIMEOUT_MS);
         if (!context) return;
+        // opencode stamps id/sessionID/messageID onto its own parts *before*
+        // firing chat.message, then persists whatever's in output.parts
+        // afterward without re-stamping — so a plugin-appended part needs
+        // all three aggregate fields itself, or opencode's decode step
+        // rejects it (logged as "invalid user part before save") and it's
+        // silently dropped from persisted history (though the LLM still
+        // sees it for this turn). `id` only needs the "prt" prefix opencode
+        // requires; it doesn't need to match opencode's own ID format.
         output.parts.push({
+          id: `prt_${crypto.randomUUID().replace(/-/g, "")}`,
+          sessionID: (output.message as any)?.sessionID ?? sessionID,
+          messageID: output.message.id,
           type: "text",
           text: `<falda-auto-recall>\nThe following memory context was retrieved automatically for this task ` +
             `(smaller budget than an explicit falda_recall call — call falda_recall yourself for a deeper search):\n\n` +
