@@ -159,6 +159,14 @@ by the single in-process worker inside `falda serve`:
   immediately wakes the worker to drain it, rather than waiting for the next
   drain tick.
 
+**Crash recovery:** a claimed job holds a time-limited lease
+(`FALDA_DISTILL_LEASE_MS`, default 10 min). If the process claiming a job
+crashes or is killed before finishing it, the job doesn't stay stuck
+`running` forever — once its lease expires it becomes claimable again (by
+the next claim on this or a restarted process), and `falda serve` also
+proactively recovers any already-expired leases on startup, before its
+first sweep/drain tick.
+
 ```bash
 # Trigger a distillation pass on demand (falda serve must be running):
 curl -s -X POST http://localhost:8077/distill \
@@ -177,6 +185,7 @@ curl -s -X POST http://localhost:8077/distill \
 | `FALDA_DRAIN_INTERVAL_MS`  | `60000`                  | how often the worker drains one ready job from the queue |
 | `FALDA_SWEEP_INTERVAL_MS`  | `300000`                 | how often the worker auto-enqueues every self-store, and prunes `recall_traces.db` |
 | `FALDA_WORKER_INTERVAL_MS` | *(unset)*                | **deprecated**: sets both of the above when they're unset — set the split vars instead |
+| `FALDA_DISTILL_LEASE_MS`   | `600000`                 | how long a claimed distillation job's lease lasts before it's considered abandoned (e.g. by a crashed process) and reclaimable by the next claim — see "Crash recovery" below |
 
 ---
 

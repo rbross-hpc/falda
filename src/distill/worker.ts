@@ -44,15 +44,35 @@
  * along with the slow sweep tick rather than the fast drain tick.
  *
  * Env (resolved by callers — src/server.ts, src/gateway.ts — not here;
- * startDistiller() takes already-resolved millisecond values):
+ *   startDistiller() takes already-resolved millisecond values):
  *   FALDA_DRAIN_INTERVAL_MS  Drain cadence (default 60000).
  *   FALDA_SWEEP_INTERVAL_MS  Passive-enqueue + prune cadence (default 300000).
  *   FALDA_WORKER_INTERVAL_MS Deprecated: sets both when the above are unset.
+ *   FALDA_DISTILL_LEASE_MS   Claim lease duration (default 600000 / 10min) —
+ *                            how long a claimed job may run before a crashed
+ *                            worker's claim is considered abandoned and the
+ *                            job becomes reclaimable (src/distill/queue.ts's
+ *                            claimNext/recoverStaleJobs). See
+ *                            docs/future/reliability-hardening.md finding 3.
+ *
+ * Crash recovery: on startup, before the first sweep/drain tick, this module
+ * resets any 'running' job whose lease has already expired back to
+ * 'pending' (recoverStaleJobs) — a job orphaned by a previous process crash
+ * or kill -9 is picked up again instead of remaining stuck forever. Every
+ * claim (drain and wake alike) stamps a fresh lease_until and this process's
+ * worker_id; a job outliving its lease without completeJob()/failJob() is
+ * itself reclaimable by the next claimNext() call, so recovery does not
+ * strictly require the startup pass to run — it just avoids waiting out a
+ * long-idle sweep interval before an orphaned job becomes visible again.
  */
 import type { Database as DatabaseType } from "better-sqlite3";
+import { randomUUID } from "node:crypto";
 import type { PoolManager } from "../pools.js";
 import type { LLMFnWithModel } from "./llm.js";
-import { claimNext, completeJob, failJob, enqueue, storeKeyFor, type DistillJob, PRIORITY_EXPLICIT } from "./queue.js";
+import {
+  claimNext, completeJob, failJob, enqueue, storeKeyFor, recoverStaleJobs,
+  type DistillJob, PRIORITY_EXPLICIT, DEFAULT_LEASE_MS,
+} from "./queue.js";
 import { distillOnce } from "./core.js";
 import { PROMPT_VERSION } from "./prompts.js";
 import { getWatermark, initWatermarkSchema } from "./watermark.js";
@@ -93,6 +113,9 @@ export interface DistillerOptions {
   /** Shared timing histograms (src/metrics.ts). Omit to disable
    *  instrumentation (e.g. in tests that don't care about timing). */
   metrics?: MetricsRegistry;
+  /** Claim lease duration, ms. Defaults to FALDA_DISTILL_LEASE_MS or
+   *  DEFAULT_LEASE_MS (10min) when omitted. See src/distill/queue.ts. */
+  leaseMs?: number;
 }
 
 /**
@@ -133,6 +156,18 @@ export function startDistiller(
   const sweepIntervalMs = opts.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
   const retentionDays = opts.recallTraceRetentionDays
     ?? resolveRetentionDays(process.env.FALDA_RECALL_TRACE_RETENTION_DAYS);
+  const leaseMs = opts.leaseMs
+    ?? Number(process.env.FALDA_DISTILL_LEASE_MS ?? DEFAULT_LEASE_MS);
+  // One id per process boot — recorded on claimed jobs for observability
+  // (falda distill inspect / stats), not used for ownership enforcement.
+  const workerId = randomUUID();
+
+  // Recover jobs orphaned by a previous crash (stuck 'running' past their
+  // lease) before the first sweep/drain tick — see the module doc comment.
+  const recovered = recoverStaleJobs(queueDb);
+  if (recovered > 0) {
+    console.log(`[falda-worker] recovered ${recovered} job(s) stranded 'running' by a previous crash`);
+  }
 
   // Run one claimed job to completion: distillOnce + completeJob/failJob,
   // observing pending/service time into the shared histograms. Shared by
@@ -169,7 +204,7 @@ export function startDistiller(
   // priority first. This is the passive-backlog throughput ceiling — a
   // multi-tenant sweep backlog drains at one tenant per drainIntervalMs.
   const drain = async () => {
-    const job = claimNext(queueDb);
+    const job = claimNext(queueDb, { leaseMs, workerId });
     if (!job) return;
     await runJob(job);
   };
@@ -184,7 +219,7 @@ export function startDistiller(
     waking = true;
     try {
       for (let i = 0; i < MAX_WAKE_DRAIN_PER_CALL; i++) {
-        const job = claimNext(queueDb, { minPriority: PRIORITY_EXPLICIT });
+        const job = claimNext(queueDb, { minPriority: PRIORITY_EXPLICIT, leaseMs, workerId });
         if (!job) break;
         await runJob(job);
       }

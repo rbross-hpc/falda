@@ -92,6 +92,71 @@ describe("resolveWorkerIntervals", () => {
   });
 });
 
+describe("startDistiller: crash recovery on startup", () => {
+  test("a job stranded 'running' by a previous crash is recovered and re-drained on this boot", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      pools.resolve("proj-x", undefined, true);
+
+      // Simulate a job claimed by a previous process instance that then
+      // crashed: 'running', lease already expired, attempts=1.
+      const jobId = enqueue(queueDb, "proj-x:self");
+      queueDb.prepare(
+        "UPDATE distill_jobs SET status='running',attempts=1,lease_until=?,worker_id=? WHERE id=?"
+      ).run(new Date(Date.now() - 1000).toISOString(), "worker-crashed", jobId);
+
+      // startDistiller() must recover it (back to 'pending') before its
+      // first drain tick, so this boot's worker picks it up rather than it
+      // remaining stuck 'running' forever.
+      const distiller = startDistiller(queueDb, pools, failingLlm, {
+        drainIntervalMs: 20,
+        sweepIntervalMs: 60_000,
+      });
+      try {
+        const redrained = await waitFor(() => (getJob(queueDb, jobId)?.attempts ?? 0) > 1, 2000);
+        assert.ok(redrained, "recovered job was reclaimed and attempted again on this boot");
+      } finally {
+        distiller.stop();
+      }
+    } finally { cleanup(root); }
+  });
+
+  test("a job with a live (unexpired) lease from another still-running process is left untouched at startup", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      pools.resolve("proj-x", undefined, true);
+
+      const jobId = enqueue(queueDb, "proj-x:self");
+      queueDb.prepare(
+        "UPDATE distill_jobs SET status='running',attempts=1,lease_until=?,worker_id=? WHERE id=?"
+      ).run(new Date(Date.now() + 60_000).toISOString(), "worker-still-alive", jobId);
+
+      const distiller = startDistiller(queueDb, pools, failingLlm, {
+        drainIntervalMs: 20,
+        sweepIntervalMs: 60_000,
+      });
+      try {
+        // Give a few drain ticks a chance to run — the job must stay
+        // untouched (still attempts=1, still running under the other
+        // worker's lease) since its lease hasn't expired.
+        await new Promise((r) => setTimeout(r, 100));
+        const job = getJob(queueDb, jobId)!;
+        assert.equal(job.status, "running");
+        assert.equal(job.attempts, 1);
+        assert.equal(job.worker_id, "worker-still-alive");
+      } finally {
+        distiller.stop();
+      }
+    } finally { cleanup(root); }
+  });
+});
+
 describe("startDistiller: independent drain/sweep timers", () => {
   test("drain fires on drainIntervalMs without waiting for a sweep tick", async () => {
     const root = makeTempRoot();
