@@ -323,6 +323,7 @@ path.
 | `role` | Turn role (`user`, `assistant`, …) |
 | `content` | Turn text |
 | `ts` | Timestamp |
+| `seq` | Store-global, monotonically-increasing sequence number, assigned at insert (`MAX(seq)+1` within the store) (§4.2) |
 
 `session_id` is already captured, indexed, and queryable/deletable by
 session (`src/falda.ts`).
@@ -331,8 +332,17 @@ session (`src/falda.ts`).
 
 | Field | Meaning |
 |---|---|
-| `turn_index` | Strictly-increasing index within a session (nullable — legacy callers may omit it) |
+| `turn_index` | Strictly-increasing index *within a session* (nullable — legacy callers may omit it) |
 | `turn_id` | Idempotency token for this turn, independent of the row `id` |
+| `seq` | Strictly-increasing index *across the whole store, independent of session* — the actual key distillation watermarks (§8.5, §8.8) and cross-session ordering are defined over; unlike `turn_index`/`turn_id` it is never caller-supplied, always present (backfilled on migration), and never null |
+
+`seq` and `turn_index` answer different questions: `turn_index` orders turns
+*within one session* for a caller that wants to reconstruct that session's
+transcript; `seq` orders turns *across every session in the store* so a
+distillation pass has one unambiguous, store-global cursor
+(`distill_watermark.last_processed_seq`, §8.5/§8.8) regardless of how many
+sessions are interleaved. Both exist simultaneously and serve different
+consumers — `seq` is not a replacement for `turn_index`.
 
 Two problems this fixes, and **two invariants**, not one, are enforced:
 
@@ -497,7 +507,8 @@ secondary rendering. See §1 for why this distinction is the point.
 | `title` | Label naming the unit. **Always populated** — provisional/mechanical at creation, optionally replaced by an LLM label later (§6.4). Never null. |
 | `atom_ids` | Membership (JSON array) — **the primary artifact of a scene** |
 | `summary` | Narrative markdown body — **secondary**, optional, hash-gated (§6.4). Absent until the first lazy pass runs. |
-| `content_hash` | Canonical hash of exactly the L2 summary prompt's input (§6.4) — used to hash-gate regeneration (§8.3) |
+| `content_hash` | Canonical hash of exactly the L2 summary prompt's input (§6.4) — used to hash-gate regeneration of the **title/summary** (§8.3) |
+| `render_hash` | `sha256(title + "\n" + summary)` — a *separate* hash gating only the scene's **embedding** (§6.5), independent of `content_hash` |
 | `status` | `active \| retired` (§6.3) |
 | `derived_from` / `superseded_by` | Prior/successor `scene_id`(s) recorded across a split, merge, or reorganization (§6.3) |
 | `created_at` / `updated_at` | Timestamps |
@@ -682,6 +693,20 @@ or less than the prompt actually consumes, hash-gating either regenerates
 unnecessarily or (worse) silently skips a regeneration the prompt's input
 actually needed. Per §3.3's resolution, `confidence` is **not** part of
 this hash (or the prompt): confidence remains recall-only metadata (§3.2).
+
+**`render_hash` gates a different, downstream step and is deliberately a
+separate column from `content_hash`, not a rename of it.** `content_hash`
+answers "would the L2 *summary prompt's* input differ from last time?";
+`render_hash = sha256(title + "\n" + summary)` answers the narrower
+question "did the *rendered text* (title or summary) actually come out
+different this time?" — which matters because a `content_hash` change
+(membership changed) does not guarantee the LLM's title/summary output
+changed too, and re-embedding (§6.5) is pure cost with no correctness
+benefit when the text is unchanged. Vector re-embedding is gated on
+`render_hash`, not `content_hash`: `content_hash` regenerates the
+title/summary; `render_hash` regenerates the embedding, and the two can
+legitimately disagree on a given pass (input changed, output text
+happened not to).
 
 ### 6.5 Scene recall
 
@@ -1248,4 +1273,102 @@ Carried forward rather than silently dropped. None of these block Branch A
   scales before combining (§7.2) — an option, not a decision.
 - The consolidation candidate limit and per-pass cost ceiling (§8.2) are
   provisional; the right values depend on observed atom volumes per store.
+
+## 14. Persisted storage inventory
+
+Every prior section describes tiers and concepts; this section is the
+missing complement — **the flat map of every physical thing FALDA actually
+writes to disk**, and which section owns the detailed semantics of each.
+Nothing here is new behavior; it exists because no single table previously
+listed every persisted artifact together, which made it easy for a table
+covered only in an operational doc (`docs/OPERATIONS.md`,
+`docs/RECALL_TRACES.md`) to read as "not part of the model."
+
+### 14.1 Three SQLite databases, not one
+
+FALDA does not use a single database file. A given `root` (§2, `docs/POOLS.md`)
+contains:
+
+```
+root/
+├── tenants/<tenant>/self/
+│   ├── falda.db        one per (tenant, self) store — §14.2
+│   └── blobs/
+│       ├── core.md               T3 core, if synthesized (§8.4)
+│       └── scenes/<scene_id>.md  best-effort T2 rendered mirror (§6.1)
+├── pools/<pool>/
+│   ├── falda.db        one per named shared pool — same schema as above (§2)
+│   └── blobs/          (same layout as above)
+├── distill_queue.db     the distillation job queue — one per root, shared
+│                        across every store (§14.3)
+├── recall_traces.db     recall telemetry — one per root, shared across
+│                        every store (§14.4, `docs/RECALL_TRACES.md`)
+├── pools.json           pool declarations + member rosters (`docs/POOLS.md`)
+└── falda_tokens.json    the bearer-token file (`docs/API.md`)
+```
+
+Each `falda.db` is scoped to exactly one store (§2); `distill_queue.db` and
+`recall_traces.db` are **root-scoped**, holding rows for every store under
+that root, distinguished by a `store_key` column. This split exists so
+telemetry/queue growth and retention never compete with, or block a
+migration of, the durable-memory schema in `falda.db` (`src/recall/schema.ts`).
+
+### 14.2 `falda.db` — one per store (`src/falda.ts`)
+
+| Table | Tier / role | Detailed in |
+|---|---|---|
+| `stream` (+`stream_fts`, `stream_vec`) | T0 evidence | §4 |
+| `atoms` (+`atoms_fts`, `atoms_vec`) | T1 knowledge | §3 |
+| `atom_evidence` | atom → stream provenance edge | §5 |
+| `scenes` (+`scenes_fts`, `scenes_vec`) | T2 organization | §6 |
+| `scene_atoms` | scene ↔ atom membership edge | §6.1 |
+| `consolidation_decisions` | L1 decision audit (why store/update/merge/skip) | §5.5, §8.2 |
+| `distillation_passes` | one row per distillation pass (timing, watermark range, counts, `model`/`prompt_version`/`distiller_version`) | §5.5 |
+| `pass_scene_effects` | per-pass, per-scene audit (created/updated/retired/unchanged, membership delta) | §5.5, §8.3 |
+| `pass_core_effects` | per-pass core audit (regenerated/deleted/unchanged/failed, input-hash + char-count delta) | §5.5, §8.4 |
+| `distill_watermark` | this store's distillation cursor — `last_processed_seq` (§4.2) is the field the sweep gate (§8.8) actually reads | §8.5, §8.8 |
+| `core_state` | last input hash used to synthesize T3 core, so hash-gating compares input-hash to input-hash, not input-hash to output content | §8.4 |
+
+`distill_watermark` and `core_state` are **operational state, not domain
+knowledge** — deleting a store's `falda.db` and starting over loses no
+memory-model information that isn't recomputable, but does force a full
+re-distillation (watermark resets to "never processed," core hash-gate
+resets to "always regenerate").
+
+### 14.3 `distill_queue.db` — one per root (`src/distill/queue.ts`)
+
+| Table | Role |
+|---|---|
+| `distill_jobs` | the priority job queue (§8.8): `store_key`, `status` (`pending \| running \| done \| dead`), `priority` (`PRIORITY_PASSIVE \| PRIORITY_EXPLICIT`), `origin` (`sweep \| http \| mcp`), `attempts`, `next_attempt_at`, `error` |
+
+Full operational detail (retry/backoff, dead-letter inspection via `falda
+distill inspect`): `docs/OPERATIONS.md`.
+
+### 14.4 `recall_traces.db` — one per root (`src/recall/schema.ts`)
+
+| Table | Role |
+|---|---|
+| `recall_traces` | one row per `assembleContext()` call (§8.9–8.10): query, `store_key`, `policy_snapshot`, budgets, `mode` (`explicit \| auto`) |
+| `recall_trace_items` | one row per admitted `RecallItem`, in rank order, with `usage` (`unknown \| used \| unused`) |
+
+This database is **telemetry, not memory** (§8.10): nothing here is read
+back into ranking, and its rows never gate or block a recall. Full schema
+and evaluation queries: `docs/RECALL_TRACES.md`.
+
+### 14.5 Machine-readable schema and drift guard
+
+The three DBs' authoritative DDL, extracted directly from the code that
+creates it, and a Mermaid ER diagram of the domain entities (§3–§6, §5) are
+maintained separately from this prose document, since a schema is more
+useful diffable than described:
+
+- `docs/schema/tables.sql` — DDL for every table in §14.2–§14.4.
+- `docs/schema/ERD.md` — entity-relationship diagram of the domain tables
+  (excludes pure-audit and operational tables for readability; see the
+  file for exactly which tables it covers).
+
+`docs/schema/tables.sql` is checked against the live runtime schema by a
+test (`test/schema_doc_sync.test.ts`) — a table whose DDL drifts from that
+file fails CI, rather than silently going stale the way §4/§6's field
+tables previously did for `stream.seq` and `scenes.render_hash`.
 
