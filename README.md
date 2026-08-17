@@ -117,6 +117,16 @@ To connect an agent runtime (Hermes, OpenClaw, opencode, or your own) to
 FALDA — shadow or live, single-tenant or shared-pool — see
 [`docs/HARNESS_INTEGRATION.md`](docs/HARNESS_INTEGRATION.md).
 
+### Roadmap and known gaps
+
+Deferred design questions, auth-hardening options, and a ranked audit of
+failure/recovery-path gaps (not the nominal path — the full test suite
+passes) live under `docs/future/`:
+[`open-questions.md`](docs/future/open-questions.md),
+[`auth-hardening.md`](docs/future/auth-hardening.md),
+[`reliability-hardening.md`](docs/future/reliability-hardening.md).
+None of these are implemented; they're tracked so the analysis isn't lost.
+
 ### Distillation (T0 → T1 → T2 → T3)
 
 Distillation runs **in-process inside `falda serve`** as a background
