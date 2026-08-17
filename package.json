@@ -14,9 +14,7 @@
   },
   "bin": {
     "falda": "bin/falda",
-    "falda-serve": "dist/server.js",
-    "falda-gateway": "dist/gateway.js",
-    "falda-mcp": "dist/mcp.js"
+    "falda-serve": "dist/server.js"
   },
   "files": [
     "dist",
@@ -30,8 +28,6 @@
     "build": "tsc -p tsconfig.json",
     "test": "tsx --test test/*.test.ts",
     "serve": "tsx src/server.ts",
-    "gateway": "tsx src/gateway.ts",
-    "mcp": "tsx src/mcp.ts",
     "stats": "tsx src/stats.ts",
     "reembed": "tsx src/reembed.ts",
     "distill-inspect": "tsx src/inspect/cli.ts",

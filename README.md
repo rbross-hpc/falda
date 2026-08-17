@@ -86,8 +86,7 @@ curl -X POST localhost:8077/atoms/search \
 ```
 
 Pass `--no-mcp` to run the HTTP API + distillation worker only, with no MCP
-listener (`falda serve --no-mcp`, or `npm run gateway` as a standalone legacy
-entry point — see below).
+listener (`falda serve --no-mcp`).
 
 See [`docs/API.md`](docs/API.md) for the full HTTP route table and auth
 model, and [`docs/MCP.md`](docs/MCP.md) for the MCP tool table — both
@@ -114,30 +113,15 @@ ships a `Dockerfile` running `falda serve` by default (see
 [`integrations/opencode/README.md`](integrations/opencode/README.md) for the
 opencode-specific setup (Compose recipe, MCP config, auto-capture plugin).
 
-<details>
-<summary>Legacy standalone entry points (deprecated, kept for compatibility)</summary>
-
-Before the unified server, the HTTP API and MCP endpoint ran as two separate
-processes with two separate token files. Both still work standalone —
-`npm run gateway` / `npm run mcp` (`dist/gateway.js` / `dist/mcp.js`) — for
-existing deployments that haven't migrated. `falda gateway` starts only the
-HTTP API + distillation worker (no MCP); `falda mcp` starts only the MCP
-endpoint (no distillation worker — nothing drains the shared queue unless
-some other process owns it). Both now read the canonical `FALDA_TOKENS`
-(with the old `FALDA_MCP_TOKENS` honored as a deprecated fallback for the
-MCP entry point). New deployments should use `falda serve`.
-
-</details>
-
 To connect an agent runtime (Hermes, OpenClaw, opencode, or your own) to
 FALDA — shadow or live, single-tenant or shared-pool — see
 [`docs/HARNESS_INTEGRATION.md`](docs/HARNESS_INTEGRATION.md).
 
 ### Distillation (T0 → T1 → T2 → T3)
 
-Distillation runs **in-process inside `falda serve`** (or its `falda
-gateway` legacy equivalent) as a background worker (`src/distill/worker.ts`,
-`src/distill/core.ts`). It is the canonical owner of the distillation
+Distillation runs **in-process inside `falda serve`** as a background
+worker (`src/distill/worker.ts`, `src/distill/core.ts`). It is the
+canonical owner of the distillation
 queue — a job enqueued via `falda_distill` (MCP) or `POST /distill` (HTTP)
 is always drained by the same process that accepted it, because both
 protocol surfaces and the worker share one runtime (`src/runtime.ts`). It
@@ -213,16 +197,15 @@ locally (Ollama, vLLM, llama.cpp) or against a self-hosted lab server.
 
 `FALDA_DB`/`FALDA_BLOBS` (a single store's SQLite path/blob dir) apply only
 when embedding `Falda` directly as a library — see "As a library" above.
-`falda serve`/`falda gateway`/`falda mcp` always address stores through
-`FALDA_ROOT` + the pool layer (`docs/POOLS.md`), never a single `FALDA_DB`.
+`falda serve` always addresses stores through `FALDA_ROOT` + the pool layer
+(`docs/POOLS.md`), never a single `FALDA_DB`.
 
 Recommended open embedding models: `nomic-embed-text` (768), `BAAI/bge-base-en-v1.5`
 (768), `nomic-ai/nomic-embed-text-v1.5` (768). Set `FALDA_DIM` to match.
 
 ### CLI-client environment variables
 
-These are read by CLI **clients**, not `falda serve`/`falda gateway`/`falda
-mcp` themselves:
+These are read by CLI **clients**, not `falda serve` itself:
 
 | Env var        | Default                   | Notes |
 |----------------|----------------------------|-------|

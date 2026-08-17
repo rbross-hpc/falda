@@ -16,7 +16,8 @@
  *   5. Pool-admin routes (/pools/*) require a fully-trusted (["*"]) principal;
  *      any other principal is denied even for a tenant it owns.
  *   6. GET /healthz requires no authentication (proven against a real socket,
- *      since it's wired ahead of any auth in gateway.ts's request handler).
+ *      since it's wired ahead of any auth in src/server.ts's HTTP listener,
+ *      before handleRequest is ever called — see startHealthzServer below).
  */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -37,11 +38,12 @@ function hdrs(token?: string, tenant?: string) {
 }
 
 /**
- * Minimal stand-in for gateway.ts's own createServer() wiring, to prove
- * /healthz is reachable over a real socket with zero Authorization header.
- * gateway.ts's actual healthz branch is checked-before-auth identically; this
- * avoids re-booting the module's IS_MAIN-gated server (which only runs when
- * invoked as the entry script, by design, mirroring src/mcp.ts).
+ * Minimal stand-in for src/server.ts's startHttpApi() listener (the only
+ * place an HTTP socket for this API is actually opened — gateway.ts itself
+ * only exports the pure handleRequest), to prove /healthz is reachable over
+ * a real socket with zero Authorization header. startHttpApi's actual
+ * healthz branch is checked-before-auth identically; this avoids
+ * re-booting the full server for one liveness-probe assertion.
  */
 function startHealthzServer(): Promise<{ server: Server; port: number }> {
   return new Promise((resolve) => {

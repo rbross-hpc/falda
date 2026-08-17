@@ -191,10 +191,7 @@ Notes:
 - **`command:` override**: the image's default `CMD` is `node dist/server.js`
   (`falda serve`, both ports + worker). Pass `command: ["node",
   "dist/server.js", "--no-mcp"]` if you only want the HTTP API + worker in a
-  given service (rare — MCP is what agents actually use). The legacy
-  standalone `dist/gateway.js`/`dist/mcp.js` entry points still exist for
-  deployments mid-migration but are not the recommended `command:` for new
-  setups.
+  given service (rare — MCP is what agents actually use).
 
 ## 3. Per-project opencode config
 

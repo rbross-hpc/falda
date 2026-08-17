@@ -1,7 +1,7 @@
 /**
- * FALDA unified runtime — the single canonical bootstrap for all server
- * processes (src/server.ts's `falda serve`, and the legacy standalone
- * src/gateway.ts / src/mcp.ts entry points, which now delegate here).
+ * FALDA unified runtime — the single canonical bootstrap for `falda serve`
+ * (src/server.ts), which starts the HTTP API (src/gateway.ts) and MCP
+ * endpoint (src/mcp.ts) against this one shared runtime.
  *
  * Builds every shared resource exactly once:
  *   - PoolManager (embedder + store resolution)
@@ -64,14 +64,14 @@ export interface FaldaRuntime {
    *  surface (HTTP, MCP, distillation worker) so /metrics reflects the
    *  whole process's activity, not one surface's. */
   metrics: MetricsRegistry;
-  /** Set by src/server.ts (and the legacy gateway.ts entry point) once the
-   *  distillation worker has started, since the worker itself is
-   *  constructed AFTER the runtime (it needs runtime.queueDb). Calling it
-   *  drains ready explicit-priority distill jobs immediately rather than
-   *  waiting for the next timed drain tick — see src/distill/worker.ts's
-   *  wake(). Undefined if no worker is running in this process (e.g. a
-   *  bare MCP-only or HTTP-only legacy entry point) — callers must treat
-   *  it as optional and simply fall back to the timed drain in that case. */
+  /** Set by src/server.ts once the distillation worker has started, since
+   *  the worker itself is constructed AFTER the runtime (it needs
+   *  runtime.queueDb). Calling it drains ready explicit-priority distill
+   *  jobs immediately rather than waiting for the next timed drain tick —
+   *  see src/distill/worker.ts's wake(). Undefined if no worker is running
+   *  in this process (e.g. a test harness that builds a runtime without
+   *  starting a worker) — callers must treat it as optional and simply
+   *  fall back to the timed drain in that case. */
   wakeDistiller?: () => void;
   close(): void;
 }

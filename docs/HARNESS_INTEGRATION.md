@@ -19,7 +19,7 @@ Everything below is built on three primitives:
 
 | Surface            | What it is                                  | Where documented |
 |--------------------|---------------------------------------------|------------------|
-| HTTP API           | `POST` JSON to `:8077` (`/stream/*`, `/atoms/*`, `/scenes/*`, `/core/*`, `/pools/*`), served by `falda serve` (or the legacy `falda gateway` standalone entry point) | `docs/API.md`, `docs/POOLS.md` |
+| HTTP API           | `POST` JSON to `:8077` (`/stream/*`, `/atoms/*`, `/scenes/*`, `/core/*`, `/pools/*`), served by `falda serve` | `docs/API.md`, `docs/POOLS.md` |
 | CLI                | `bin/falda` — same operations from a shell | `README.md` |
 | Multi-tenant addr  | tenant is selected via the `X-Falda-Tenant` header (not a body field); optional body `pool` ⇒ a shared pool instead of the tenant's private `self` store | `docs/POOLS.md` |
 
@@ -59,14 +59,14 @@ are three integration points, from lightest to deepest.
 Run FALDA alongside Hermes' existing memory, capturing in parallel without
 touching the live recall path. Two long-running processes, both under launchd:
 
-- **Gateway** — `npm run gateway` (or `bin/falda serve`) from a checkout of
-  this repo, pointed at a runtime data dir via env:
+- **Gateway** — `bin/falda serve --no-mcp` from a checkout of this repo,
+  pointed at a runtime data dir via env:
 
   ```bash
   FALDA_ROOT=~/.falda/data \
   FALDA_PORT=8077 \
   FALDA_EMBED=local \            # or remote; see docs/INSTALL.md
-  node --import tsx src/gateway.ts
+  node --import tsx src/server.ts --no-mcp
   ```
 
 - **Tap** — `integrations/external-source/falda_tap.py` tails the existing
@@ -134,9 +134,9 @@ on the same host as the FALDA gateway (CherryRd, macOS).
 
 ### 2a. Shadow capture
 
-- **Gateway**: `bin/falda serve` / `npm run gateway` already running on
-  CherryRd at `localhost:8077` under launchd label
-  `com.stevens.falda-gateway` (`KeepAlive=true`).
+- **Gateway**: `bin/falda serve` already running on CherryRd at
+  `localhost:8077` under launchd label `com.stevens.falda-gateway`
+  (`KeepAlive=true`).
 
 - **Tap**: `integrations/external-source/falda_tap.py` points at
   OpenClaw's L0 session-log export directory:

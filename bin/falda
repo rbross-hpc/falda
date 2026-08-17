@@ -8,12 +8,6 @@
 #                            shared runtime (uses built dist/ if present, else
 #                            falls back to tsx on the TypeScript source).
 #                            --no-mcp starts the HTTP API + worker only.
-#   falda gateway           Legacy: HTTP API + worker only, no MCP endpoint.
-#                            Equivalent to `falda serve --no-mcp`.
-#   falda mcp               Legacy: MCP endpoint only, no distillation worker
-#                            of its own (nothing drains the shared queue
-#                            unless a `falda serve`/`falda gateway` process
-#                            elsewhere owns it).
 #   falda smoke             Run the offline smoke test.
 #   falda build             Compile TypeScript -> dist/.
 #   falda health [PORT]     Curl the HTTP API's /healthz endpoint.
@@ -99,7 +93,7 @@ cd "$ROOT"
 
 PORT="${FALDA_PORT:-8077}"
 
-usage() { sed -n '3,78p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,80p' "$0" | sed 's/^# \{0,1\}//'; }
 
 run_node_or_tsx() {
   # $1 = dist target (relative), $2 = src target (relative), remaining = args
@@ -119,14 +113,6 @@ case "$cmd" in
   serve)
     echo "falda: starting unified server on :$PORT (HTTP) / :${FALDA_MCP_PORT:-8079} (MCP) (Ctrl-C to stop)"
     run_node_or_tsx "dist/server.js" "src/server.ts" "$@"
-    ;;
-  gateway)
-    echo "falda: starting HTTP API + worker (no MCP) on :$PORT (Ctrl-C to stop)"
-    run_node_or_tsx "dist/gateway.js" "src/gateway.ts" "$@"
-    ;;
-  mcp)
-    echo "falda: starting MCP endpoint on :${FALDA_MCP_PORT:-8079} (Ctrl-C to stop)"
-    run_node_or_tsx "dist/mcp.js" "src/mcp.ts" "$@"
     ;;
   smoke)
     exec npm run --silent smoke

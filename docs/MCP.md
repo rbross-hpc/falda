@@ -23,11 +23,6 @@ set below; the HTTP API additionally exposes pool-admin routes MCP omits
 by design. Merging the daemon does not merge or broaden either surface's
 capabilities.
 
-A standalone `falda mcp` (MCP only, `src/mcp.ts`'s own entry point) remains
-available for compatibility, but it starts no distillation worker — nothing
-drains the shared queue unless some other process (`falda serve` or `falda
-gateway`) owns it. Prefer `falda serve` for new deployments.
-
 ## Run it
 
 ```bash
@@ -46,10 +41,8 @@ curl -s localhost:8079/healthz   # {"ok":true,"mcp":true}
 ```
 
 MCP endpoint: `POST/GET/DELETE http://<host>:8079/mcp` (Streamable HTTP
-transport, stateless — a fresh session per connection). Standalone
-(`falda mcp` / `node dist/mcp.js`) still works and still honors
-`FALDA_MCP_PORT` (default `8079`), for existing deployments that haven't
-migrated to `falda serve`.
+transport, stateless — a fresh session per connection), port configurable
+via `FALDA_MCP_PORT` (default `8079`).
 
 ## Auth model
 
@@ -178,8 +171,8 @@ routes from an internal/admin context.
 
 ### Choosing a toolset
 
-Set `FALDA_MCP_TOOLSET=full` (env var on the `falda serve`/`falda mcp`
-process) to expose the advanced tools alongside the default ones — useful
+Set `FALDA_MCP_TOOLSET=full` (env var on the `falda serve` process) to
+expose the advanced tools alongside the default ones — useful
 for a debugging session or an admin/migration script. The underlying
 service methods (`Falda.searchAtoms`, `upsertAtom`, etc.) are never
 removed; `full` only changes which tools are *registered* on the MCP

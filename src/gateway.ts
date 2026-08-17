@@ -103,12 +103,13 @@
  *
  *   /healthz         (GET, unauthenticated)                        -> {ok, tiers}
  *
- * Prefer `falda serve` (src/server.ts) for new deployments — it starts this
- * same HTTP API alongside the MCP endpoint (src/mcp.ts) from one shared
- * runtime (src/runtime.ts), with one canonical token file and one
- * distillation worker for both surfaces. This module's own IS_MAIN entry
- * point (`node dist/gateway.js`) is kept for backward compatibility and is
- * equivalent to `falda serve --no-mcp`.
+ * This module exports `handleRequest`, the pure request handler — the
+ * actual HTTP listener lives in `falda serve` (src/server.ts's
+ * startHttpApi), which starts this API alongside the MCP endpoint
+ * (src/mcp.ts) from one shared runtime (src/runtime.ts), with one
+ * canonical token file and one distillation worker for both surfaces. The
+ * standalone `node dist/gateway.js` / `falda gateway` entry point has been
+ * retired — use `falda serve --no-mcp` for an HTTP-API-only process.
  *
  * Env: see src/runtime.ts for the canonical set (FALDA_ROOT, FALDA_DIM,
  *   FALDA_EMBED*, FALDA_TOKENS, FALDA_LLM_*). Gateway-specific:
@@ -122,14 +123,11 @@
  *   FALDA_RECALL_MAX_BUDGET   Hard ceiling on any requested budget (default 20000).
  *   See src/recall/budgets.ts for the two-tier rationale.
  */
-import { createServer } from "node:http";
 import Database from "better-sqlite3";
 import { PoolManager, PoolError } from "./pools.js";
 import { TokenStore, AuthError, parseBearer, type Principal } from "./mcp_auth.js";
 import { StreamConflictError, AtomImmutabilityError, AtomTypeError } from "./falda.js";
 import { enqueue, storeKeyFor, getJobAuthorized, PRIORITY_EXPLICIT } from "./distill/queue.js";
-import { buildRuntime } from "./runtime.js";
-import { startDistiller, resolveWorkerIntervals } from "./distill/worker.js";
 import { assembleContext, DEFAULT_TIER_BUDGETS } from "./distill/context.js";
 import type { MetricsRegistry } from "./metrics.js";
 import { resolveAutoRecallBudget, resolveMaxRecallBudget, resolveRecallBudget } from "./recall/budgets.js";
@@ -393,66 +391,4 @@ export async function handleRequest(
       metrics?.http_request_ms.observe(Date.now() - requestStartedAt, metrics.distillActive());
     }
   }
-}
-
-/**
- * Standalone entry point (legacy): `node dist/gateway.js` starts the HTTP
- * API + distillation worker only, no MCP endpoint — equivalent to
- * `falda serve --no-mcp`. Delegates to the same buildRuntime() the unified
- * server uses (src/runtime.ts), so there is exactly one runtime bootstrap
- * path regardless of which entry point is invoked. The HTTP listener here
- * is intentionally self-contained (not imported from src/server.ts) to
- * avoid a circular module dependency, since server.ts imports handleRequest
- * from this file.
- *
- * FALDA_TOKENS is the canonical token file for both HTTP and MCP; see
- * src/runtime.ts. Prefer `falda serve` for new deployments — this entry
- * point is kept for backward compatibility with existing deployments that
- * invoke dist/gateway.js directly.
- */
-const IS_MAIN = process.argv[1]?.endsWith("gateway.js") || process.argv[1]?.endsWith("gateway.ts");
-if (IS_MAIN) {
-  (async () => {
-  const PORT = Number(process.env.FALDA_PORT ?? 8077);
-  const resolvedEnv = resolveWorkerIntervals();
-  if (resolvedEnv.usingDeprecatedFallback) {
-    console.warn(
-      "falda gateway: FALDA_WORKER_INTERVAL_MS is deprecated — set FALDA_DRAIN_INTERVAL_MS " +
-      "and FALDA_SWEEP_INTERVAL_MS instead (see src/distill/worker.ts).",
-    );
-  }
-
-  const runtime = await buildRuntime({ label: "FALDA gateway" });
-  const distiller = startDistiller(runtime.queueDb, runtime.pools, runtime.llm, undefined, {
-    drainIntervalMs: resolvedEnv.drainIntervalMs,
-    sweepIntervalMs: resolvedEnv.sweepIntervalMs,
-    recallTraceDb: runtime.recallTraceDb,
-    metrics: runtime.metrics,
-  });
-  runtime.wakeDistiller = () => distiller.wake();
-
-  createServer((req, res) => {
-    if (req.method === "GET" && req.url === "/healthz") {
-      res.writeHead(200, { "content-type": "application/json" });
-      return res.end(JSON.stringify({ ok: true, tiers: ["stream", "atoms", "scenes", "core"], pools: true }));
-    }
-    if (req.method !== "POST") { res.writeHead(405); return res.end(); }
-    let body = "";
-    req.on("data", (c) => (body += c));
-    req.on("end", async () => {
-      try {
-        const parsed = body ? JSON.parse(body) : {};
-        const { status, body: out } = await handleRequest(
-          runtime.pools, runtime.tokenStore, req.headers, req.url ?? "", parsed,
-          runtime.queueDb, runtime.recallTraceDb, runtime.metrics, runtime.wakeDistiller,
-        );
-        res.writeHead(status, { "content-type": "application/json" });
-        res.end(JSON.stringify(out));
-      } catch (e: any) {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: String(e?.message ?? e) }));
-      }
-    });
-  }).listen(PORT, () => console.log(`FALDA gateway listening on :${PORT} (root=${runtime.root})`));
-  })().catch((e) => { console.error(e); process.exit(1); });
 }
