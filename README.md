@@ -173,6 +173,7 @@ curl -s -X POST http://localhost:8077/distill \
 | `FALDA_LLM_BASE_URL`    | `http://localhost:11434/v1` | chat-completions endpoint |
 | `FALDA_LLM_API_KEY`     | `x`                         | bearer token for chat endpoint |
 | `FALDA_LLM_MODEL`       | `gpt-4o-mini`               | extraction/synthesis model id |
+| `FALDA_LLM_TIMEOUT_MS`  | `120000`                    | request timeout for the chat endpoint — a stalled LLM fails the pass (retried with backoff) instead of hanging indefinitely |
 | `FALDA_DRAIN_INTERVAL_MS`  | `60000`                  | how often the worker drains one ready job from the queue |
 | `FALDA_SWEEP_INTERVAL_MS`  | `300000`                 | how often the worker auto-enqueues every self-store, and prunes `recall_traces.db` |
 | `FALDA_WORKER_INTERVAL_MS` | *(unset)*                | **deprecated**: sets both of the above when they're unset — set the split vars instead |
@@ -191,6 +192,7 @@ locally (Ollama, vLLM, llama.cpp) or against a self-hosted lab server.
 | `FALDA_EMBED_API_KEY`   | `x`                            | bearer token (`x` for keyless local)   |
 | `FALDA_EMBED_MODEL`     | `nomic-embed-text`             | embedding model id                     |
 | `FALDA_EMBED_STRICT`    | *(unset)*                      | `1` makes an unconfigured embedder a startup FATAL instead of silently falling back to the local embedder — recommended for production |
+| `FALDA_EMBED_TIMEOUT_MS` | `30000`                       | request timeout for the embeddings endpoint — a stalled embedder fails the call instead of hanging indefinitely |
 | `FALDA_DIM`             | `768`                          | must match the model's dimensionality  |
 | `FALDA_ROOT`            | `./falda-data`                | pool root dir (all tenant/pool stores) |
 | `FALDA_PORT`            | `8077`                         | HTTP JSON API port                     |
