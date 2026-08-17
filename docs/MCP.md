@@ -189,7 +189,6 @@ API when run via `falda serve`). MCP-specific:
 | `FALDA_MCP_TOOLSET` | `default` (compact agent API) or `full` (+ tier-specific advanced tools) | `default` |
 | `FALDA_ROOT` | pool root dir (shared with the HTTP API) | `./falda-data` |
 | `FALDA_TOKENS` | canonical token file, shared by HTTP and MCP | `./falda_tokens.json` |
-| `FALDA_MCP_TOKENS` | **deprecated** fallback for `FALDA_TOKENS`, honored with a startup warning for the standalone `falda mcp` entry point only | — |
 | `FALDA_DIM` / `FALDA_EMBED*` | embedder selection, as in the HTTP API | — |
 | `FALDA_RECALL_TRACE_RETENTION_DAYS` | days to retain `recall_traces.db` rows (see `docs/RECALL_TRACES.md`); `<= 0` retains indefinitely | `90` |
 | `FALDA_RECALL_BUDGET` | `falda_recall`'s default budget for a deliberate call (`mode` omitted or `"explicit"`) | `6000` |

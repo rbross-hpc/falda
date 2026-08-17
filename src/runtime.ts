@@ -18,16 +18,13 @@
  * Config consolidation: one canonical FALDA_TOKENS path is used for both
  * HTTP and MCP auth (previously the gateway read FALDA_TOKENS and the MCP
  * server read a separate FALDA_MCP_TOKENS — an unintentional credential
- * split with no security rationale). FALDA_MCP_TOKENS is still honored as a
- * deprecated fallback (with a startup warning) for one release, so an
- * existing deployment's token file keeps working until it migrates its env.
+ * split with no security rationale).
  *
  * Env:
  *   FALDA_ROOT           Pool root dir (default ./falda-data)
  *   FALDA_DIM            Embedding dimensionality (default 768)
  *   FALDA_EMBED*         Embedder selection — see src/boot.ts
  *   FALDA_TOKENS         Path to the token file (default ./falda_tokens.json)
- *   FALDA_MCP_TOKENS     Deprecated fallback for FALDA_TOKENS (warns if used)
  *   FALDA_LLM_*          Distillation LLM client — see src/distill/llm.ts
  *   FALDA_RECALL_TRACE_RETENTION_DAYS
  *                        Days to retain recall_traces.db rows before the
@@ -76,18 +73,11 @@ export interface FaldaRuntime {
   close(): void;
 }
 
-/** Resolve the canonical token file path, honoring the deprecated
- *  FALDA_MCP_TOKENS fallback with a one-time startup warning. */
-function resolveTokensPath(explicit: string | undefined, label: string): string {
+/** Resolve the canonical token file path: explicit config, else
+ *  FALDA_TOKENS, else the default. */
+function resolveTokensPath(explicit: string | undefined): string {
   if (explicit) return explicit;
   if (process.env.FALDA_TOKENS) return process.env.FALDA_TOKENS;
-  if (process.env.FALDA_MCP_TOKENS) {
-    console.warn(
-      `${label}: FALDA_MCP_TOKENS is deprecated — both HTTP and MCP now share one token ` +
-        `file via FALDA_TOKENS. Rename the env var; the file format is unchanged.`,
-    );
-    return process.env.FALDA_MCP_TOKENS;
-  }
   return "./falda_tokens.json";
 }
 
@@ -104,7 +94,7 @@ export async function buildRuntime(cfg: RuntimeConfig = {}): Promise<FaldaRuntim
   const label = cfg.label ?? "FALDA";
   const root = cfg.root ?? process.env.FALDA_ROOT ?? "./falda-data";
   const dim = cfg.dim ?? Number(process.env.FALDA_DIM ?? 768);
-  const tokensPath = resolveTokensPath(cfg.tokensPath, label);
+  const tokensPath = resolveTokensPath(cfg.tokensPath);
 
   const embed = selectEmbedder(dim, label);
   await probeEmbedder(embed, dim, label);

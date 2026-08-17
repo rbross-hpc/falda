@@ -6,8 +6,6 @@ dist
 
 # Secrets — must never enter an image layer.
 falda_tokens.json
-falda_mcp_tokens.json
-falda_gateway_tokens.json
 proxy/falda_proxy_tokens.json
 proxy/falda_proxy.crt
 proxy/falda_proxy.key
