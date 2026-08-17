@@ -66,7 +66,7 @@ scene's content hash when its requested narration failed.
 
 ### High
 
-**3. Queue jobs left `running` by a process crash are never recovered.**
+**3. Queue jobs left `running` by a process crash are never recovered. — ✅ addressed**
 `claimNext()` moves a job from `pending` to `running`
 (`src/distill/queue.ts:122-136`) and only the active worker calls
 `completeJob()`/`failJob()` (`src/distill/worker.ts:153-164`). There is no
@@ -83,7 +83,25 @@ replacement.
 *Recommendation:* add a lease (`claimed_at`/`lease_until`/worker id) and
 requeue expired `running` jobs on startup or next claim attempt.
 
-**4. Shutdown is not graceful; remote calls have no timeout.**
+**Landed:** `distill_jobs` gained `lease_until`/`worker_id` columns
+(additive migration, `src/distill/queue.ts`'s `initQueueSchema`).
+`claimNext()` now stamps a fresh lease + worker id on every claim (fresh or
+reclaimed) and its ready-job predicate also matches a `running` row whose
+lease has expired or is `NULL` (the latter covers a job orphaned by a
+pre-lease binary); `completeJob()`/`failJob()` clear the lease.
+`startDistiller()` calls the new `recoverStaleJobs()` once at boot, before
+the first sweep/drain tick, and logs how many jobs it recovered — so an
+orphaned job doesn't have to wait for a fresh claim attempt to become
+visible again. Lease duration defaults to 10 minutes
+(`FALDA_DISTILL_LEASE_MS`), fixed for the claim's duration (no mid-run
+heartbeat/renewal — see the tradeoff note in `src/distill/queue.ts`'s
+`DEFAULT_LEASE_MS` doc comment). Named-pool jobs still aren't
+auto-swept (unchanged; separate from this finding). Tests:
+`test/distill_queue_lease.test.ts`, plus two boot-integration tests in
+`test/distill_worker.test.ts`'s "startDistiller: crash recovery on
+startup".
+
+**4. Shutdown is not graceful; remote calls have no timeout. — partially addressed**
 `ServeHandle.close()` stops timers and immediately closes listeners and
 SQLite handles without waiting for in-flight HTTP/MCP requests or a
 running distillation pass (`src/server.ts:173-178`); `DistillerHandle.stop()`
@@ -97,6 +115,15 @@ orderly shutdown.
 *Recommendation:* install signal handlers that stop enqueuing new work,
 await in-flight requests/jobs (with a bounded grace period), then close
 storage. Add timeouts/cancellation to outbound embedding and LLM calls.
+
+**Landed (remote-call timeouts only):** `makeEmbedder()`/`makeLLM()` now
+pass `AbortSignal.timeout(...)` on their `fetch` calls
+(`FALDA_EMBED_TIMEOUT_MS` default 30s, `FALDA_LLM_TIMEOUT_MS` default
+120s), surfacing a clear timeout error that flows into the existing
+`failJob` backoff/dead-letter path rather than hanging indefinitely. Tests:
+`test/remote_timeouts.test.ts`. The graceful-shutdown half (signal
+handlers, awaiting in-flight work before closing storage) is tracked
+separately as the next phase of this same finding.
 
 **5. Stream deletion leaves stale FTS/vector index rows.**
 `addStream()` writes all three representations (row, FTS, vector;

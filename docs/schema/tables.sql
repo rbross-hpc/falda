@@ -200,8 +200,10 @@ CREATE TABLE IF NOT EXISTS distill_jobs (
   error TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  priority INTEGER NOT NULL DEFAULT 100,        -- PRIORITY_PASSIVE | PRIORITY_EXPLICIT (migrated in, additive)
-  origin TEXT NOT NULL DEFAULT 'sweep'          -- 'sweep' | 'http' | 'mcp' (migrated in, additive)
+  priority INTEGER NOT NULL DEFAULT 0,          -- PRIORITY_PASSIVE (0) | PRIORITY_EXPLICIT (10) (migrated in, additive)
+  origin TEXT NOT NULL DEFAULT 'sweep',         -- 'sweep' | 'http' | 'mcp' (migrated in, additive)
+  lease_until TEXT,                             -- claim lease expiry; NULL if never claimed or claim released (migrated in, additive)
+  worker_id TEXT                                -- opaque id of the worker holding the current claim, observability only (migrated in, additive)
 );
 CREATE INDEX IF NOT EXISTS idx_jobs_store_status ON distill_jobs(store_key, status);
 CREATE INDEX IF NOT EXISTS idx_jobs_pending ON distill_jobs(status, priority, next_attempt_at)
