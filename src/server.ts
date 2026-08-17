@@ -155,7 +155,7 @@ export async function serve(opts: ServeOptions = {}): Promise<ServeHandle> {
 
   const runtime = await buildRuntime({ label: "FALDA", ...opts.runtimeConfig });
 
-  const distiller = startDistiller(runtime.queueDb, runtime.pools, runtime.llm, undefined, {
+  const distiller = startDistiller(runtime.queueDb, runtime.pools, runtime.llm, {
     drainIntervalMs, sweepIntervalMs,
     recallTraceDb: runtime.recallTraceDb,
     metrics: runtime.metrics,
