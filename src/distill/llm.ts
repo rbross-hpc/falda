@@ -1,7 +1,7 @@
 /**
  * Shared OpenAI-compatible chat LLM client for distillation.
- * Used by the unified server runtime (src/runtime.ts) and the standalone
- * distill CLI (src/distill/cli.ts) — one implementation, not two copies.
+ * Used by the unified server runtime (src/runtime.ts) — the distillation
+ * worker (src/distill/worker.ts) is the sole consumer.
  *
  * Env:
  *   FALDA_LLM_BASE_URL    OpenAI-compatible chat endpoint (default: http://localhost:11434/v1)

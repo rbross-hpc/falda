@@ -172,10 +172,6 @@ curl -s -X POST http://localhost:8077/distill \
   -H "X-Falda-Tenant: my-agent" \
   -H "Content-Type: application/json" \
   -d '{}' | jq
-
-# Or via the standalone CLI entrypoint (one-shot, no server process needed):
-FALDA_TENANT=my-agent FALDA_LLM_BASE_URL=http://localhost:8000/v1 \
-  tsx src/distill/cli.ts --once
 ```
 
 | Env var                 | Default                     | Notes |

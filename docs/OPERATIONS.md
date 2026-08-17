@@ -139,8 +139,8 @@ embedder corrupt or silently degrade recall (`src/boot.ts`):
   writes on first boot is written from a network-verified dimension, not
   taken on faith from the env.
 
-Both are process-startup checks — they run once per `falda serve`/
-`gateway`/`mcp`/distill-cli process boot, not per-request.
+Both are process-startup checks — they run once per `falda serve` process
+boot, not per-request.
 
 # Re-embedding after a model/dimension change
 
@@ -151,7 +151,7 @@ whose `FALDA_EMBED_MODEL`/`FALDA_DIM` no longer match a store's locked
 command.
 
 ```bash
-# 1. Stop every FALDA process (serve/gateway/mcp/distill-cli) against this root.
+# 1. Stop every `falda serve` process against this root.
 
 # 2. Preview what would be affected (no writes):
 FALDA_ROOT=/data FALDA_DIM=1024 FALDA_EMBED=remote \

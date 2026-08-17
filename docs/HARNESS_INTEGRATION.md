@@ -415,7 +415,7 @@ gateway runs pinned Node (native ABI dependency via `better-sqlite3`). Do not
 
 ## 5. Install / bootstrap order (replication-grade)
 
-The broker leg lives on the Hermes host (m1); see `KUKLA_DELTA.md` +
+The broker leg lives on the Hermes host (m1); see §4 above and
 `deploy/nats/` for the `nats-server.conf` 3-user ACL (note the
 `publish: $JS.>` JetStream grant gotcha) and stream-create commands. Once the
 broker + streams exist, bring up the OpenClaw side in this order:
@@ -426,7 +426,7 @@ broker + streams exist, bring up the OpenClaw side in this order:
 3.  npm rebuild better-sqlite3   # ABI must match the pinned Node; pin the
                                  # absolute node path in any launchd plist env
 4.  mkdir -p ~/.openclaw/falda-dualrun ~/.openclaw/logs ~/.falda
-5.  (Hermes host) start nats-server + create streams (KUKLA_DELTA.md)
+5.  (Hermes host) start nats-server + create streams (see §4 / deploy/nats/create-streams.sh)
 6.  (Hermes host) create durable consumers: sibline-ollie/ollie-inbox-durable,
     sibline-broadcast/ollie-bcast-durable
 7.  start FALDA gateway:  launchctl bootstrap + kickstart
