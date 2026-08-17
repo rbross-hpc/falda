@@ -7,12 +7,20 @@
  *   FALDA_LLM_BASE_URL    OpenAI-compatible chat endpoint (default: http://localhost:11434/v1)
  *   FALDA_LLM_API_KEY     API key (default: "x")
  *   FALDA_LLM_MODEL       Model name (default: gpt-4o-mini)
+ *   FALDA_LLM_TIMEOUT_MS  Request timeout, ms (default 120000) — extraction/
+ *                         synthesis prompts are slower than embeddings; a
+ *                         stalled chat endpoint must not hang a distillation
+ *                         pass indefinitely (see
+ *                         docs/future/reliability-hardening.md finding 4)
  */
 export interface LLMConfig {
   baseUrl?: string;
   apiKey?: string;
   model?: string;
+  timeoutMs?: number;
 }
+
+const DEFAULT_LLM_TIMEOUT_MS = 120_000;
 
 export type LLMFn = (prompt: string) => Promise<string>;
 
@@ -34,13 +42,23 @@ export function makeLLM(cfg: LLMConfig = {}): LLMFnWithModel {
   const baseUrl = cfg.baseUrl ?? process.env.FALDA_LLM_BASE_URL ?? "http://localhost:11434/v1";
   const apiKey = cfg.apiKey ?? process.env.FALDA_LLM_API_KEY ?? "x";
   const model = resolveLLMModel(cfg);
+  const timeoutMs = cfg.timeoutMs ?? Number(process.env.FALDA_LLM_TIMEOUT_MS ?? DEFAULT_LLM_TIMEOUT_MS);
 
   const fn = async function llm(prompt: string): Promise<string> {
-    const resp = await fetch(`${baseUrl}/chat/completions`, {
-      method: "POST",
-      headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
-      body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], temperature: 0 }),
-    });
+    let resp: Response;
+    try {
+      resp = await fetch(`${baseUrl}/chat/completions`, {
+        method: "POST",
+        headers: { "content-type": "application/json", authorization: `Bearer ${apiKey}` },
+        body: JSON.stringify({ model, messages: [{ role: "user", content: prompt }], temperature: 0 }),
+        signal: AbortSignal.timeout(timeoutMs),
+      });
+    } catch (e: any) {
+      if (e?.name === "TimeoutError" || e?.name === "AbortError") {
+        throw new Error(`LLM request timed out after ${timeoutMs}ms`);
+      }
+      throw e;
+    }
     if (!resp.ok) throw new Error(`LLM ${resp.status}: ${await resp.text()}`);
     const j = (await resp.json()) as any;
     return j.choices[0].message.content as string;
