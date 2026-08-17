@@ -23,11 +23,6 @@ set below; the HTTP API additionally exposes pool-admin routes MCP omits
 by design. Merging the daemon does not merge or broaden either surface's
 capabilities.
 
-A standalone `falda mcp` (MCP only, `src/mcp.ts`'s own entry point) remains
-available for compatibility, but it starts no distillation worker — nothing
-drains the shared queue unless some other process (`falda serve` or `falda
-gateway`) owns it. Prefer `falda serve` for new deployments.
-
 ## Run it
 
 ```bash
@@ -46,10 +41,8 @@ curl -s localhost:8079/healthz   # {"ok":true,"mcp":true}
 ```
 
 MCP endpoint: `POST/GET/DELETE http://<host>:8079/mcp` (Streamable HTTP
-transport, stateless — a fresh session per connection). Standalone
-(`falda mcp` / `node dist/mcp.js`) still works and still honors
-`FALDA_MCP_PORT` (default `8079`), for existing deployments that haven't
-migrated to `falda serve`.
+transport, stateless — a fresh session per connection), port configurable
+via `FALDA_MCP_PORT` (default `8079`).
 
 ## Auth model
 
@@ -178,8 +171,8 @@ routes from an internal/admin context.
 
 ### Choosing a toolset
 
-Set `FALDA_MCP_TOOLSET=full` (env var on the `falda serve`/`falda mcp`
-process) to expose the advanced tools alongside the default ones — useful
+Set `FALDA_MCP_TOOLSET=full` (env var on the `falda serve` process) to
+expose the advanced tools alongside the default ones — useful
 for a debugging session or an admin/migration script. The underlying
 service methods (`Falda.searchAtoms`, `upsertAtom`, etc.) are never
 removed; `full` only changes which tools are *registered* on the MCP
@@ -196,7 +189,6 @@ API when run via `falda serve`). MCP-specific:
 | `FALDA_MCP_TOOLSET` | `default` (compact agent API) or `full` (+ tier-specific advanced tools) | `default` |
 | `FALDA_ROOT` | pool root dir (shared with the HTTP API) | `./falda-data` |
 | `FALDA_TOKENS` | canonical token file, shared by HTTP and MCP | `./falda_tokens.json` |
-| `FALDA_MCP_TOKENS` | **deprecated** fallback for `FALDA_TOKENS`, honored with a startup warning for the standalone `falda mcp` entry point only | — |
 | `FALDA_DIM` / `FALDA_EMBED*` | embedder selection, as in the HTTP API | — |
 | `FALDA_RECALL_TRACE_RETENTION_DAYS` | days to retain `recall_traces.db` rows (see `docs/RECALL_TRACES.md`); `<= 0` retains indefinitely | `90` |
 | `FALDA_RECALL_BUDGET` | `falda_recall`'s default budget for a deliberate call (`mode` omitted or `"explicit"`) | `6000` |

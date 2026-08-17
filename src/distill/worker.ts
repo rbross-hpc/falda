@@ -85,11 +85,10 @@ export interface DistillerHandle {
 export interface DistillerOptions {
   recallTraceDb?: DatabaseType;
   recallTraceRetentionDays?: number;
-  /** Drain cadence, ms. Falls back to the 4th positional `intervalMs` arg
-   *  when omitted (back-compat with the pre-split single-interval API). */
+  /** Drain cadence, ms. Defaults to 60000 when omitted. */
   drainIntervalMs?: number;
-  /** Passive-enqueue-sweep + prune cadence, ms. Falls back to the 4th
-   *  positional `intervalMs` arg when omitted. */
+  /** Passive-enqueue-sweep + prune cadence, ms. Defaults to 300000 when
+   *  omitted. */
   sweepIntervalMs?: number;
   /** Shared timing histograms (src/metrics.ts). Omit to disable
    *  instrumentation (e.g. in tests that don't care about timing). */
@@ -128,11 +127,10 @@ export function startDistiller(
   queueDb: DatabaseType,
   pools: PoolManager,
   llm: LLMFnWithModel,
-  intervalMs = DEFAULT_INTERVAL_MS,
   opts: DistillerOptions = {},
 ): DistillerHandle {
-  const drainIntervalMs = opts.drainIntervalMs ?? intervalMs;
-  const sweepIntervalMs = opts.sweepIntervalMs ?? intervalMs;
+  const drainIntervalMs = opts.drainIntervalMs ?? DEFAULT_INTERVAL_MS;
+  const sweepIntervalMs = opts.sweepIntervalMs ?? DEFAULT_SWEEP_INTERVAL_MS;
   const retentionDays = opts.recallTraceRetentionDays
     ?? resolveRetentionDays(process.env.FALDA_RECALL_TRACE_RETENTION_DAYS);
 

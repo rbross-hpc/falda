@@ -102,7 +102,7 @@ describe("startDistiller: independent drain/sweep timers", () => {
       pools.resolve("proj-x", undefined, true); // materialize a self-store
       const jobId = enqueue(queueDb, "proj-x:self");
 
-      const distiller = startDistiller(queueDb, pools, failingLlm, undefined, {
+      const distiller = startDistiller(queueDb, pools, failingLlm, {
         drainIntervalMs: 20,
         sweepIntervalMs: 10_000, // deliberately slow — proves drain doesn't wait on it
       });
@@ -125,7 +125,7 @@ describe("startDistiller: wake()", () => {
       initQueueSchema(queueDb);
       pools.resolve("proj-x", undefined, true);
 
-      const distiller = startDistiller(queueDb, pools, failingLlm, undefined, {
+      const distiller = startDistiller(queueDb, pools, failingLlm, {
         drainIntervalMs: 60_000, // deliberately slow — proves wake() doesn't wait on it
         sweepIntervalMs: 60_000,
       });
@@ -148,7 +148,7 @@ describe("startDistiller: wake()", () => {
       initQueueSchema(queueDb);
       pools.resolve("proj-x", undefined, true);
 
-      const distiller = startDistiller(queueDb, pools, failingLlm, undefined, {
+      const distiller = startDistiller(queueDb, pools, failingLlm, {
         drainIntervalMs: 60_000,
         sweepIntervalMs: 60_000,
       });
@@ -188,7 +188,7 @@ describe("startDistiller: wake()", () => {
         { model: "stub" },
       );
 
-      const distiller = startDistiller(queueDb, pools, slowLlm, undefined, {
+      const distiller = startDistiller(queueDb, pools, slowLlm, {
         drainIntervalMs: 60_000,
         sweepIntervalMs: 60_000,
       });
@@ -219,7 +219,7 @@ describe("startDistiller: metrics instrumentation", () => {
       enqueue(queueDb, "proj-x:self");
 
       const metrics = new MetricsRegistry();
-      const distiller = startDistiller(queueDb, pools, failingLlm, undefined, {
+      const distiller = startDistiller(queueDb, pools, failingLlm, {
         drainIntervalMs: 20, sweepIntervalMs: 10_000, metrics,
       });
       try {
@@ -256,7 +256,7 @@ describe("startDistiller: metrics instrumentation", () => {
         },
         { model: "stub" },
       );
-      const distiller = startDistiller(queueDb, pools, slowLlm, undefined, {
+      const distiller = startDistiller(queueDb, pools, slowLlm, {
         drainIntervalMs: 20, sweepIntervalMs: 10_000, metrics,
       });
       try {
@@ -278,7 +278,7 @@ describe("startDistiller: metrics instrumentation", () => {
       pools.resolve("proj-x", undefined, true);
 
       const metrics = new MetricsRegistry();
-      const distiller = startDistiller(queueDb, pools, failingLlm, undefined, {
+      const distiller = startDistiller(queueDb, pools, failingLlm, {
         drainIntervalMs: 60_000, sweepIntervalMs: 60_000, metrics,
       });
       try {
@@ -302,7 +302,7 @@ describe("startDistiller: sweep gate (only enqueue stores with undistilled turns
       initQueueSchema(queueDb);
       pools.resolve("proj-empty", undefined, true); // materialize, zero turns
 
-      const distiller = startDistiller(queueDb, pools, failingLlm, undefined, {
+      const distiller = startDistiller(queueDb, pools, failingLlm, {
         drainIntervalMs: 60_000, sweepIntervalMs: 20,
       });
       try {
@@ -324,7 +324,7 @@ describe("startDistiller: sweep gate (only enqueue stores with undistilled turns
       const store = pools.resolve("proj-new", undefined, true);
       await store.addStream("sess-1", [{ role: "user", content: "first turn ever" }]);
 
-      const distiller = startDistiller(queueDb, pools, failingLlm, undefined, {
+      const distiller = startDistiller(queueDb, pools, failingLlm, {
         drainIntervalMs: 60_000, sweepIntervalMs: 20,
       });
       try {
@@ -350,7 +350,7 @@ describe("startDistiller: sweep gate (only enqueue stores with undistilled turns
       const head = store.streamHeadSeq();
       setWatermark(db, "proj-caughtup:self", "some-turn-id", new Date().toISOString(), head);
 
-      const distiller = startDistiller(queueDb, pools, failingLlm, undefined, {
+      const distiller = startDistiller(queueDb, pools, failingLlm, {
         drainIntervalMs: 60_000, sweepIntervalMs: 15,
       });
       try {
@@ -379,7 +379,7 @@ describe("startDistiller: sweep gate (only enqueue stores with undistilled turns
       // Watermark behind head: only "turn one" processed so far.
       setWatermark(db, "proj-backlog:self", "turn-one-id", new Date().toISOString(), 1);
 
-      const distiller = startDistiller(queueDb, pools, failingLlm, undefined, {
+      const distiller = startDistiller(queueDb, pools, failingLlm, {
         drainIntervalMs: 60_000, sweepIntervalMs: 20,
       });
       try {
@@ -409,7 +409,7 @@ describe("startDistiller: sweep gate (only enqueue stores with undistilled turns
       const fresh = pools.resolve("proj-fresh", undefined, true);
       await fresh.addStream("sess-1", [{ role: "user", content: "brand new turn" }]);
 
-      const distiller = startDistiller(queueDb, pools, failingLlm, undefined, {
+      const distiller = startDistiller(queueDb, pools, failingLlm, {
         drainIntervalMs: 60_000, sweepIntervalMs: 20,
       });
       try {

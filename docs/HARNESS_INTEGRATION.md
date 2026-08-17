@@ -19,7 +19,7 @@ Everything below is built on three primitives:
 
 | Surface            | What it is                                  | Where documented |
 |--------------------|---------------------------------------------|------------------|
-| HTTP API           | `POST` JSON to `:8077` (`/stream/*`, `/atoms/*`, `/scenes/*`, `/core/*`, `/pools/*`), served by `falda serve` (or the legacy `falda gateway` standalone entry point) | `docs/API.md`, `docs/POOLS.md` |
+| HTTP API           | `POST` JSON to `:8077` (`/stream/*`, `/atoms/*`, `/scenes/*`, `/core/*`, `/pools/*`), served by `falda serve` | `docs/API.md`, `docs/POOLS.md` |
 | CLI                | `bin/falda` — same operations from a shell | `README.md` |
 | Multi-tenant addr  | tenant is selected via the `X-Falda-Tenant` header (not a body field); optional body `pool` ⇒ a shared pool instead of the tenant's private `self` store | `docs/POOLS.md` |
 
@@ -59,14 +59,14 @@ are three integration points, from lightest to deepest.
 Run FALDA alongside Hermes' existing memory, capturing in parallel without
 touching the live recall path. Two long-running processes, both under launchd:
 
-- **Gateway** — `npm run gateway` (or `bin/falda serve`) from a checkout of
-  this repo, pointed at a runtime data dir via env:
+- **Gateway** — `bin/falda serve --no-mcp` from a checkout of this repo,
+  pointed at a runtime data dir via env:
 
   ```bash
   FALDA_ROOT=~/.falda/data \
   FALDA_PORT=8077 \
   FALDA_EMBED=local \            # or remote; see docs/INSTALL.md
-  node --import tsx src/gateway.ts
+  node --import tsx src/server.ts --no-mcp
   ```
 
 - **Tap** — `integrations/external-source/falda_tap.py` tails the existing
@@ -134,9 +134,9 @@ on the same host as the FALDA gateway (CherryRd, macOS).
 
 ### 2a. Shadow capture
 
-- **Gateway**: `bin/falda serve` / `npm run gateway` already running on
-  CherryRd at `localhost:8077` under launchd label
-  `com.stevens.falda-gateway` (`KeepAlive=true`).
+- **Gateway**: `bin/falda serve` already running on CherryRd at
+  `localhost:8077` under launchd label `com.stevens.falda-gateway`
+  (`KeepAlive=true`).
 
 - **Tap**: `integrations/external-source/falda_tap.py` points at
   OpenClaw's L0 session-log export directory:
@@ -415,7 +415,7 @@ gateway runs pinned Node (native ABI dependency via `better-sqlite3`). Do not
 
 ## 5. Install / bootstrap order (replication-grade)
 
-The broker leg lives on the Hermes host (m1); see `KUKLA_DELTA.md` +
+The broker leg lives on the Hermes host (m1); see §4 above and
 `deploy/nats/` for the `nats-server.conf` 3-user ACL (note the
 `publish: $JS.>` JetStream grant gotcha) and stream-create commands. Once the
 broker + streams exist, bring up the OpenClaw side in this order:
@@ -426,7 +426,7 @@ broker + streams exist, bring up the OpenClaw side in this order:
 3.  npm rebuild better-sqlite3   # ABI must match the pinned Node; pin the
                                  # absolute node path in any launchd plist env
 4.  mkdir -p ~/.openclaw/falda-dualrun ~/.openclaw/logs ~/.falda
-5.  (Hermes host) start nats-server + create streams (KUKLA_DELTA.md)
+5.  (Hermes host) start nats-server + create streams (see §4 / deploy/nats/create-streams.sh)
 6.  (Hermes host) create durable consumers: sibline-ollie/ollie-inbox-durable,
     sibline-broadcast/ollie-bcast-durable
 7.  start FALDA gateway:  launchctl bootstrap + kickstart

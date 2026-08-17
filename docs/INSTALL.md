@@ -74,10 +74,6 @@ falda version
 boot without one — see `docs/API.md` "Authentication". This one token file
 is shared by both the HTTP API and the MCP endpoint.
 
-`falda gateway` and `falda mcp` remain available as legacy standalone entry
-points (HTTP-only / MCP-only, each its own process) for deployments that
-haven't migrated — see `docs/API.md` and `docs/MCP.md`.
-
 ## Running in Docker
 
 ```bash
@@ -134,8 +130,8 @@ const hits = await mem.recall("kukla", "what should I remember?");
 | `FALDA_EMBED_STRICT` | _(unset)_ | `1` turns an unconfigured embedder (no `FALDA_EMBED`/`FALDA_EMBED_BASE_URL`) into a startup `FATAL` instead of the silent local-embedder fallback below — opt in for production |
 
 `FALDA_DB` (a single store's SQLite path) applies only when embedding
-`Falda` directly as a library, not to `falda serve`/`falda gateway`/`falda
-mcp`, which always address stores through `FALDA_ROOT` + the pool layer.
+`Falda` directly as a library, not to `falda serve`, which always addresses
+stores through `FALDA_ROOT` + the pool layer.
 
 With no embedder configured, FALDA uses a built-in **deterministic local
 embedder** so `falda serve` and all four tiers work fully offline out of the

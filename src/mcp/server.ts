@@ -32,14 +32,10 @@
  * Atom type enum (§3.1): fact | pattern | preference | constraint | instruction.
  * Out-of-set values are rejected as errors (no coercion).
  *
- * Prefer `falda serve` (src/server.ts) for new deployments — it starts this
- * same MCP endpoint alongside the HTTP API (src/gateway.ts) from one shared
+ * `falda serve` (src/server.ts) is the only server entry point — it starts
+ * this MCP endpoint alongside the HTTP API (src/gateway.ts) from one shared
  * runtime (src/runtime.ts), with one canonical token file and one
- * distillation worker for both surfaces. src/mcp.ts's own IS_MAIN entry
- * point (`node dist/mcp.js`) is kept for backward compatibility; it runs
- * MCP only, with no distillation worker of its own (falda_distill still
- * enqueues into the shared queue — nothing will drain it unless a gateway
- * or `falda serve` process elsewhere owns that queue db).
+ * distillation worker for both surfaces.
  *
  * Env: see src/runtime.ts for the canonical set (FALDA_ROOT, FALDA_DIM,
  * FALDA_EMBED*, FALDA_TOKENS, FALDA_LLM_*). MCP-specific:

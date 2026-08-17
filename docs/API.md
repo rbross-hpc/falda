@@ -1,9 +1,9 @@
 # FALDA API
 
 All routes are `POST` with a JSON body and JSON response, except `/healthz` (`GET`).
-Default port: `8077` (`FALDA_PORT`). Served by `falda serve` (recommended —
-runs alongside the MCP endpoint from one shared runtime, see `docs/MCP.md`)
-or the standalone `falda gateway` legacy entry point (HTTP API only, no MCP).
+Default port: `8077` (`FALDA_PORT`). Served by `falda serve`, which runs
+this HTTP API alongside the MCP endpoint from one shared runtime — see
+`docs/MCP.md`. Pass `--no-mcp` for an HTTP-API-only process.
 
 ## Authentication
 
@@ -334,8 +334,8 @@ coalesced — a second explicit enqueue on top of an already-pending passive
 job upgrades that job's priority in place rather than creating a duplicate
 (returns the existing job id either way). Asynchronous — does not wait for
 distillation to complete. Drained by the single in-process distillation
-worker started by `falda serve` (or `falda gateway`) — see the README's
-"Distillation" section and `FALDA_DRAIN_INTERVAL_MS`/`FALDA_SWEEP_INTERVAL_MS`.
+worker started by `falda serve` — see the README's "Distillation" section
+and `FALDA_DRAIN_INTERVAL_MS`/`FALDA_SWEEP_INTERVAL_MS`.
 
 ### `POST /distill/status`
 ```json

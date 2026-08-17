@@ -118,7 +118,7 @@ export function requireTokenFile(path: string, label = "FALDA"): void {
       `FATAL: ${label} token file problem — ${result.reason}. ` +
         `Every request would be rejected with 401. Create the file with at least one ` +
         `{"tokens": {"<bearer-token>": {"tenants": [...], "pools": [...]}}} entry, or point ` +
-        `FALDA_MCP_TOKENS/FALDA_TOKENS at a valid file.`,
+        `FALDA_TOKENS at a valid file.`,
     );
     process.exit(1);
   }

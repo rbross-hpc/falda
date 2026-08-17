@@ -163,9 +163,9 @@ and persists only the hash.
 
 **Migration cost:** this is a breaking change to the token file format. It
 would invalidate:
-- The deployed `tokens.json` (both gateway and MCP, per
-  `docker-setups/stacks/alpha-beta/compose.yaml`).
-- `falda_mcp_tokens.example.json` and `falda_gateway_tokens.example.json`.
+- The deployed `tokens.json`, per
+  `docker-setups/stacks/alpha-beta/compose.yaml`.
+- `falda_tokens.example.json`.
 - Anyone who has hand-authored a token file per the current documented
   shape (`{"tokens": {"<raw-token>": {...}}}`).
 

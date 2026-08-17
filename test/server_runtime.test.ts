@@ -221,7 +221,9 @@ describe("HTTP and MCP share one runtime", () => {
     // the goal here is only to prove the *job transitions off pending*,
     // not to prove distillOnce's LLM-dependent internals (covered elsewhere).
     const stubLlm = async () => { throw new Error("no LLM in this test — distillOnce may fail, that's fine"); };
-    const distiller = startDistiller(runtime.queueDb, runtime.pools, stubLlm, 20);
+    const distiller = startDistiller(runtime.queueDb, runtime.pools, stubLlm, {
+      drainIntervalMs: 20, sweepIntervalMs: 20,
+    });
     try {
       // The stub LLM makes distillOnce fail, so failJob() reschedules the job
       // back to 'pending' with backoff rather than leaving it in a terminal
