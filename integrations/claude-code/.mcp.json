@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "falda": {
+      "type": "http",
+      "url": "${FALDA_MCP_URL:-http://localhost:8079/mcp}",
+      "headers": {
+        "Authorization": "Bearer ${FALDA_TOKEN}",
+        "X-Falda-Tenant": "${FALDA_TENANT}"
+      }
+    }
+  }
+}

@@ -112,6 +112,11 @@ ships a `Dockerfile` running `falda serve` by default (see
 [`docs/INSTALL.md`](docs/INSTALL.md) "Running in Docker"), and
 [`integrations/opencode/README.md`](integrations/opencode/README.md) for the
 opencode-specific setup (Compose recipe, MCP config, auto-capture plugin).
+For a single-user Claude Code session against the same MCP endpoint, see
+[`integrations/claude-code/README.md`](integrations/claude-code/README.md) —
+the Claude Code equivalent: an installable plugin providing the same
+auto-capture/auto-recall/auto-distill behaviour via hooks instead of an
+in-process plugin.
 
 To connect an agent runtime (Hermes, OpenClaw, opencode, or your own) to
 FALDA — shadow or live, single-tenant or shared-pool — see

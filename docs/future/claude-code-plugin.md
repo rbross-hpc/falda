@@ -44,7 +44,7 @@ Four disciplines from that plugin are load-bearing and are preserved here:
 |---|---|---|
 | Plugin model | in-process TS module, long-lived closure | hooks are **separate processes**, one per event |
 | State | in-memory `Map`/`Set` | must be on disk |
-| Message text | streamed `Part` objects, reassembled by `messageID` | delivered whole: `user_prompt`, `last_assistant_message` |
+| Message text | streamed `Part` objects, reassembled by `messageID` | delivered whole: `prompt`, `last_assistant_message` |
 | Recall injection | mutate `output.parts` on `chat.message` | `hookSpecificOutput.additionalContext` |
 | Compaction trigger | `experimental.session.compacting` | `PreCompact` / `PostCompact` (**both stable**) |
 | Credential source | `client.config.get()` → `mcp.falda.headers` | `${FALDA_*}` env, shared with `.mcp.json` |
@@ -112,8 +112,8 @@ A repo-root `.claude-plugin/marketplace.json` makes it installable via
 
 | Hook | Config | Subcommand | Behaviour |
 |---|---|---|---|
-| `UserPromptSubmit` | `async: true` | `capture-user` | `falda_stream_add` with the `user_prompt` |
-| `UserPromptSubmit` | `timeout: 5` | `auto-recall` | if first-of-session **or** post-compact pending → `falda_recall` (`mode: "auto"`), inject |
+| `UserPromptSubmit` | `async: true` | `capture-user` | `falda_stream_add` with the `prompt` |
+| `UserPromptSubmit` | `timeout: 10` | `auto-recall` | if first-of-session **or** post-compact pending → `falda_recall` (`mode: "auto"`), inject |
 | `Stop` | `async: true` | `capture-assistant` | `falda_stream_add` with `last_assistant_message` |
 | `PreCompact` | `async: true` | `distill` | `falda_distill {}`, fire-and-forget |
 | `PostCompact` | `async: true` | `mark-compacted` | set `postCompactPending` |
@@ -126,12 +126,29 @@ delay the prompt, so it is async; recall must be synchronous because its
 output has to reach the model with the prompt. They are independent — recall
 queries long-term memory, not the current turn — so ordering does not matter.
 
-Input fields used, per the hook reference: `session_id` and `prompt_id`
-(common); `user_prompt` (`UserPromptSubmit`); `last_assistant_message`
-(`Stop`). Nothing reads `transcript_path` — that is what the
-`last_assistant_message` decision below buys. `PreCompact` fires distill
-regardless of `compaction_reason`, and `PostCompact` needs no fields beyond
-`session_id`.
+Input fields used: `session_id` and `prompt_id` (common, `prompt_id`
+optional — see "Capture and idempotency" below); `prompt`
+(`UserPromptSubmit`); `last_assistant_message` (`Stop`). Nothing reads
+`transcript_path` — that is what the `last_assistant_message` decision
+below buys. `PreCompact` fires distill regardless of `trigger`, and
+`PostCompact` needs no fields beyond `session_id`.
+
+**The published Claude Code hook reference is wrong about the
+`UserPromptSubmit` field name and about the `PreCompact` field name.** It
+documents `user_prompt`; the field the binary actually emits is `prompt`
+(verified directly against a shipped `claude` binary — `strings -a
+~/.local/share/claude/versions/<version> | grep -o
+'hook_event_name:"UserPromptSubmit".\{0,120\}'` yields
+`hook_event_name:"UserPromptSubmit",prompt:r,...`; the string
+`user_prompt` appears in that binary only as an OpenTelemetry span
+attribute, never in a hook payload). It documents `compaction_reason` for
+`PreCompact`; the real field is `trigger`. This was the source of a
+critical bug in an earlier version of this plugin (`capture-user` and
+`auto-recall` both read the non-existent `input.user_prompt`, so user
+prompts were silently never captured and recall was silently dead). The
+code now reads `input.prompt ?? input.user_prompt` defensively, but do
+**not** "fix" this document, the code, or the tests back to treating
+`user_prompt` as primary — `prompt` is the real field.
 
 Injection shape:
 
@@ -155,7 +172,7 @@ without modification.
 ```json
 { "mcpServers": { "falda": {
     "type": "http",
-    "url": "${FALDA_MCP_URL}",
+    "url": "${FALDA_MCP_URL:-http://localhost:8079/mcp}",
     "headers": {
       "Authorization": "Bearer ${FALDA_TOKEN}",
       "X-Falda-Tenant": "${FALDA_TENANT}"
@@ -218,6 +235,16 @@ the server is the idempotency authority, so two concurrently-running async
 hooks cannot corrupt anything, and a retry is always safe. A `409` is logged
 and dropped, never retried.
 
+`prompt_id` is **optional** in the real payload (the shipped binary builds
+it as `Qst() ?? void 0`, i.e. it can be absent). When it is missing, the
+hooks omit `turn_id` entirely rather than send a fixed literal like
+`"cc-undefined-user"` for the whole session — the invariant-2 check above
+(`src/falda.ts:546-552`) matches on `turn_id` **without comparing content**,
+so a colliding constant `turn_id` would make every second-and-later turn in
+that session look like a replay of the first and be silently discarded.
+Omitting `turn_id` instead means duplicates are possible (no dedup key),
+which is far cheaper than silent data loss.
+
 Only user prose and assistant prose are captured. Tool calls and tool
 results are not — matching opencode, which filters to `part.type === "text"`
 (`falda-capture.ts:309`) and drops system messages (`:320`). Distillation
@@ -278,10 +305,21 @@ Commands, which have no opencode equivalent:
 
 | Command | Does |
 |---|---|
-| `/falda:recall <query>` | deliberate full-budget recall (not `mode: "auto"`) |
-| `/falda:remember <content>` | store an atom, prompting for `type` if ambiguous |
-| `/falda:status` | `falda_whoami` + `GET :8079/healthz` (unauthenticated) |
-| `/falda:distill` | force an out-of-cycle distillation pass |
+| `/falda-memory:recall <query>` | deliberate full-budget recall (not `mode: "auto"`) |
+| `/falda-memory:remember <content>` | store an atom, prompting for `type` if ambiguous |
+| `/falda-memory:status` | `falda_whoami` + `GET :8079/healthz` (unauthenticated) |
+| `/falda-memory:distill` | force an out-of-cycle distillation pass |
+
+Slash commands and skills are namespaced by **plugin** name
+(`.claude-plugin/plugin.json`'s `name`, here `falda-memory`), never by
+marketplace name (here `falda`, from the repo-root
+`.claude-plugin/marketplace.json`). Verified the same way as the
+`UserPromptSubmit` field name above: by inspecting how an installed
+plugin's own commands/skills resolve at runtime (e.g. an installed
+`superpowers` plugin, whose marketplace is `claude-plugins-official`,
+exposes `superpowers:brainstorming` — namespaced by the plugin name, not
+the marketplace name). Do not "fix" the invocation back to `/falda:...`
+to match the plugin's own display name; that string does not resolve.
 
 ## Configuration
 
@@ -362,7 +400,7 @@ already spins a real server on port 0 with a temp root and token file:
   intermediate-prose gap, or is the final response the better distillation
   input on purpose? Worth revisiting once there is real T1 output to judge
   the quality of.
-- Should `/falda:status` shell out to `falda stats` (offline, richer) rather
+- Should `/falda-memory:status` shell out to `falda stats` (offline, richer) rather
   than the MCP/HTTP surfaces? That would couple the plugin to a local
   checkout, which the rest of the design avoids.
 - The dependency-free MCP client assumes FALDA's endpoint keeps accepting
