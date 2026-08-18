@@ -450,6 +450,88 @@ test("deleteStream returns affected_atom_ids", async () => {
   } finally { cleanup(s, blobDir); }
 });
 
+// ─── 10b. Stream deletion removes FTS/vector index rows (finding 5) ────────────
+
+test("deleteStream({ ids }) purges stream_fts/stream_vec and is unreachable by search", async () => {
+  const { s, blobDir } = makeStore();
+  try {
+    const [keepId, killId] = await s.addStream("sess-del-1", [
+      { role: "user", content: "the quokka wandered across the boardwalk" },
+      { role: "user", content: "photosynthesis converts sunlight into chemical energy" },
+    ]);
+
+    let hits = await s.searchStream("photosynthesis chemical energy", 5);
+    assert.ok(hits.some((h) => h.id === killId), "target turn is findable before deletion");
+
+    const result = s.deleteStream({ ids: [killId] });
+    assert.equal(result.deleted_count, 1);
+
+    hits = await s.searchStream("photosynthesis chemical energy", 5);
+    assert.ok(!hits.some((h) => h.id === killId), "deleted turn no longer surfaces in search");
+
+    const stillFound = await s.searchStream("quokka boardwalk", 5);
+    assert.ok(stillFound.some((h) => h.id === keepId), "non-deleted turn still surfaces");
+
+    const db = (s as any).db;
+    const ftsRow = db.prepare("SELECT id FROM stream_fts WHERE id=?").get(killId);
+    const vecRow = db.prepare("SELECT id FROM stream_vec WHERE id=?").get(killId);
+    assert.equal(ftsRow, undefined, "stream_fts row physically removed");
+    assert.equal(vecRow, undefined, "stream_vec row physically removed");
+  } finally { cleanup(s, blobDir); }
+});
+
+test("deleteStream({ session_id }) purges stream_fts/stream_vec for every turn in the session", async () => {
+  const { s, blobDir } = makeStore();
+  try {
+    const ids = await s.addStream("sess-del-2", [
+      { role: "user", content: "volcanic basalt cools into dark fine-grained rock" },
+      { role: "user", content: "basalt columns form hexagonal jointing patterns" },
+    ]);
+    await s.addStream("sess-keep", [
+      { role: "user", content: "an unrelated turn about migratory birds" },
+    ]);
+
+    const result = s.deleteStream({ session_id: "sess-del-2" });
+    assert.equal(result.deleted_count, 2);
+
+    const hits = await s.searchStream("volcanic basalt hexagonal jointing", 5);
+    assert.equal(hits.filter((h) => ids.includes(h.id)).length, 0, "no deleted turns surface");
+
+    const db = (s as any).db;
+    const placeholders = ids.map(() => "?").join(",");
+    const ftsRows = db.prepare(`SELECT id FROM stream_fts WHERE id IN (${placeholders})`).all(...ids);
+    const vecRows = db.prepare(`SELECT id FROM stream_vec WHERE id IN (${placeholders})`).all(...ids);
+    assert.equal(ftsRows.length, 0, "all stream_fts rows for the session removed");
+    assert.equal(vecRows.length, 0, "all stream_vec rows for the session removed");
+  } finally { cleanup(s, blobDir); }
+});
+
+test("migrate() sweeps orphaned stream_fts/stream_vec rows left by pre-fix deletions", async () => {
+  const blobDir = fs.mkdtempSync(path.join(os.tmpdir(), "falda-orphan-"));
+  const dbPath = path.join(blobDir, "test.db");
+  try {
+    const s1 = new Falda({ dbPath, blobDir, embed: makeLocalEmbedder(32), dim: 32 });
+    const [id] = await s1.addStream("sess-orphan", [
+      { role: "user", content: "content that will be orphaned in the indexes" },
+    ]);
+    // Simulate the pre-fix bug: remove only the primary row, leaving
+    // stream_fts/stream_vec behind.
+    const db1 = (s1 as any).db;
+    db1.prepare("DELETE FROM stream WHERE id=?").run(id);
+    assert.ok(db1.prepare("SELECT id FROM stream_fts WHERE id=?").get(id), "orphan present before reopen");
+    assert.ok(db1.prepare("SELECT id FROM stream_vec WHERE id=?").get(id), "orphan present before reopen");
+    s1.close();
+
+    const s2 = new Falda({ dbPath, blobDir, embed: makeLocalEmbedder(32), dim: 32 });
+    const db2 = (s2 as any).db;
+    assert.equal(db2.prepare("SELECT id FROM stream_fts WHERE id=?").get(id), undefined, "orphan swept on reopen");
+    assert.equal(db2.prepare("SELECT id FROM stream_vec WHERE id=?").get(id), undefined, "orphan swept on reopen");
+    s2.close();
+  } finally {
+    fs.rmSync(blobDir, { recursive: true, force: true });
+  }
+});
+
 // ─── 11. Migration idempotency ─────────────────────────────────────────────────
 
 test("migration: creating a second Falda on the same db path is a no-op", async () => {

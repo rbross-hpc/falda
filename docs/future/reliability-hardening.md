@@ -271,7 +271,7 @@ in-flight tracking used for HTTP (the MCP SDK owns that request's
 lifecycle). Tests: `test/graceful_shutdown.test.ts`,
 "startDistiller: graceful stop()" in `test/distill_worker.test.ts`.
 
-**5. Stream deletion leaves stale FTS/vector index rows.**
+**5. Stream deletion leaves stale FTS/vector index rows. — ✅ addressed**
 `addStream()` writes all three representations (row, FTS, vector;
 `src/falda.ts:509-513,561-564`), but `deleteStream()` only removes
 evidence and the primary `stream` row — never `stream_fts` or
@@ -283,6 +283,36 @@ remains recoverable from the index tables.
 *Recommendation:* delete primary, FTS, vector, and evidence rows in one
 transaction; add a test asserting deleted content is unreachable by both
 lexical and vector search.
+
+**Landed:** `deleteStream()` now runs entirely inside one
+`db.transaction(...).immediate()` (finding-1 pattern), and both of its
+resolution paths (`{ ids }` and `{ session_id }`) delete the matching
+`stream_fts` and `stream_vec` rows alongside `atom_evidence` and the
+primary `stream` row — so a deletion request removes all four
+representations atomically or none of them. `deleteStream` is a
+caller-invoked operation only (`POST /stream/delete`; nothing in the
+distillation pipeline calls it), used for retraction, correction, or
+privacy erasure of raw turn content (`docs/MODEL.md` §5.4); leaving the
+FTS/vector rows behind meant "deleted" text was still physically
+recoverable and still consumed `hybridStream`'s candidate slots
+(`src/falda.ts:1430-1448`), which this closes. `markStoreDirty()`
+(finding 2) still fires after the transaction commits, unchanged. The
+deliberate no-cascade-to-atoms policy (`affected_atom_ids` returned,
+atoms never auto-deleted/archived) is untouched.
+
+A one-time repair also runs in `migrate()`: any `stream_fts`/`stream_vec`
+row whose `id` has no matching primary `stream` row (an orphan left by a
+pre-fix deletion) is removed on next store open. Idempotent — a store
+with no history of the bug removes zero rows.
+
+Tests (`test/data_model_schema.test.ts`): deleting by `ids` and by
+`session_id` each purge `stream_fts`/`stream_vec` for exactly the deleted
+turns, verified both via `searchStream()` (the deleted content is
+unreachable and a sibling turn still surfaces) and via direct row counts
+against the index tables (proving physical removal, not just a
+join-filtered display); a fourth test seeds a pre-fix-style orphan
+(primary row deleted, index rows left behind) and asserts it is gone
+after reopening the store.
 
 **6. Legacy-schema migration can fail before `migrate()` runs.**
 `initSchema()` creates indexes against newer columns (`stream.seq`
