@@ -376,7 +376,7 @@ one contract throughout. None of these surfaces are covered by CI
 (`.github/workflows/ci.yml:27-34` runs only `npm ci && npm run build &&
 npm test`), so add at least a smoke check per integration.
 
-**9. OpenCode capture plugin can lose a turn on a failed flush.**
+**9. OpenCode capture plugin can lose a turn on a failed flush. — ✅ addressed**
 `flush()` deletes the pending message from local state *before* calling
 FALDA (`integrations/opencode/plugin/falda-capture.ts:273-284`); on
 failure it only reverts `flushedIds`, not the removed pending content
@@ -390,6 +390,31 @@ automated test coverage.
 *Recommendation:* restore the pending entry (not just `flushedIds`) on a
 failed `callFaldaStreamAdd`, so a later retry or flush attempt can still
 deliver it.
+
+**Landed:** the pending-text/flush bookkeeping (previously three closure-
+local `Map`/`Set`s and an inline `flush()` inside the plugin factory) was
+extracted into a new, dependency-free module,
+`integrations/opencode/plugin/capture-flush.ts`'s `CaptureFlushQueue`. Its
+`flush()` now captures the pending entry and any prior `settledRole`
+before removing them, and on a failed `send()` restores **both** (not
+just the flushed-id marker) and rethrows — so a later text-part update,
+settle event, or flush retry can still deliver the turn; nothing is lost
+on a single failed attempt. `falda-capture.ts` now delegates to this
+queue instead of managing the three maps/sets itself; its behavior
+(feature set, event wiring, logging) is otherwise unchanged.
+
+Extracting the state machine also closes the finding's "no automated test
+coverage" gap: `integrations/` was previously untestable by `npm test`
+because it type-imports `@opencode-ai/plugin`, which isn't installed in
+this repo and isn't in `tsconfig.json`'s `include`. `capture-flush.ts` has
+no such import, so `test/capture_flush.test.ts` (6 tests) can import and
+exercise it directly: successful delivery clears state and is never
+re-delivered; a failed `send()` restores both the pending entry and any
+prior `settledRole` (verified by asserting the turn is still deliverable
+afterward — the actual finding); a retry after a failure delivers exactly
+once (no loss, no duplication); a text-part update between a failed
+attempt and its retry (the full-accumulated-text overwrite behavior)
+still delivers correctly; and blank/no-pending calls remain true no-ops.
 
 ### Medium
 

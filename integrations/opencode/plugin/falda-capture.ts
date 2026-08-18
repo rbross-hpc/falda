@@ -118,6 +118,7 @@
 import type { Plugin, PluginInput } from "@opencode-ai/plugin";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import { CaptureFlushQueue } from "./capture-flush.js";
 
 interface FaldaCreds { url: string; token: string; tenant: string; }
 
@@ -147,8 +148,6 @@ async function resolveFaldaCreds(client: PluginInput["client"], directory: strin
   if (url && token && tenant) return { url, token, tenant };
   return undefined;
 }
-
-interface PendingText { sessionID: string; text: string[]; }
 
 async function callFaldaStreamAdd(creds: FaldaCreds, sessionId: string, role: string, content: string, id: string) {
   const transport = new StreamableHTTPClientTransport(new URL(creds.url), {
@@ -261,29 +260,22 @@ export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
   // a session that compacts N times gets up to N post-compaction recalls.
   const pendingPostCompactRecall = new Set<string>();
 
-  // messageID -> accumulated text parts, until the message settles.
-  const pending = new Map<string, PendingText>();
-  // messageID -> role, for messages whose message.updated (settled) event
-  // arrived before their text part(s) did — flush as soon as the text
-  // part shows up.
-  const settledRole = new Map<string, string>();
-  // messageID already flushed to FALDA, to avoid double-capture.
-  const flushedIds = new Set<string>();
+  // Pending-text bookkeeping + flush-with-restore-on-failure — see
+  // capture-flush.ts (docs/future/reliability-hardening.md finding 9).
+  const flushQueue = new CaptureFlushQueue();
 
   async function flush(messageId: string, role: string) {
-    const entry = pending.get(messageId);
-    if (!entry || flushedIds.has(messageId)) return;
-    const text = entry.text.join("\n").trim();
-    if (!text) return;
+    if (!flushQueue.hasDeliverableText(messageId)) return;
     const creds = await getCreds();
-    if (!creds) return;
-    pending.delete(messageId);
-    settledRole.delete(messageId);
-    flushedIds.add(messageId);
+    if (!creds) return; // state untouched — retried on the next part/settle event
     try {
-      await callFaldaStreamAdd(creds, entry.sessionID, role, text, messageId);
+      await flushQueue.flush(messageId, role, ({ sessionID, text }) =>
+        callFaldaStreamAdd(creds, sessionID, role, text, messageId));
     } catch (e) {
-      flushedIds.delete(messageId);
+      // flushQueue.flush() already restored pending/settledRole on failure
+      // (the actual fix — previously the accumulated text was lost here),
+      // so a later text-part update or settle event, or the next flush()
+      // call for this message id, can still deliver it.
       await client.app.log({
         body: { service: "falda-capture", level: "warn", message: "capture failed", extra: { error: String(e) } },
       }).catch(() => {});
@@ -307,10 +299,8 @@ export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
       if (event.type === "message.part.updated") {
         const part = (event.properties as any)?.part;
         if (part?.type !== "text" || !part.text) return;
-        const entry = pending.get(part.messageID) ?? { sessionID: part.sessionID, text: [] };
-        entry.text = [part.text]; // TextPart carries the full accumulated text, not a delta
-        pending.set(part.messageID, entry);
-        const role = settledRole.get(part.messageID);
+        flushQueue.recordPart(part.messageID, part.sessionID, part.text);
+        const role = flushQueue.getSettledRole(part.messageID);
         if (role) await flush(part.messageID, role);
         return;
       }
@@ -321,10 +311,10 @@ export const FaldaCapturePlugin: Plugin = async ({ client, directory }) => {
         const isSettled = message.role === "user" || message.time?.completed !== undefined;
         if (!isSettled) return;
 
-        if (pending.has(message.id)) {
+        if (flushQueue.hasPending(message.id)) {
           await flush(message.id, message.role);
         } else {
-          settledRole.set(message.id, message.role);
+          flushQueue.setSettledRole(message.id, message.role);
         }
       }
     } : undefined,
