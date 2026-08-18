@@ -324,11 +324,15 @@ async function distillOncePass(
   } = ctx;
 
   // ── L1: Extract + Consolidate (one atomic transaction) ────────────────────
-
-  // ── L1 async work: LLM calls BEFORE the transaction ────────────────────────
-  // better-sqlite3 transactions are synchronous — no async functions inside.
-  // Strategy: do all async work (LLM calls, embeddings) outside the transaction,
-  // collect the resulting write operations, then commit them atomically.
+  //
+  // Atomicity contract (docs/MODEL.md §8.5, docs/future/reliability-hardening.md
+  // finding 1): atom rows, their atoms_fts/atoms_vec index rows, evidence
+  // edges, lifecycle changes (supersede/merge), consolidation_decisions, and
+  // the watermark advance all commit in ONE synchronous SQLite transaction,
+  // or none of them do. better-sqlite3 transactions must be fully
+  // synchronous, so ALL async work (LLM calls, embeddings, candidate search)
+  // happens below, before the transaction opens. Nothing after that point
+  // may await anything.
 
   const streamIds = turns.map((t) => t.id);
 
@@ -345,7 +349,6 @@ async function distillOncePass(
     candidate: CandidateAtom;
     newId: string;
     validTargetIds: string[];
-    oldEvidence: string[];  // for update/merge: evidence from absorbed atoms
     rationale: string;
     decId: string;
   }
@@ -359,17 +362,14 @@ async function distillOncePass(
     }));
     const decRaw = await llm(consolidationPrompt(candidate, existing));
     const dec = parseConsolidation(decRaw);
-    const validTargetIds = dec.target_ids.filter((id) => existing.some((e) => e.id === id));
+    // Normalize to stable first-occurrence uniqueness — the LLM can repeat
+    // an id in target_ids, which would otherwise cause duplicate lifecycle
+    // writes below.
+    const validTargetIds = [...new Set(
+      dec.target_ids.filter((id) => existing.some((e) => e.id === id)),
+    )];
     const newId = atomIdFromContent(candidate.type, candidate.content);
     const decId = `${pid}-dec-${i}`;
-
-    // Collect old evidence for update/merge now (before tx) so tx is sync.
-    const oldEvidence: string[] = [];
-    if ((dec.action === "update" || dec.action === "merge") && validTargetIds.length > 0) {
-      for (const tid of validTargetIds) {
-        store.evidenceForAtom(tid).forEach((e) => oldEvidence.push(e.stream_id));
-      }
-    }
 
     const action =
       (dec.action === "store" || (validTargetIds.length === 0 && dec.action !== "skip")) ? "store"
@@ -377,46 +377,67 @@ async function distillOncePass(
       : dec.action === "merge" && validTargetIds.length >= 1 ? "merge"
       : "skip";
 
-    writeOps.push({ action, candidate, newId, validTargetIds, oldEvidence, rationale: dec.rationale, decId });
+    writeOps.push({ action, candidate, newId, validTargetIds, rationale: dec.rationale, decId });
   }
 
-  // Now embed all new-atom content before the transaction (async work done).
-  // Pre-embed: for each store/update/merge op, we need the embedding to call upsertAtom.
-  // upsertAtom itself is async (it embeds). We call it outside tx and collect the rows.
-  // Then the tx just records everything synchronously.
-
+  // Precompute (and validate) one embedding per UNIQUE non-skip atom id —
+  // sequentially, not in parallel, to preserve existing call ordering and
+  // keep remote-embedder load and failure-injection behavior predictable.
+  // No DB writes happen here. Deliberately NOT gated on "does this id
+  // already exist" — an existing deterministic id still needs a prepared
+  // embedding so the write phase can repair a historical partial write
+  // (e.g. an atom row with no FTS/vector row from before this fix).
   interface PreparedAtom {
-    id: string; type: AtomType; content: string; confidence: AtomConfidence;
+    id: string; type: AtomType; content: string; confidence: AtomConfidence; embedding: number[];
   }
   const preparedAtoms = new Map<string, PreparedAtom>();
   for (const op of writeOps) {
     if (op.action === "skip") continue;
     if (!preparedAtoms.has(op.newId)) {
-      const existing = db.prepare("SELECT id FROM atoms WHERE id=?").get(op.newId);
-      if (!existing) {
-        // Pre-call upsertAtom (async, embeds content, inserts row).
-        // We do this outside the transaction so embedding can be async.
-        const a = await store.upsertAtom({
-          id: op.newId,
-          type: op.candidate.type,
-          content: op.candidate.content,
-          confidence: op.candidate.confidence,
-        });
-        preparedAtoms.set(op.newId, { id: a.id, type: a.type, content: a.content, confidence: a.confidence });
-      }
+      const embedding = await store.prepareAtomEmbedding(op.candidate.content);
+      preparedAtoms.set(op.newId, {
+        id: op.newId, type: op.candidate.type, content: op.candidate.content,
+        confidence: op.candidate.confidence, embedding,
+      });
     }
   }
 
-  // Synchronous transaction: record evidence edges, lifecycle changes, decisions, watermark.
-  db.exec("BEGIN IMMEDIATE");
-  try {
+  // ── Synchronous L1 transaction ─────────────────────────────────────────────
+  // Everything below this point is synchronous. Counters/log messages are
+  // accumulated locally and only applied to `result`/emitted after the
+  // transaction commits — SQLite rollback does not undo JS mutations or
+  // console output, so applying them eagerly could report success for
+  // writes that were actually rolled back.
+  let txAtomsStored = 0, txAtomsUpdated = 0, txAtomsMerged = 0, txAtomsSkipped = 0;
+  const txLogs: string[] = [];
+  const countedStoredIds = new Set<string>();
+
+  const commitL1 = db.transaction(() => {
+    // Phase A: ensure/repair each unique prepared atom exactly once. Doing
+    // this once per unique id (rather than once per write-op) means
+    // duplicate extracted candidates don't repeatedly delete+reinsert the
+    // same FTS/vector rows.
+    const writeResults = new Map<string, { inserted: boolean }>();
+    for (const atom of preparedAtoms.values()) {
+      const res = store.upsertDistilledAtomSync(
+        { id: atom.id, type: atom.type, content: atom.content, confidence: atom.confidence },
+        atom.embedding,
+      );
+      writeResults.set(atom.id, { inserted: res.inserted });
+    }
+
+    // Phase B: per-candidate evidence / lifecycle / decision writes, in
+    // original candidate order (preserves consolidation-decision ordering
+    // and audit shape even when multiple candidates share one atom id).
     for (const op of writeOps) {
       if (op.action === "store") {
-        const atom = preparedAtoms.get(op.newId);
-        if (atom) {
-          store.addEvidence(atom.id, streamIds);
-          result.atoms_stored++;
-          log(`[distill] stored atom ${atom.id}`);
+        if (preparedAtoms.has(op.newId)) {
+          store.addEvidence(op.newId, streamIds);
+          if (!countedStoredIds.has(op.newId)) {
+            countedStoredIds.add(op.newId);
+            txAtomsStored++;
+            txLogs.push(`[distill] stored atom ${op.newId}`);
+          }
         }
         store.recordDecision({
           id: op.decId, pass_id: pid, action: "store", atom_id: op.newId, rationale: op.rationale,
@@ -426,11 +447,19 @@ async function distillOncePass(
 
       } else if (op.action === "update") {
         const oldId = op.validTargetIds[0];
-        const atom = preparedAtoms.get(op.newId);
-        if (atom && op.newId !== oldId) {
-          store.addEvidence(atom.id, [...op.oldEvidence, ...streamIds]);
-          store.supersedeAtom(oldId, op.newId);
-          result.atoms_updated++;
+        if (preparedAtoms.has(op.newId)) {
+          // Inherited evidence is read here, inside the transaction, so it
+          // reflects the current committed state rather than a snapshot
+          // taken before the (possibly long) async planning phase above.
+          const inherited = store.evidenceForAtom(oldId).map((e) => e.stream_id);
+          // Always attach evidence for this pass's turns, even when
+          // newId === oldId ("update-to-self") — only the supersede
+          // lifecycle write is conditional on the ids actually differing.
+          store.addEvidence(op.newId, [...new Set([...inherited, ...streamIds])]);
+          if (op.newId !== oldId) {
+            store.supersedeAtom(oldId, op.newId);
+            txAtomsUpdated++;
+          }
         }
         store.recordDecision({
           id: op.decId, pass_id: pid, action: "update", atom_id: op.newId, target_ids: [oldId], rationale: op.rationale,
@@ -439,12 +468,23 @@ async function distillOncePass(
         });
 
       } else if (op.action === "merge") {
-        const atom = preparedAtoms.get(op.newId);
-        if (atom) {
-          const allEvidence = new Set<string>([...op.oldEvidence, ...streamIds]);
-          store.addEvidence(atom.id, [...allEvidence]);
-          store.mergeAtoms(op.validTargetIds, op.newId);
-          result.atoms_merged++;
+        if (preparedAtoms.has(op.newId)) {
+          const inherited = new Set<string>();
+          for (const tid of op.validTargetIds) {
+            store.evidenceForAtom(tid).forEach((e) => inherited.add(e.stream_id));
+          }
+          for (const sid of streamIds) inherited.add(sid);
+          store.addEvidence(op.newId, [...inherited]);
+          // Exclude the winner from lifecycle losers — the LLM's
+          // target_ids can include the atom id it just decided to keep
+          // (e.g. when recall surfaces the deterministic id itself as a
+          // candidate target), and mergeAtoms() would otherwise mark that
+          // winner 'merged' too.
+          const lifecycleLosers = op.validTargetIds.filter((id) => id !== op.newId);
+          if (lifecycleLosers.length > 0) {
+            store.mergeAtoms(lifecycleLosers, op.newId);
+            txAtomsMerged++;
+          }
         }
         store.recordDecision({
           id: op.decId, pass_id: pid, action: "merge", atom_id: op.newId, target_ids: op.validTargetIds, rationale: op.rationale,
@@ -461,16 +501,27 @@ async function distillOncePass(
           candidate_type: op.candidate.type, candidate_content: op.candidate.content,
           candidate_confidence: op.candidate.confidence,
         });
-        result.atoms_skipped++;
+        txAtomsSkipped++;
       }
     }
+
     // Advance watermark — last thing in the transaction.
     setWatermark(db, storeKey, lastTurn.id, lastTurn.timestamp, lastTurn.seq);
-    db.exec("COMMIT");
-  } catch (e) {
-    try { db.exec("ROLLBACK"); } catch {}
-    throw e;
-  }
+  });
+
+  // .immediate() preserves the previous BEGIN IMMEDIATE write-lock timing;
+  // plain commitL1() would use a deferred transaction instead. Any throw
+  // inside the callback above rolls back every write it made, including
+  // the atoms/atoms_fts/atoms_vec writes from Phase A — this is the actual
+  // fix for finding 1 (previously those were written before the tx began).
+  commitL1.immediate();
+
+  // Only apply counters/logs once the transaction has durably committed.
+  result.atoms_stored += txAtomsStored;
+  result.atoms_updated += txAtomsUpdated;
+  result.atoms_merged += txAtomsMerged;
+  result.atoms_skipped += txAtomsSkipped;
+  for (const msg of txLogs) log(msg);
 
   // ── L2: Organize into scenes ──────────────────────────────────────────────
 
