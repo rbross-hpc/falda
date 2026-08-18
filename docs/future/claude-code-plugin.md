@@ -1,7 +1,8 @@
 # Claude Code plugin — design
 
-**Status: proposed / future work. Not yet implemented.** Nothing here has
-landed in `integrations/`. This document specifies a Claude Code plugin
+**Status: implemented.** The plugin lives at `integrations/claude-code/`;
+installing it is opt-in, and each feature is independently switchable by
+env var. This document specifies the Claude Code plugin
 that provides the same four memory behaviours the opencode plugin
 (`integrations/opencode/plugin/falda-capture.ts`) already provides, plus
 two Claude Code-native surfaces (a Skill and slash commands) that opencode

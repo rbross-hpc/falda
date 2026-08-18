@@ -68,6 +68,22 @@ your shell profile, a project `.envrc` (if you use direnv), or a
 }
 ```
 
+> **Put that block in the project's settings, not `~/.claude/settings.json`.**
+> Claude Code merges user-level settings into every project on the machine, so
+> a `FALDA_TENANT` set there quietly becomes the tenant for all of them: every
+> repo you open captures into one pool, and `falda_recall` in one project
+> returns another project's memories. Per-tenant isolation is the entire point
+> of the pool layer, and this defeats it in a single line.
+>
+> It is also close to invisible once done. `/falda-memory:status` reports the
+> tenant it resolved, but a wrong-because-shared tenant looks exactly like a
+> right one — the symptom shows up much later as unrelated memories surfacing
+> in recall. If that happens, check the *user-level* settings file first.
+>
+> The right homes are `.claude/settings.json` inside the project (committed —
+> `FALDA_MCP_URL` and `FALDA_TENANT`, no secrets) and
+> `.claude/settings.local.json` (kept out of git — `FALDA_TOKEN`).
+
 **This is the one design point worth understanding before anything else:**
 `.mcp.json` (the model's MCP tool connection) and every hook read the exact
 same three variables — not merely "consistent" values, the same lookup.
