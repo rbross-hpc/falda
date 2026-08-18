@@ -27,6 +27,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "test": "tsx --test test/*.test.ts",
+    "smoke": "tsx --test test/smoke.test.ts",
     "serve": "tsx src/server.ts",
     "stats": "tsx src/stats.ts",
     "reembed": "tsx src/reembed.ts",
