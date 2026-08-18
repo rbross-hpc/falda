@@ -239,7 +239,7 @@ describe("HTTP and MCP share one runtime", () => {
       assert.ok(job!.attempts > 0, "worker claimed and attempted the job at least once");
       assert.ok(job!.error, "worker recorded the (expected) failure from the stub LLM");
     } finally {
-      distiller.stop();
+      await distiller.stop();
     }
   });
 });
@@ -268,7 +268,7 @@ describe("serve() with --no-mcp", () => {
       const health = await fetch(`http://127.0.0.1:${port}/healthz`);
       assert.equal(health.status, 200, "HTTP API reachable");
     } finally {
-      handle?.close();
+      await handle?.close();
       fs.rmSync(root, { recursive: true, force: true });
     }
   });

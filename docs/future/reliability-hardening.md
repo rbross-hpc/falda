@@ -101,7 +101,7 @@ auto-swept (unchanged; separate from this finding). Tests:
 `test/distill_worker.test.ts`'s "startDistiller: crash recovery on
 startup".
 
-**4. Shutdown is not graceful; remote calls have no timeout. — partially addressed**
+**4. Shutdown is not graceful; remote calls have no timeout. — ✅ addressed**
 `ServeHandle.close()` stops timers and immediately closes listeners and
 SQLite handles without waiting for in-flight HTTP/MCP requests or a
 running distillation pass (`src/server.ts:173-178`); `DistillerHandle.stop()`
@@ -116,14 +116,30 @@ orderly shutdown.
 await in-flight requests/jobs (with a bounded grace period), then close
 storage. Add timeouts/cancellation to outbound embedding and LLM calls.
 
-**Landed (remote-call timeouts only):** `makeEmbedder()`/`makeLLM()` now
-pass `AbortSignal.timeout(...)` on their `fetch` calls
-(`FALDA_EMBED_TIMEOUT_MS` default 30s, `FALDA_LLM_TIMEOUT_MS` default
-120s), surfacing a clear timeout error that flows into the existing
-`failJob` backoff/dead-letter path rather than hanging indefinitely. Tests:
-`test/remote_timeouts.test.ts`. The graceful-shutdown half (signal
-handlers, awaiting in-flight work before closing storage) is tracked
-separately as the next phase of this same finding.
+**Landed, remote-call timeouts:** `makeEmbedder()`/`makeLLM()` now pass
+`AbortSignal.timeout(...)` on their `fetch` calls (`FALDA_EMBED_TIMEOUT_MS`
+default 30s, `FALDA_LLM_TIMEOUT_MS` default 120s), surfacing a clear
+timeout error that flows into the existing `failJob` backoff/dead-letter
+path rather than hanging indefinitely. Tests: `test/remote_timeouts.test.ts`.
+
+**Landed, graceful shutdown:** `DistillerHandle.stop()` is now async — it
+stops the drain/sweep/prune timers and flips an internal `stopping` flag
+(so a concurrent `wake()` or in-flight drain tick can no longer claim new
+work), then awaits any job already in flight, bounded by
+`FALDA_SHUTDOWN_GRACE_MS`/`shutdownGraceMs` (default 10s) so a stuck pass
+cannot hang shutdown forever. `startHttpApi()` gained an `InFlightTracker`
+that wraps every request-handler promise; `ServeHandle.close()` is now
+async and, in order: stops the HTTP/MCP listeners from accepting new
+connections, awaits in-flight HTTP handlers and `distiller.stop()` in
+parallel (each independently bounded by the same grace period), then
+closes the pool/queue/trace databases. `close()` is idempotent. `falda
+serve`'s `IS_MAIN` entrypoint now installs `SIGTERM`/`SIGINT` handlers that
+call `close()` and exit 0 on success (exit 1 on error); a second signal
+during shutdown forces an immediate exit rather than waiting out the grace
+period again. MCP relies on its own listener close rather than the same
+in-flight tracking used for HTTP (the MCP SDK owns that request's
+lifecycle). Tests: `test/graceful_shutdown.test.ts`,
+"startDistiller: graceful stop()" in `test/distill_worker.test.ts`.
 
 **5. Stream deletion leaves stale FTS/vector index rows.**
 `addStream()` writes all three representations (row, FTS, vector;

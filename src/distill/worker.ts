@@ -54,6 +54,10 @@
  *                            job becomes reclaimable (src/distill/queue.ts's
  *                            claimNext/recoverStaleJobs). See
  *                            docs/future/reliability-hardening.md finding 3.
+ *   FALDA_SHUTDOWN_GRACE_MS  How long stop() waits for an in-flight job to
+ *                            finish before returning anyway (default 10000).
+ *                            See docs/future/reliability-hardening.md
+ *                            finding 4.
  *
  * Crash recovery: on startup, before the first sweep/drain tick, this module
  * resets any 'running' job whose lease has already expired back to
@@ -64,6 +68,13 @@
  * itself reclaimable by the next claimNext() call, so recovery does not
  * strictly require the startup pass to run — it just avoids waiting out a
  * long-idle sweep interval before an orphaned job becomes visible again.
+ *
+ * Graceful shutdown: stop() is async. It first stops the three timers and
+ * flips an internal flag so no NEW job is claimed by either the timed drain
+ * or a wake() loop already in progress, then awaits any job(s) already
+ * in-flight (bounded by FALDA_SHUTDOWN_GRACE_MS) before returning — so
+ * src/server.ts's close() can safely close the pool/queue/trace databases
+ * afterward without racing a half-finished distillation pass.
  */
 import type { Database as DatabaseType } from "better-sqlite3";
 import { randomUUID } from "node:crypto";
@@ -91,14 +102,24 @@ const DEFAULT_SWEEP_INTERVAL_MS = 300_000;
  *  jobs are never claimed here (minPriority filters them out), so this only
  *  bounds explicit-priority backlogs, which should be rare and small. */
 const MAX_WAKE_DRAIN_PER_CALL = 50;
+/** How long stop() waits for in-flight job(s) to finish before giving up and
+ *  returning anyway — a bound, not a guarantee, so a stuck pass (e.g. an LLM
+ *  call somehow outliving FALDA_LLM_TIMEOUT_MS) cannot hang process
+ *  shutdown forever. See docs/future/reliability-hardening.md finding 4. */
+const DEFAULT_SHUTDOWN_GRACE_MS = 10_000;
 
 export interface DistillerHandle {
-  stop(): void;
+  /** Stop the timers and prevent any NEW job from being claimed, then await
+   *  job(s) already in flight (bounded by FALDA_SHUTDOWN_GRACE_MS /
+   *  opts.shutdownGraceMs) before resolving. Safe to call once; src/server.ts
+   *  awaits this before closing the pool/queue/trace databases so a
+   *  half-finished distillation pass never races a DB close. */
+  stop(): Promise<void>;
   /** Immediately drain all currently-ready EXPLICIT-priority jobs, without
    *  waiting for the next drainIntervalMs tick. Safe to call redundantly —
    *  concurrent wake() calls collapse into one in-flight drain loop. Never
    *  throws (drain failures are logged, matching the timed drain's
-   *  failJob()-based error handling). */
+   *  failJob()-based error handling). A no-op once stop() has been called. */
   wake(): void;
 }
 
@@ -116,6 +137,9 @@ export interface DistillerOptions {
   /** Claim lease duration, ms. Defaults to FALDA_DISTILL_LEASE_MS or
    *  DEFAULT_LEASE_MS (10min) when omitted. See src/distill/queue.ts. */
   leaseMs?: number;
+  /** How long stop() awaits an in-flight job before giving up, ms. Defaults
+   *  to FALDA_SHUTDOWN_GRACE_MS or DEFAULT_SHUTDOWN_GRACE_MS (10s). */
+  shutdownGraceMs?: number;
 }
 
 /**
@@ -158,9 +182,17 @@ export function startDistiller(
     ?? resolveRetentionDays(process.env.FALDA_RECALL_TRACE_RETENTION_DAYS);
   const leaseMs = opts.leaseMs
     ?? Number(process.env.FALDA_DISTILL_LEASE_MS ?? DEFAULT_LEASE_MS);
+  const shutdownGraceMs = opts.shutdownGraceMs
+    ?? Number(process.env.FALDA_SHUTDOWN_GRACE_MS ?? DEFAULT_SHUTDOWN_GRACE_MS);
   // One id per process boot — recorded on claimed jobs for observability
   // (falda distill inspect / stats), not used for ownership enforcement.
   const workerId = randomUUID();
+
+  // Graceful-shutdown bookkeeping: once stopping is true, drain()/wake() no
+  // longer claim new work; inFlight tracks the currently-running runJob()
+  // promise (if any) so stop() can await it before returning.
+  let stopping = false;
+  let inFlight: Promise<void> | null = null;
 
   // Recover jobs orphaned by a previous crash (stuck 'running' past their
   // lease) before the first sweep/drain tick — see the module doc comment.
@@ -203,25 +235,42 @@ export function startDistiller(
   // Timed drain: claim and run exactly one ready job per tick, highest
   // priority first. This is the passive-backlog throughput ceiling — a
   // multi-tenant sweep backlog drains at one tenant per drainIntervalMs.
+  // Once stopping, no new job is claimed (but a job already in flight from
+  // a prior tick is left to finish — see inFlight/stop()).
   const drain = async () => {
+    if (stopping) return;
     const job = claimNext(queueDb, { leaseMs, workerId });
     if (!job) return;
-    await runJob(job);
+    const p = runJob(job);
+    inFlight = p;
+    try {
+      await p;
+    } finally {
+      if (inFlight === p) inFlight = null;
+    }
   };
 
   // Wake: drain every currently-ready EXPLICIT-priority job immediately,
   // bounded and re-entrancy-guarded so overlapping wake() calls (e.g. two
   // falda_distill calls landing close together) collapse into one loop
-  // rather than running concurrently against the same queue.
+  // rather than running concurrently against the same queue. Once stopping,
+  // wake() is a no-op (see the returned handle's wake()).
   let waking = false;
   const drainHighPriority = async () => {
-    if (waking) return;
+    if (waking || stopping) return;
     waking = true;
     try {
       for (let i = 0; i < MAX_WAKE_DRAIN_PER_CALL; i++) {
+        if (stopping) break;
         const job = claimNext(queueDb, { minPriority: PRIORITY_EXPLICIT, leaseMs, workerId });
         if (!job) break;
-        await runJob(job);
+        const p = runJob(job);
+        inFlight = p;
+        try {
+          await p;
+        } finally {
+          if (inFlight === p) inFlight = null;
+        }
       }
     } finally {
       waking = false;
@@ -293,10 +342,27 @@ export function startDistiller(
   const pruneTimer = setInterval(prune, sweepIntervalMs);
 
   return {
-    stop() {
+    async stop() {
+      stopping = true;
       clearInterval(enqueueTimer);
       clearInterval(drainTimer);
       clearInterval(pruneTimer);
+
+      const current = inFlight;
+      if (!current) return;
+
+      let timedOut = false;
+      const timeout = new Promise<void>((resolve) => {
+        setTimeout(() => { timedOut = true; resolve(); }, shutdownGraceMs);
+      });
+      await Promise.race([current, timeout]);
+      if (timedOut) {
+        console.error(
+          `[falda-worker] stop(): in-flight job did not finish within ` +
+          `${shutdownGraceMs}ms grace period — returning anyway. The job's ` +
+          `lease will eventually expire and it will be reclaimed on a future boot.`,
+        );
+      }
     },
     wake() {
       drainHighPriority().catch((e) => console.error("[falda-worker] wake drain failed:", e));

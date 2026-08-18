@@ -68,11 +68,53 @@ export interface ServeHandle {
   httpServer: Server;
   mcpServer: Server | null;
   distiller: DistillerHandle;
-  close(): void;
+  /**
+   * Graceful shutdown: stop accepting new HTTP connections, await in-flight
+   * HTTP request handlers and any in-flight distillation job (each bounded
+   * by FALDA_SHUTDOWN_GRACE_MS, default 10s), then close storage. Safe to
+   * call once. See docs/future/reliability-hardening.md finding 4.
+   */
+  close(): Promise<void>;
+}
+
+/**
+ * Tracks in-flight request handler promises for a listener, so
+ * ServeHandle.close() can await them (bounded by a grace period) before
+ * closing storage — see docs/future/reliability-hardening.md finding 4.
+ * Exported for use by both startHttpApi and (in principle) other listeners
+ * this module might add.
+ */
+export class InFlightTracker {
+  private readonly inFlight = new Set<Promise<unknown>>();
+
+  /** Wrap a request-handling promise so it's tracked until it settles. */
+  track<T>(p: Promise<T>): Promise<T> {
+    this.inFlight.add(p);
+    const clear = () => this.inFlight.delete(p);
+    p.then(clear, clear);
+    return p;
+  }
+
+  get size(): number {
+    return this.inFlight.size;
+  }
+
+  /** Await all currently-tracked promises, bounded by graceMs. Returns true
+   *  if everything settled within the grace period, false if it timed out. */
+  async drain(graceMs: number): Promise<boolean> {
+    if (this.inFlight.size === 0) return true;
+    const snapshot = [...this.inFlight];
+    let timedOut = false;
+    const timeout = new Promise<void>((resolve) => {
+      setTimeout(() => { timedOut = true; resolve(); }, graceMs);
+    });
+    await Promise.race([Promise.allSettled(snapshot), timeout]);
+    return !timedOut;
+  }
 }
 
 /** Start the HTTP/JSON API on its own listener, against the shared runtime. */
-export function startHttpApi(runtime: FaldaRuntime, port: number): Server {
+export function startHttpApi(runtime: FaldaRuntime, port: number, inFlight = new InFlightTracker()): Server & { inFlight: InFlightTracker } {
   const server = createServer((req, res) => {
     if (req.method === "GET" && req.url === "/healthz") {
       res.writeHead(200, { "content-type": "application/json" });
@@ -81,23 +123,26 @@ export function startHttpApi(runtime: FaldaRuntime, port: number): Server {
     if (req.method !== "POST") { res.writeHead(405); return res.end(); }
     let body = "";
     req.on("data", (c) => (body += c));
-    req.on("end", async () => {
-      try {
-        const parsed = body ? JSON.parse(body) : {};
-        const { status, body: out } = await handleRequest(
-          runtime.pools, runtime.tokenStore, req.headers, req.url ?? "", parsed,
-          runtime.queueDb, runtime.recallTraceDb, runtime.metrics, runtime.wakeDistiller,
-        );
-        res.writeHead(status, { "content-type": "application/json" });
-        res.end(JSON.stringify(out));
-      } catch (e: any) {
-        res.writeHead(500, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: String(e?.message ?? e) }));
-      }
+    req.on("end", () => {
+      const handled = (async () => {
+        try {
+          const parsed = body ? JSON.parse(body) : {};
+          const { status, body: out } = await handleRequest(
+            runtime.pools, runtime.tokenStore, req.headers, req.url ?? "", parsed,
+            runtime.queueDb, runtime.recallTraceDb, runtime.metrics, runtime.wakeDistiller,
+          );
+          res.writeHead(status, { "content-type": "application/json" });
+          res.end(JSON.stringify(out));
+        } catch (e: any) {
+          res.writeHead(500, { "content-type": "application/json" });
+          res.end(JSON.stringify({ error: String(e?.message ?? e) }));
+        }
+      })();
+      inFlight.track(handled);
     });
   });
   server.listen(port, () => console.log(`FALDA HTTP API listening on :${port} (root=${runtime.root})`));
-  return server;
+  return Object.assign(server, { inFlight });
 }
 
 /** Start the MCP endpoint on its own listener, against the shared runtime. */
@@ -152,6 +197,7 @@ export async function serve(opts: ServeOptions = {}): Promise<ServeHandle> {
   }
   const drainIntervalMs = opts.drainIntervalMs ?? opts.workerIntervalMs ?? resolvedEnv.drainIntervalMs;
   const sweepIntervalMs = opts.sweepIntervalMs ?? opts.workerIntervalMs ?? resolvedEnv.sweepIntervalMs;
+  const shutdownGraceMs = Number(process.env.FALDA_SHUTDOWN_GRACE_MS ?? 10_000);
 
   const runtime = await buildRuntime({ label: "FALDA", ...opts.runtimeConfig });
 
@@ -159,29 +205,78 @@ export async function serve(opts: ServeOptions = {}): Promise<ServeHandle> {
     drainIntervalMs, sweepIntervalMs,
     recallTraceDb: runtime.recallTraceDb,
     metrics: runtime.metrics,
+    shutdownGraceMs,
   });
   runtime.wakeDistiller = () => distiller.wake();
 
   const httpServer = startHttpApi(runtime, httpPort);
   const mcpServer = opts.noMcp ? null : startMcp(runtime, mcpPort, opts.mcpToolset);
 
+  let closed = false;
   return {
     runtime,
     httpServer,
     mcpServer,
     distiller,
-    close() {
-      distiller.stop();
-      httpServer.close();
-      mcpServer?.close();
+    // Order: stop accepting new HTTP connections and stop the distiller
+    // claiming new work FIRST (in parallel — neither depends on the
+    // other), then await whatever was already in flight on each, THEN
+    // close storage. This avoids the failure mode where an in-flight
+    // request or distillation pass hits a closed SQLite handle mid-write.
+    // MCP relies on its own listener close (the MCP SDK owns that
+    // request's lifecycle) rather than the same in-flight tracking used
+    // for HTTP — see docs/future/reliability-hardening.md finding 4.
+    async close() {
+      if (closed) return;
+      closed = true;
+      const httpClosed = new Promise<void>((resolve) => httpServer.close(() => resolve()));
+      const mcpClosed = mcpServer
+        ? new Promise<void>((resolve) => mcpServer.close(() => resolve()))
+        : Promise.resolve();
+      const [, , inFlightOk] = await Promise.all([
+        httpClosed,
+        mcpClosed,
+        (httpServer as any).inFlight?.drain(shutdownGraceMs) ?? Promise.resolve(true),
+        distiller.stop(),
+      ]);
+      if (inFlightOk === false) {
+        console.error(
+          `[falda-server] close(): one or more in-flight HTTP requests did not ` +
+          `finish within ${shutdownGraceMs}ms grace period — closing storage anyway.`,
+        );
+      }
       runtime.close();
     },
   };
+}
+
+async function shutdown(handle: ServeHandle, signal: string): Promise<void> {
+  console.log(`falda serve: received ${signal}, shutting down gracefully...`);
+  try {
+    await handle.close();
+    process.exit(0);
+  } catch (e) {
+    console.error("falda serve: error during shutdown:", e);
+    process.exit(1);
+  }
 }
 
 const IS_MAIN = process.argv[1]?.endsWith("server.js") || process.argv[1]?.endsWith("server.ts");
 if (IS_MAIN) {
   const args = process.argv.slice(2);
   const noMcp = args.includes("--no-mcp");
-  serve({ noMcp }).catch((e) => { console.error(e); process.exit(1); });
+  serve({ noMcp }).then((handle) => {
+    let shuttingDown = false;
+    for (const signal of ["SIGTERM", "SIGINT"] as const) {
+      process.on(signal, () => {
+        if (shuttingDown) {
+          // Second signal: the operator wants out now, not a graceful wait.
+          console.log(`falda serve: received ${signal} again, forcing immediate exit`);
+          process.exit(1);
+        }
+        shuttingDown = true;
+        shutdown(handle, signal);
+      });
+    }
+  }).catch((e) => { console.error(e); process.exit(1); });
 }

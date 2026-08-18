@@ -186,6 +186,14 @@ curl -s -X POST http://localhost:8077/distill \
 | `FALDA_SWEEP_INTERVAL_MS`  | `300000`                 | how often the worker auto-enqueues every self-store, and prunes `recall_traces.db` |
 | `FALDA_WORKER_INTERVAL_MS` | *(unset)*                | **deprecated**: sets both of the above when they're unset — set the split vars instead |
 | `FALDA_DISTILL_LEASE_MS`   | `600000`                 | how long a claimed distillation job's lease lasts before it's considered abandoned (e.g. by a crashed process) and reclaimable by the next claim — see "Crash recovery" below |
+| `FALDA_SHUTDOWN_GRACE_MS`  | `10000`                  | on `SIGTERM`/`SIGINT`, how long `falda serve` waits for in-flight HTTP requests and an in-flight distillation job to finish before closing storage anyway — see "Graceful shutdown" below |
+
+**Graceful shutdown:** `falda serve` handles `SIGTERM`/`SIGINT` by stopping
+new work (new HTTP connections, new distillation claims), awaiting whatever
+was already in flight (bounded by `FALDA_SHUTDOWN_GRACE_MS`), then closing
+storage — so a container restart or `Ctrl-C` doesn't cut off an in-flight
+request mid-response or close a SQLite handle while a distillation pass is
+still writing. A second signal during shutdown forces an immediate exit.
 
 ---
 
