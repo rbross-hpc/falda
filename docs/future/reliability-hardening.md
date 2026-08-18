@@ -330,7 +330,7 @@ created by the current schema (`test/data_model_schema.test.ts:455-474`)
 create column-dependent indexes/constraints (or move to versioned
 migrations). Add fixtures for every supported historical schema.
 
-**7. `falda smoke` invokes a nonexistent npm script.**
+**7. `falda smoke` invokes a nonexistent npm script. — ✅ addressed**
 Both `bin/falda smoke` (`bin/falda:117-119`) and `install.sh`
 (`install.sh:88-95`) run `npm run smoke`, but `package.json` defines no
 `smoke` script (`package.json:27-36`) — confirmed by `npm run build`
@@ -343,6 +343,17 @@ masked the missing dedicated script.)
 *Recommendation:* add a `smoke` script to `package.json` (even if it just
 runs `test/smoke.test.ts` directly), or update `bin/falda`/`install.sh` to
 call the correct target.
+
+**Landed:** added `"smoke": "tsx --test test/smoke.test.ts"` to
+`package.json`'s `scripts`. `bin/falda smoke` and `install.sh`'s smoke
+step both already invoked `npm run smoke` and check its exit code, so
+neither needed a change — they now resolve correctly. Verified `npm run
+smoke`, `./bin/falda smoke`, and `install.sh`'s smoke-step logic (`npm run
+smoke 2>&1 | tail -4` + exit-code check) all pass. `smoke` remains a
+from-source (dev) affordance — `test/` and `tsx` are not in the published
+package's `files` allowlist or `dependencies`, matching how `bin/falda
+build`/`install.sh` already assume a source checkout; not addressed by
+this phase.
 
 **8. Shipped external integrations still target the retired
 unauthenticated/body-tenant API.** The current server requires a bearer
