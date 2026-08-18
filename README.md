@@ -183,6 +183,7 @@ curl -s -X POST http://localhost:8077/distill \
 | `FALDA_LLM_API_KEY`     | `x`                         | bearer token for chat endpoint. On `anthropic`, unset falls back to the SDK's `ANTHROPIC_API_KEY` lookup |
 | `FALDA_LLM_MODEL`       | `gpt-4o-mini`               | extraction/synthesis model id (`claude-haiku-4-5` when `FALDA_LLM_PROVIDER=anthropic`) |
 | `FALDA_LLM_TIMEOUT_MS`  | `120000`                    | request timeout, both providers — a stalled LLM fails the pass (retried with backoff) instead of hanging indefinitely |
+| `FALDA_DISTILL_CONSOLIDATION_BATCH` | `20` | candidates decided per consolidation call. Distillation decides them in batches of this size instead of one call each — an estimated ~47% fewer input tokens at 15 candidates. `1` restores one call per candidate |
 | `FALDA_DRAIN_INTERVAL_MS`  | `60000`                  | how often the worker drains one ready job from the queue |
 | `FALDA_SWEEP_INTERVAL_MS`  | `300000`                 | how often the worker auto-enqueues every self-store, and prunes `recall_traces.db` |
 | `FALDA_WORKER_INTERVAL_MS` | *(unset)*                | **deprecated**: sets both of the above when they're unset — set the split vars instead |
@@ -206,6 +207,11 @@ FALDA_LLM_API_KEY=sk-ant-... \
 FALDA_LLM_MODEL=claude-haiku-4-5 \
   falda serve
 ```
+
+On Anthropic models where extended thinking runs by default, thinking
+tokens count against the same `max_tokens` budget as the visible reply, so
+pairing a large `FALDA_DISTILL_CONSOLIDATION_BATCH` with such a model can
+truncate a pass — the default batch of 20 leaves ample headroom.
 
 This is the one place FALDA can reach a hosted service, and only when
 explicitly configured — see

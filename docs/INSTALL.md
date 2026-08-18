@@ -161,6 +161,7 @@ const hits = await mem.recall("kukla", "what should I remember?");
 | `FALDA_EMBED_API_KEY` | _(unset)_ | API key for the embedder, if required |
 | `FALDA_EMBED_MODEL` | `nomic-embed-text` | Embedding model id |
 | `FALDA_EMBED_STRICT` | _(unset)_ | `1` turns an unconfigured embedder (no `FALDA_EMBED`/`FALDA_EMBED_BASE_URL`) into a startup `FATAL` instead of the silent local-embedder fallback below — opt in for production |
+| `FALDA_DISTILL_CONSOLIDATION_BATCH` | `20` | candidates decided per consolidation call. Distillation decides them in batches of this size instead of one call each — an estimated ~47% fewer input tokens at 15 candidates. `1` restores one call per candidate |
 
 `FALDA_DB` (a single store's SQLite path) applies only when embedding
 `Falda` directly as a library, not to `falda serve`, which always addresses

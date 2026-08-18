@@ -319,8 +319,14 @@ describe("Finding 1: duplicate-candidate index consistency", () => {
           `{"type":"fact","content":"${content}","confidence":"high"}`,
           `{"type":"fact","content":"${content}","confidence":"high"}`,
         ].join("\n"),
-        `{"action":"store","target_ids":[],"rationale":"New fact."}`,
-        `{"action":"store","target_ids":[],"rationale":"New fact (duplicate candidate)."}`,
+        // One batched consolidation reply covering both candidates — see
+        // docs/future/distill-consolidation-batching.md. Both still resolve to
+        // "store", so this test's subject (one atom, one index row each, two
+        // decision rows) is unchanged.
+        JSON.stringify([
+          { candidate: 0, action: "store", target_ids: [], rationale: "New fact." },
+          { candidate: 1, action: "store", target_ids: [], rationale: "New fact (duplicate candidate)." },
+        ]),
         "Fridge session", "Fridge temperature discussed.",
         "Fridge topic", "Fridge facts.",
         "# Core\n\nFridge at 4 degrees.",

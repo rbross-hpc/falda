@@ -149,6 +149,22 @@ describe("distill LLM: anthropic provider", () => {
     );
   });
 
+  test("throws when stop_reason is max_tokens, since the JSON may be truncated", async () => {
+    captured = [];
+    respond = () => ({
+      status: 200,
+      json: { ...messagesReply('{"actions": [{"index": 0, "act'), stop_reason: "max_tokens" },
+    });
+
+    const llm = makeLLM({ provider: "anthropic", apiKey: "sk-ant-test", baseUrl });
+
+    await assert.rejects(
+      () => llm("go"),
+      /max_tokens/i,
+      "a truncated reply must fail loudly instead of the batch parser silently resolving nothing",
+    );
+  });
+
   test("defaults to claude-haiku-4-5 and reports it on .model", async () => {
     captured = [];
     respond = () => ({ status: 200, json: messagesReply("ok") });
