@@ -235,6 +235,34 @@ function computeRenderHash(title: string, summary: string | null): string {
   return createHash("sha256").update(`${title}\n${summary ?? ""}`).digest("hex");
 }
 
+// ─── Internal atom-write types (shared by upsertAtom() and the distiller) ──────
+//
+// Both the public HTTP/MCP atom-write path and distillation L1 (src/distill/
+// core.ts) need to insert/repair an atom row plus its atoms_fts/atoms_vec
+// index rows. They differ only in what happens when the id already exists:
+// public upsert updates mutable metadata, while distillation replay must
+// preserve existing metadata/status and only repair indexes (see
+// docs/future/reliability-hardening.md finding 1). ExistingAtomPolicy makes
+// that difference explicit at the call site rather than inferred.
+
+type ExistingAtomPolicy = "update" | "preserve";
+
+interface NormalizedAtomWrite {
+  id: string;
+  type: AtomType;
+  content: string;
+  background: string | null;
+  priority: number;
+  confidence: AtomConfidence;
+  pinned: boolean;
+  tags: string;
+}
+
+interface AtomWriteResult {
+  atom: Atom;
+  inserted: boolean;
+}
+
 // ─── Main store class ──────────────────────────────────────────────────────────
 
 export class Falda {
@@ -261,6 +289,151 @@ export class Falda {
   private vecBuf(a: number[]): Buffer {
     const f = new Float32Array(a);
     return Buffer.from(f.buffer, f.byteOffset, f.byteLength);
+  }
+
+  /** Validate an embedding vector's shape before it's ever written to
+   *  atoms_vec — catches a malformed/wrong-dimension vector (e.g. an
+   *  embedder returning the wrong model's output) before it can corrupt an
+   *  index row or, worse, be validated only after other L1 writes have
+   *  already happened (see docs/future/reliability-hardening.md finding 1).
+   *  Returns the same vector for convenient chaining. */
+  private validateEmbedding(vector: number[]): number[] {
+    if (!Array.isArray(vector)) {
+      throw new Error(`Invalid embedding: expected an array, got ${typeof vector}`);
+    }
+    if (vector.length !== this.dim) {
+      throw new Error(`Invalid embedding: expected dimension ${this.dim}, got ${vector.length}`);
+    }
+    for (const v of vector) {
+      if (typeof v !== "number" || !Number.isFinite(v)) {
+        throw new Error("Invalid embedding: contains a non-finite value");
+      }
+    }
+    return vector;
+  }
+
+  /**
+   * @internal Compute and validate an embedding for atom content, without
+   * performing any DB write. Used by upsertAtom() and by the distillation
+   * pipeline (src/distill/core.ts) so both share one embedding-validation
+   * path and distillation can precompute embeddings before opening its L1
+   * transaction (better-sqlite3 transactions must be fully synchronous).
+   */
+  async prepareAtomEmbedding(content: string): Promise<number[]> {
+    return this.validateEmbedding(await this.embed(content));
+  }
+
+  /** Normalize/validate raw atom-write input into the shape
+   *  writeAtomWithEmbeddingSync() expects, applying the same defaults as
+   *  the historical upsertAtom() implementation (type='fact',
+   *  confidence='medium', priority=100, pinned=false, tags=[]). Shared by
+   *  the public upsertAtom() path and the distiller's internal path so
+   *  both validate identically. */
+  private normalizeAtomWrite(a: {
+    id?: string;
+    type?: string;
+    content: string;
+    background?: unknown;
+    priority?: number;
+    confidence?: string;
+    pinned?: boolean;
+    tags?: string[];
+  }): NormalizedAtomWrite {
+    const type = (a.type ?? "fact") as AtomType;
+    if (!VALID_ATOM_TYPES.includes(type)) {
+      throw new AtomTypeError(
+        `Invalid atom type '${a.type}'. Must be one of: ${VALID_ATOM_TYPES.join(", ")}`
+      );
+    }
+    const confidence = (a.confidence ?? "medium") as AtomConfidence;
+    if (!VALID_CONFIDENCE.includes(confidence)) {
+      throw new AtomTypeError(
+        `Invalid confidence '${a.confidence}'. Must be one of: ${VALID_CONFIDENCE.join(", ")}`
+      );
+    }
+    const id = a.id ?? randomUUID();
+    const background: string | null =
+      a.background == null ? null
+      : typeof a.background === "string" ? a.background
+      : typeof a.background === "object" ? JSON.stringify(a.background)
+      : String(a.background);
+    const priority = a.priority ?? 100;
+    const pinned = a.pinned ?? false;
+    const tags = JSON.stringify(a.tags ?? []);
+    return { id, type, content: a.content, background, priority, confidence, pinned, tags };
+  }
+
+  /**
+   * Insert-or-repair one atom row plus its atoms_fts/atoms_vec index rows,
+   * given a precomputed (already-validated) embedding. Fully synchronous —
+   * safe to call from inside a db.transaction() callback (see
+   * docs/future/reliability-hardening.md finding 1).
+   *
+   * existingPolicy governs behavior when `input.id` already exists:
+   *   - "update":   (public upsertAtom() semantics) immutable type/content
+   *                 are enforced, but mutable metadata (background,
+   *                 priority, confidence, pinned, tags) is overwritten.
+   *   - "preserve": (distillation replay semantics) immutable type/content
+   *                 are still enforced, but existing metadata/status/
+   *                 timestamps are left untouched — only the FTS/vector
+   *                 index rows are repaired. This lets a replayed pass
+   *                 fix a historical partial write (e.g. a row with no
+   *                 vector) without silently reverting metadata a caller
+   *                 changed out-of-band.
+   * Either way, exactly one atoms_fts row and one atoms_vec row exist for
+   * this id afterward — delete-then-insert, not INSERT OR IGNORE, because
+   * atoms_fts.id is UNINDEXED (not unique) and a naive insert could leave
+   * duplicate FTS rows behind.
+   */
+  private writeAtomWithEmbeddingSync(
+    input: NormalizedAtomWrite,
+    embedding: number[],
+    existingPolicy: ExistingAtomPolicy,
+  ): AtomWriteResult {
+    this.validateEmbedding(embedding);
+    const now = new Date().toISOString();
+    const existing = this.db.prepare(
+      "SELECT id,type,content,created_at FROM atoms WHERE id=?"
+    ).get(input.id) as any;
+
+    if (existing) {
+      // Content/type are immutable regardless of policy: reject changes to either.
+      if (existing.content !== input.content) {
+        throw new AtomImmutabilityError(
+          `Atom '${input.id}' content is immutable. To change the proposition, record a new atom with supersedes='${input.id}'.`
+        );
+      }
+      if (existing.type !== input.type) {
+        throw new AtomImmutabilityError(
+          `Atom '${input.id}' type is immutable. To change the type, record a new atom with supersedes='${input.id}'.`
+        );
+      }
+      if (existingPolicy === "update") {
+        this.db.prepare(
+          "UPDATE atoms SET background=?,priority=?,confidence=?,pinned=?,tags=?,updated_at=? WHERE id=?"
+        ).run(input.background, input.priority, input.confidence, input.pinned ? 1 : 0, input.tags, now, input.id);
+      }
+      // "preserve": metadata/status/timestamps are left exactly as they are.
+      this.db.prepare("DELETE FROM atoms_fts WHERE id=?").run(input.id);
+      this.db.prepare("DELETE FROM atoms_vec WHERE id=?").run(input.id);
+      this.db.prepare("INSERT INTO atoms_fts(content,id) VALUES(?,?)").run(input.content, input.id);
+      this.db.prepare("INSERT INTO atoms_vec(id,embedding) VALUES(?,?)").run(input.id, this.vecBuf(embedding));
+      const row = this.db.prepare("SELECT * FROM atoms WHERE id=?").get(input.id);
+      return { atom: rowToAtom(row), inserted: false };
+    }
+
+    this.db.prepare(
+      `INSERT INTO atoms(id,type,content,background,priority,confidence,pinned,status,tags,
+       source_turn_ids,source_session_ids,created_at,updated_at)
+       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`
+    ).run(
+      input.id, input.type, input.content, input.background, input.priority, input.confidence,
+      input.pinned ? 1 : 0, "active", input.tags, "[]", "[]", now, now
+    );
+    this.db.prepare("INSERT INTO atoms_fts(content,id) VALUES(?,?)").run(input.content, input.id);
+    this.db.prepare("INSERT INTO atoms_vec(id,embedding) VALUES(?,?)").run(input.id, this.vecBuf(embedding));
+    const row = this.db.prepare("SELECT * FROM atoms WHERE id=?").get(input.id);
+    return { atom: rowToAtom(row), inserted: true };
   }
 
   private hasColumn(table: string, column: string): boolean {
@@ -655,72 +828,41 @@ export class Falda {
     pinned?: boolean;
     tags?: string[];
   }): Promise<Atom> {
-    const type = (a.type ?? "fact") as AtomType;
-    if (!VALID_ATOM_TYPES.includes(type)) {
-      throw new AtomTypeError(
-        `Invalid atom type '${a.type}'. Must be one of: ${VALID_ATOM_TYPES.join(", ")}`
-      );
-    }
-    const confidence = (a.confidence ?? "medium") as AtomConfidence;
-    if (!VALID_CONFIDENCE.includes(confidence)) {
-      throw new AtomTypeError(
-        `Invalid confidence '${a.confidence}'. Must be one of: ${VALID_CONFIDENCE.join(", ")}`
-      );
-    }
+    // Normalize/validate input, then embed BEFORE any DB write. Previously
+    // the atom row + FTS row were written first and only the vector insert
+    // awaited the embedding — an embed failure could leave a new atom with
+    // no vector, or an existing atom's indexes deleted with nothing to
+    // replace them. Precomputing the embedding first and writing
+    // atom+FTS+vector together inside one local transaction closes that
+    // gap (docs/future/reliability-hardening.md finding 1).
+    const normalized = this.normalizeAtomWrite(a);
+    const embedding = await this.prepareAtomEmbedding(a.content);
+    const write = this.db.transaction(() => {
+      return this.writeAtomWithEmbeddingSync(normalized, embedding, "update");
+    });
+    return write.immediate().atom;
+  }
 
-    const now = new Date().toISOString();
-    const id = a.id ?? randomUUID();
-    const bg: string | null =
-      a.background == null ? null
-      : typeof a.background === "string" ? a.background
-      : typeof a.background === "object" ? JSON.stringify(a.background)
-      : String(a.background);
-    const priority = a.priority ?? 100;
-    const pinned = a.pinned ?? false;
-    const tags = JSON.stringify(a.tags ?? []);
-
-    const existing = this.db.prepare(
-      "SELECT id,type,content,created_at FROM atoms WHERE id=?"
-    ).get(id) as any;
-
-    if (existing) {
-      // Content/type are immutable: reject changes to either.
-      if (existing.content !== a.content) {
-        throw new AtomImmutabilityError(
-          `Atom '${id}' content is immutable. To change the proposition, record a new atom with supersedes='${id}'.`
-        );
-      }
-      if (existing.type !== type) {
-        throw new AtomImmutabilityError(
-          `Atom '${id}' type is immutable. To change the type, record a new atom with supersedes='${id}'.`
-        );
-      }
-      // Metadata-only update (background, priority, confidence, pinned, tags).
-      this.db.prepare(
-        "UPDATE atoms SET background=?,priority=?,confidence=?,pinned=?,tags=?,updated_at=? WHERE id=?"
-      ).run(bg, priority, confidence, pinned ? 1 : 0, tags, now, id);
-      // Update FTS and vector index (content unchanged but re-index for consistency).
-      this.db.prepare("DELETE FROM atoms_fts WHERE id=?").run(id);
-      this.db.prepare("DELETE FROM atoms_vec WHERE id=?").run(id);
-      this.db.prepare("INSERT INTO atoms_fts(content,id) VALUES(?,?)").run(a.content, id);
-      this.db.prepare("INSERT INTO atoms_vec(id,embedding) VALUES(?,?)")
-        .run(id, this.vecBuf(await this.embed(a.content)));
-      return rowToAtom(this.db.prepare("SELECT * FROM atoms WHERE id=?").get(id) as any);
-    }
-
-    // New atom.
-    this.db.prepare(
-      `INSERT INTO atoms(id,type,content,background,priority,confidence,pinned,status,tags,
-       source_turn_ids,source_session_ids,created_at,updated_at)
-       VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`
-    ).run(
-      id, type, a.content, bg, priority, confidence, pinned ? 1 : 0,
-      "active", tags, "[]", "[]", now, now
-    );
-    this.db.prepare("INSERT INTO atoms_fts(content,id) VALUES(?,?)").run(a.content, id);
-    this.db.prepare("INSERT INTO atoms_vec(id,embedding) VALUES(?,?)")
-      .run(id, this.vecBuf(await this.embed(a.content)));
-    return rowToAtom(this.db.prepare("SELECT * FROM atoms WHERE id=?").get(id) as any);
+  /**
+   * @internal Distillation L1 only (src/distill/core.ts). Performs no
+   * async work and opens no transaction of its own — the caller must
+   * supply an already-validated embedding (from prepareAtomEmbedding())
+   * and must invoke this from inside its own db.transaction() so the atom
+   * write commits atomically with evidence/lifecycle/decision/watermark
+   * writes for the same pass (docs/future/reliability-hardening.md
+   * finding 1). Uses "preserve" existing-atom semantics: replaying a
+   * deterministic atom id that already exists repairs its FTS/vector
+   * index rows without touching its metadata/status/timestamps — a
+   * distillation pass reproducing the same candidate must not silently
+   * revert priority/pinned/tags/confidence a caller changed out-of-band.
+   * Not exposed via any HTTP route or MCP tool.
+   */
+  upsertDistilledAtomSync(
+    input: { id: string; type: AtomType; content: string; confidence: AtomConfidence },
+    embedding: number[],
+  ): AtomWriteResult {
+    const normalized = this.normalizeAtomWrite(input);
+    return this.writeAtomWithEmbeddingSync(normalized, embedding, "preserve");
   }
 
   /** Mark an atom as superseded by a new atom. */

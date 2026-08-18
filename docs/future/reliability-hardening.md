@@ -16,7 +16,7 @@ outages, process restarts, deletes, and old-store upgrades.
 
 ### Critical
 
-**1. L1 atom creation happens outside the documented atomic transaction.**
+**1. L1 atom creation happens outside the documented atomic transaction. — ✅ addressed**
 `docs/MODEL.md:923-939` and `src/distill/core.ts:8-11` both promise that
 atom mutations, evidence, decisions, and the watermark commit as one unit.
 In practice, new atoms are written via `upsertAtom()` *before*
@@ -38,6 +38,54 @@ decisions, and watermark write together inside one synchronous
 transaction. On replay, existing deterministic atom IDs must still enter
 the transaction's prepared-operation set so evidence/index consistency can
 be repaired.
+
+**Landed:** `src/falda.ts` now exposes a shared, fully-synchronous atom
+writer (`writeAtomWithEmbeddingSync`, private) used by both the public
+mutation path and distillation, so there is exactly one code path that can
+insert/repair an atom row plus its `atoms_fts`/`atoms_vec` index rows.
+Index repair is delete-then-insert (not `INSERT OR IGNORE`), since
+`atoms_fts.id` is `UNINDEXED`, not unique — a naive insert could leave
+duplicate FTS rows behind. An explicit `ExistingAtomPolicy` distinguishes
+the two callers' semantics when `id` already exists: `"update"` (public
+`upsertAtom()` — overwrite mutable metadata) vs. `"preserve"`
+(distillation replay via the new `@internal` `upsertDistilledAtomSync()` —
+leave metadata/status untouched, repair only the index rows). `upsertAtom()`
+now precomputes and validates the embedding (new `prepareAtomEmbedding()`)
+*before* opening a `db.transaction(...).immediate()` that performs the
+write, closing the public-path partial-write hazard as a side effect of
+sharing the writer.
+
+`src/distill/core.ts`'s L1 phase now does all LLM/embedding/candidate-
+search work (fully async) first, then opens one
+`db.transaction(() => {...}).immediate()` that: (a) ensures/repairs each
+*unique* prepared atom via `upsertDistilledAtomSync()` — deliberately not
+gated on "does this id already exist", so a historical orphaned atom (row
+present, index rows missing) gets repaired on replay — then (b) performs
+every candidate's evidence/lifecycle/decision write, then (c) advances the
+watermark as the last statement. A throw anywhere in that callback rolls
+back all of it, including the atom/index writes from step (a) — this is
+the core fix. Counters and log lines are accumulated in local variables
+and only applied to the result/emitted after the transaction durably
+commits, so a rolled-back pass can never report partial success.
+
+Two related correctness bugs surfaced and were fixed as part of sharing one
+transaction: an "update" decision whose target is the atom's own
+deterministic id ("update-to-self") now still attaches the pass's evidence
+(previously it could silently drop it, since the old code diffed the same
+id against itself); and a "merge" decision whose target list happens to
+include the winning atom's own id no longer marks the winner `merged` too
+(`mergeAtoms()` is now called with the target list minus the winner id).
+
+Tests: `test/distill_l1_atomic.test.ts` — public `upsertAtom()` atomicity
+on embed failure (new-atom and existing-atom/metadata-update cases),
+distillation embed-failure atomicity (with a successful retry after
+disarming), a mid-transaction rollback via an injected `addEvidence`
+failure, legacy orphan index repair, duplicate-candidate index consistency
+(one atom/index row, two decision rows, one `prepareAtomEmbedding` call),
+update-to-self evidence attachment, and merge-self exclusion. All existing
+tests continue to pass unchanged (`test/distill_core.test.ts`,
+`test/distill_inspect.test.ts`, `test/distill_watermark_seq.test.ts`,
+`test/data_model_schema.test.ts`).
 
 **2. L2/L3 failures and lifecycle-only changes are not independently
 retryable.** A pass with no new stream turns returns immediately
