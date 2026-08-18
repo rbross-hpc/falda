@@ -44,8 +44,8 @@ describe("stats: timing section (live server)", () => {
     url = `http://127.0.0.1:${port}`;
   });
 
-  after(() => {
-    handle.close();
+  after(async () => {
+    await handle.close();
     fs.rmSync(root, { recursive: true, force: true });
   });
 

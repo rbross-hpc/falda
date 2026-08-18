@@ -119,7 +119,7 @@ describe("startDistiller: crash recovery on startup", () => {
         const redrained = await waitFor(() => (getJob(queueDb, jobId)?.attempts ?? 0) > 1, 2000);
         assert.ok(redrained, "recovered job was reclaimed and attempted again on this boot");
       } finally {
-        distiller.stop();
+        await distiller.stop();
       }
     } finally { cleanup(root); }
   });
@@ -151,8 +151,114 @@ describe("startDistiller: crash recovery on startup", () => {
         assert.equal(job.attempts, 1);
         assert.equal(job.worker_id, "worker-still-alive");
       } finally {
-        distiller.stop();
+        await distiller.stop();
       }
+    } finally { cleanup(root); }
+  });
+});
+
+describe("startDistiller: graceful stop()", () => {
+  test("stop() awaits an in-flight job before resolving", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      const store = pools.resolve("proj-x", undefined, true);
+      // A pass with zero turns returns early WITHOUT calling the LLM
+      // (src/distill/core.ts) — give it a real turn so the LLM is actually
+      // invoked and stays in flight until resolveLlm() is called below.
+      await store.addStream("sess-1", [{ role: "user", content: "hello" }]);
+
+      let resolveLlm: (() => void) | undefined;
+      const slowLlm: LLMFnWithModel = Object.assign(
+        () => new Promise<string>((resolve) => {
+          resolveLlm = () => resolve('{"atoms":[]}');
+        }),
+        { model: "stub" },
+      );
+
+      const jobId = enqueue(queueDb, "proj-x:self");
+      const distiller = startDistiller(queueDb, pools, slowLlm, {
+        drainIntervalMs: 20,
+        sweepIntervalMs: 60_000,
+      });
+
+      // Wait for the job to actually be claimed (attempts > 0) before
+      // calling stop() — otherwise we might race stop() against a drain
+      // tick that hasn't fired yet.
+      await waitFor(() => (getJob(queueDb, jobId)?.attempts ?? 0) > 0, 2000);
+      assert.equal(getJob(queueDb, jobId)?.status, "running", "job is in flight");
+
+      // Let the in-flight job resolve shortly after stop() is called, and
+      // confirm stop() actually waited for it rather than returning
+      // immediately while the job was still running.
+      let stopResolved = false;
+      const stopPromise = distiller.stop().then(() => { stopResolved = true; });
+      await new Promise((r) => setTimeout(r, 30));
+      assert.equal(stopResolved, false, "stop() must not resolve while the job is still in flight");
+
+      resolveLlm?.();
+      await stopPromise;
+      assert.equal(stopResolved, true, "stop() resolved once the in-flight job finished");
+    } finally { cleanup(root); }
+  });
+
+  test("stop() gives up after the shutdown grace period if the job never finishes", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      const store = pools.resolve("proj-x", undefined, true);
+      await store.addStream("sess-1", [{ role: "user", content: "hello" }]);
+
+      const hangingLlm: LLMFnWithModel = Object.assign(
+        () => new Promise<string>(() => { /* never resolves */ }),
+        { model: "stub" },
+      );
+
+      const jobId = enqueue(queueDb, "proj-x:self");
+      const distiller = startDistiller(queueDb, pools, hangingLlm, {
+        drainIntervalMs: 20,
+        sweepIntervalMs: 60_000,
+        shutdownGraceMs: 50,
+      });
+
+      await waitFor(() => (getJob(queueDb, jobId)?.attempts ?? 0) > 0, 2000);
+
+      const start = Date.now();
+      await distiller.stop();
+      const elapsed = Date.now() - start;
+      assert.ok(elapsed < 2000, "stop() must return once the grace period elapses, not hang forever");
+      assert.ok(elapsed >= 40, "stop() should have waited roughly the grace period");
+    } finally { cleanup(root); }
+  });
+
+  test("stop() prevents new jobs from being claimed even if a drain tick fires during shutdown", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      pools.resolve("proj-x", undefined, true);
+
+      const distiller = startDistiller(queueDb, pools, failingLlm, {
+        drainIntervalMs: 10_000, // won't fire during this test
+        sweepIntervalMs: 60_000,
+      });
+      await distiller.stop();
+
+      // Enqueue AFTER stop() — a stopped worker's timers are cleared, so
+      // nothing should claim this job.
+      const jobId = enqueue(queueDb, "proj-x:self");
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(getJob(queueDb, jobId)?.status, "pending", "no claim after stop()");
+
+      // wake() after stop() must also be a no-op.
+      distiller.wake();
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(getJob(queueDb, jobId)?.status, "pending", "wake() after stop() must not claim");
     } finally { cleanup(root); }
   });
 });
@@ -175,7 +281,7 @@ describe("startDistiller: independent drain/sweep timers", () => {
         const drained = await waitFor(() => (getJob(queueDb, jobId)?.attempts ?? 0) > 0, 2000);
         assert.ok(drained, "drain claimed the job well within the slow sweep interval");
       } finally {
-        distiller.stop();
+        await distiller.stop();
       }
     } finally { cleanup(root); }
   });
@@ -200,7 +306,7 @@ describe("startDistiller: wake()", () => {
         const drained = await waitFor(() => (getJob(queueDb, jobId)?.attempts ?? 0) > 0, 2000);
         assert.ok(drained, "wake() drained the explicit job without waiting for the 60s drain tick");
       } finally {
-        distiller.stop();
+        await distiller.stop();
       }
     } finally { cleanup(root); }
   });
@@ -226,7 +332,7 @@ describe("startDistiller: wake()", () => {
         assert.equal(job.attempts, 0, "wake() must not drain a passive-priority job");
         assert.equal(job.priority, PRIORITY_PASSIVE);
       } finally {
-        distiller.stop();
+        await distiller.stop();
       }
     } finally { cleanup(root); }
   });
@@ -267,7 +373,7 @@ describe("startDistiller: wake()", () => {
         await waitFor(() => (getJob(queueDb, jobA)?.attempts ?? 0) > 0 && (getJob(queueDb, jobB)?.attempts ?? 0) > 0, 3000);
         assert.ok(maxConcurrent <= 1, "the two wake() calls must not run distillOnce concurrently against the same queue");
       } finally {
-        distiller.stop();
+        await distiller.stop();
       }
     } finally { cleanup(root); }
   });
@@ -294,7 +400,7 @@ describe("startDistiller: metrics instrumentation", () => {
         assert.equal(metrics.recall_ms.snapshot().count, 0, "recall metric untouched by distill activity");
         assert.equal(metrics.distillActive(), false, "distillActive() must be false again once the pass has finished");
       } finally {
-        distiller.stop();
+        await distiller.stop();
       }
     } finally { cleanup(root); }
   });
@@ -329,7 +435,7 @@ describe("startDistiller: metrics instrumentation", () => {
         assert.equal(sawActiveDuringPass, true, "distillActive() must be true while the pass's LLM call is in flight");
         assert.equal(metrics.distillActive(), false, "distillActive() must be false again once the pass has finished");
       } finally {
-        distiller.stop();
+        await distiller.stop();
       }
     } finally { cleanup(root); }
   });
@@ -352,7 +458,7 @@ describe("startDistiller: metrics instrumentation", () => {
         await waitFor(() => metrics.distill_service_ms.snapshot().count > 0, 2000);
         assert.equal(metrics.distill_service_ms.snapshot().count, 1);
       } finally {
-        distiller.stop();
+        await distiller.stop();
       }
     } finally { cleanup(root); }
   });
@@ -375,7 +481,7 @@ describe("startDistiller: sweep gate (only enqueue stores with undistilled turns
         await new Promise((r) => setTimeout(r, 100));
         assert.equal(listJobs(queueDb, "proj-empty:self").length, 0, "no job ever created for an empty store");
       } finally {
-        distiller.stop();
+        await distiller.stop();
       }
     } finally { cleanup(root); }
   });
@@ -396,7 +502,7 @@ describe("startDistiller: sweep gate (only enqueue stores with undistilled turns
         const enqueuedOk = await waitFor(() => listJobs(queueDb, "proj-new:self").length > 0, 1000);
         assert.ok(enqueuedOk, "never-distilled store with turns is enqueued");
       } finally {
-        distiller.stop();
+        await distiller.stop();
       }
     } finally { cleanup(root); }
   });
@@ -423,7 +529,7 @@ describe("startDistiller: sweep gate (only enqueue stores with undistilled turns
         await new Promise((r) => setTimeout(r, 120));
         assert.equal(listJobs(queueDb, "proj-caughtup:self").length, 0, "caught-up store stays un-enqueued");
       } finally {
-        distiller.stop();
+        await distiller.stop();
       }
     } finally { cleanup(root); }
   });
@@ -451,7 +557,7 @@ describe("startDistiller: sweep gate (only enqueue stores with undistilled turns
         const enqueuedOk = await waitFor(() => listJobs(queueDb, "proj-backlog:self").length > 0, 1000);
         assert.ok(enqueuedOk, "backlogged store is enqueued even though it has been distilled before");
       } finally {
-        distiller.stop();
+        await distiller.stop();
       }
     } finally { cleanup(root); }
   });
@@ -484,7 +590,7 @@ describe("startDistiller: sweep gate (only enqueue stores with undistilled turns
         assert.equal(listJobs(queueDb, "proj-idle:self").length, 0, "idle store never enqueued");
         assert.equal(listJobs(queueDb, "proj-caught:self").length, 0, "caught-up store never enqueued");
       } finally {
-        distiller.stop();
+        await distiller.stop();
       }
     } finally { cleanup(root); }
   });
