@@ -47,8 +47,9 @@ either way; the surfaces differ in what they expose:
   model.
 
 Both stay off the public internet — no TLS/rate-limiting of their own; bind
-to a private network/tailnet or Compose-internal network (see
-`proxy/README.md` if you need a public-facing front door with TLS).
+to a private network/tailnet or Compose-internal network (terminate TLS in
+front with a standard reverse proxy, e.g. nginx or Caddy, if you need a
+public-facing front door).
 
 ## 1. Auth model in one paragraph
 

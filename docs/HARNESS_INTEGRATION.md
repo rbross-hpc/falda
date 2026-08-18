@@ -3,9 +3,8 @@
 FALDA is harness-agnostic: it speaks a small HTTP/JSON API (see `docs/API.md`)
 plus a CLI (`bin/falda`). Any agent runtime can use it for memory. This guide
 shows how to wire the two reference harnesses we run in production —
-**Hermes** and **OpenClaw** — to a FALDA deployment, in either *shadow* mode
-(capture + validate, not in the live recall path) or *live* mode (FALDA is the
-agent's memory).
+**Hermes** and **OpenClaw** — to a FALDA deployment as its live memory
+provider.
 
 The two harnesses are independent agent runtimes on different hosts that share
 one FALDA-family deployment. Nothing here couples FALDA to either harness —
@@ -29,16 +28,14 @@ sharing a tenant.
 
 > **Auth (all examples below):** the server requires
 > `Authorization: Bearer <token>` + `X-Falda-Tenant: <tenant>` on every route
-> except `GET /healthz` — see `docs/API.md` "Authentication". The `curl`/env
-> snippets in this guide predate that requirement and, where they show a bare
-> `POST` or a body `{tenant: ...}`, still need a bearer token added and the
-> tenant moved to the header to work against a current server. That token
-> file (`FALDA_TOKENS`) is now canonical and shared by the HTTP API and the
-> MCP endpoint when run via `falda serve` — see `docs/MCP.md`.
+> except `GET /healthz` — see `docs/API.md` "Authentication". Every `curl`/env
+> snippet below uses that header pair; tenant is never a body field. The token
+> file (`FALDA_TOKENS`) is canonical and shared by the HTTP API and the MCP
+> endpoint when run via `falda serve` — see `docs/MCP.md`.
 > Distillation is handled by the in-process distillation worker — see the
 > `POST /distill` route and `falda_distill` MCP tool (`docs/API.md`,
 > `docs/MCP.md`). It is always drained by the same process that accepted the
-> job. The Python sidecar (`falda_distiller.py`) has been removed.
+> job.
 
 Health check, harness-independent:
 
@@ -52,32 +49,7 @@ curl -s localhost:8077/healthz      # {"ok":true,"tiers":[...],"pools":true}
 
 Hermes is a Python agent runtime with a long-running **gateway** process, a
 **tool/skill** layer, **cron** jobs, and a pluggable **memory provider**. There
-are three integration points, from lightest to deepest.
-
-### 1a. Shadow capture (recommended first step)
-
-Run FALDA alongside Hermes' existing memory, capturing in parallel without
-touching the live recall path. Two long-running processes, both under launchd:
-
-- **Gateway** — `bin/falda serve --no-mcp` from a checkout of this repo,
-  pointed at a runtime data dir via env:
-
-  ```bash
-  FALDA_ROOT=~/.falda/data \
-  FALDA_PORT=8077 \
-  FALDA_EMBED=local \            # or remote; see docs/INSTALL.md
-  node --import tsx src/server.ts --no-mcp
-  ```
-
-- **Tap** — `integrations/external-source/falda_tap.py` tails the existing
-  memory provider's L0 JSONL and forwards new turns to `/stream/add`. Restart-
-  safe via byte-offset checkpoint. See that dir's README for env.
-
-This validates **capture**; pair with `compare_dualrun.py` to confirm parity
-before trusting FALDA for live recall.
-
-Reference launchd labels we run: `com.stevens.falda-gateway`,
-`com.stevens.falda-tap` (both `KeepAlive=true`).
+are two integration points.
 
 > Node ABI gotcha: `better-sqlite3` is a native module. The interpreter that
 > runs `npm install` / `npm rebuild` MUST be the one the gateway runs under.
@@ -85,20 +57,23 @@ Reference launchd labels we run: `com.stevens.falda-gateway`,
 > a different version, else you get `ERR_DLOPEN_FAILED` (NODE_MODULE_VERSION
 > mismatch).
 
-### 1b. Live memory provider
+### 1a. Live memory provider
 
 To make FALDA the agent's memory, have the Hermes memory hooks call the
 gateway: write turns to `/stream/add`, recall via `/stream/search` +
 `/atoms/search`, persist distilled facts via `/atoms/upsert`, read the agent
-core from `/core/read`. Address every call with the agent's `tenant`; omit
-`pool` for private memory. Keep the gateway local (`127.0.0.1:8077`) or on the
-tailnet; it has no auth of its own, so don't expose it publicly.
+core from `/core/read`. Every request needs
+`Authorization: Bearer <token>` + `X-Falda-Tenant: <tenant>`; omit `pool` for
+private memory. Keep the gateway local (`127.0.0.1:8077`) or on the tailnet —
+its auth is a routing/authorization boundary, not transport security, so
+don't expose it publicly without terminating TLS in front of it.
 
-### 1c. Tool/CLI access
+### 1b. Tool/CLI access
 
-For ad-hoc agent use, expose `bin/falda` (or thin `curl` wrappers) as a Hermes
-tool/skill so the agent can query/insert memory mid-task. Same HTTP surface,
-just driven from the tool layer.
+For ad-hoc agent use, expose `bin/falda` (or thin `curl` wrappers, with the
+bearer token and tenant header set) as a Hermes tool/skill so the agent can
+query/insert memory mid-task. Same HTTP surface, just driven from the tool
+layer.
 
 ### Cross-agent messaging (how the two harnesses coordinate)
 
@@ -132,50 +107,26 @@ OpenClaw is a Node.js agent gateway (port 3000) with a plugin/skill layer,
 cron scheduler, and a pluggable memory provider surface. The deployment runs
 on the same host as the FALDA gateway (CherryRd, macOS).
 
-### 2a. Shadow capture
-
-- **Gateway**: `bin/falda serve` already running on CherryRd at
-  `localhost:8077` under launchd label `com.stevens.falda-gateway`
-  (`KeepAlive=true`).
-
-- **Tap**: `integrations/external-source/falda_tap.py` points at
-  OpenClaw's L0 session-log export directory:
-
-  ```
-  SOURCE_CONV_DIR=~/.openclaw/sessions   # top-level session JSONL dir
-  FALDA_URL=http://127.0.0.1:8077
-  FALDA_TENANT=openclaw
-  ```
-
-  The tap tails any `*.jsonl` files in that tree, forwarding new turns to
-  `/stream/add` with `{tenant: "openclaw"}`. Byte-offset checkpoint is
-  stored at `~/.falda/tap-checkpoint-openclaw.json`.
-
-- **Process manager**: launchd label `com.stevens.falda-tap-openclaw`
-  (`KeepAlive=true`). Plist at
-  `~/Library/LaunchAgents/com.stevens.falda-tap-openclaw.plist`.
-
-### 2b. Live memory provider
+### 2a. Live memory provider
 
 OpenClaw exposes a memory-provider plugin interface. The FALDA provider
-calls the same HTTP surface the Hermes side uses:
+calls the same HTTP surface the Hermes side uses, with
+`Authorization: Bearer <token>` + `X-Falda-Tenant: openclaw` on every call:
 
 - **Write** (after each turn): `POST /stream/add` with
-  `{tenant: "openclaw", turn: {role, content, ts}}`.
-- **Read/recall**: `GET /stream/search?q=...&tenant=openclaw` +
-  `GET /atoms/search?q=...&tenant=openclaw`.
-- **Core/persona**: `GET /core/read?tenant=openclaw` on startup.
-- **Distilled facts**: `POST /atoms/upsert` as the distillation sidecar
-  promotes T0→T1→T2→T3.
+  `{turn: {role, content, ts}}`.
+- **Read/recall**: `POST /stream/search` + `POST /atoms/search`.
+- **Core/persona**: `POST /core/read` on startup.
+- **Distilled facts**: `POST /atoms/upsert`, or let the in-process
+  distillation worker promote T0→T1→T2→T3 automatically.
 - **Tenant id**: `openclaw` (private `self` store; no pool unless sharing
   with Hermes — see §3).
 
 The provider plugin lives at
 `~/.openclaw/plugins/falda-memory/index.js` (loaded via
-`plugins.falda-memory` in Gateway config). Gateway runs FALDA in shadow
-mode by default; flip `memory.provider: falda` in config to go live.
+`plugins.falda-memory` in Gateway config), set as `memory.provider: falda`.
 
-### 2c. Cross-agent messaging
+### Cross-agent messaging (OpenClaw side)
 
 - **Subscriber**: `~/.hermes/nats-subscriber.py` (shared script, one
   instance per agent identity). On the OpenClaw side it consumes
@@ -223,8 +174,9 @@ interface, and the deployment shape here is typically **many containerized
 opencode agents against one shared FALDA instance**, with a single container
 often working across several projects. That combination — many untrusted-ish
 network peers, one container spanning multiple tenants — is why FALDA ships a
-dedicated, **authenticated** MCP server (`src/mcp.ts`) alongside the
-unauthenticated JSON gateway used by Hermes/OpenClaw above.
+dedicated MCP server (`src/mcp.ts`) alongside the JSON gateway used by
+Hermes/OpenClaw above; both share the same bearer-token + tenant-allow-list
+auth (`src/mcp_auth.ts`).
 
 Full setup recipe (server config, per-project opencode config, auto-capture
 plugin, shared pools): `integrations/opencode/README.md` and `docs/MCP.md`.
@@ -251,9 +203,7 @@ Summary:
   This lets one container/token drive several projects (each project = a
   different FALDA tenant) by varying the header per-project, while keeping
   cross-tenant access impossible outside the token's allow-list — see
-  `docs/MCP.md` for the full contract, and `proxy/` for the analogous
-  (stricter, one-token-one-tenant) pattern already used for external REST
-  demo access.
+  `docs/MCP.md` for the full contract.
 - **Shared pools**: identical mechanism to §3 below — declare a pool on the
   gateway (admin-only, not exposed over MCP) and add it to the relevant
   tokens' `pools` allow-list.
@@ -281,7 +231,7 @@ semantics + isolation guarantees in `docs/POOLS.md`.
 
 ## 4. Broker deploy (NATS + JetStream, runs on Kukla's host)
 
-The message bus described in §1 and §2c assumes a running NATS broker. Templates
+The message bus described in §1 and §2 assumes a running NATS broker. Templates
 live in `deploy/nats/`.
 
 ### `deploy/nats/nats-server.conf.template`
@@ -324,7 +274,7 @@ broker ACL/config change:
 
 ## 5. Hermes-side launchd templates
 
-Four `.plist.template` files live in `deploy/launchd/`. Tokens: `REPLACE_ME_HOME`,
+Three `.plist.template` files live in `deploy/launchd/`. Tokens: `REPLACE_ME_HOME`,
 `REPLACE_ME_TAILSCALE_IP`, `REPLACE_ME_NODE` (absolute node path — must match the
 one used for `npm install`/`npm rebuild better-sqlite3`),
 `REPLACE_ME_FALDA_CHECKOUT`, `REPLACE_ME_NODE_BINDIR`.
@@ -334,13 +284,12 @@ one used for `npm install`/`npm rebuild better-sqlite3`),
 | `com.stevens.nats-broker.plist.template` | `com.stevens.nats-broker` | `/opt/homebrew/bin/nats-server` | Broker itself; Kukla's host |
 | `com.stevens.nats-subscriber.plist.template` | `com.stevens.nats-subscriber` | sibline venv Python 3.13 | Needs `nats-py`; 3.11+ isoformat native |
 | `com.stevens.falda-gateway.plist.template` | `com.stevens.falda-gateway` | Pinned `node` (same as `npm rebuild`) | ABI must match — see `REPLACE_ME_NODE`. Runs the unified `falda serve` (`src/server.ts`): HTTP API on `:8077` **and** MCP on `:8079`, plus the distillation worker — despite the "gateway" label, which is kept for install continuity. |
-| `com.stevens.falda-tap.plist.template` | `com.stevens.falda-tap` | `/usr/bin/python3` (system) | stdlib only, no deps |
 
-> **Why three interpreters?** Deliberately different: the broker is a Go binary;
-the subscriber runs the sibline venv (needs `nats-py`, pinned to Python 3.13+);
-the tap uses system Python (stdlib only, no deps, maximum portability); the
-gateway runs pinned Node (native ABI dependency via `better-sqlite3`). Do not
-"unify" them — each interpreter choice carries a real constraint.
+> **Why different interpreters?** Deliberately different: the broker is a Go
+binary; the subscriber runs the sibline venv (needs `nats-py`, pinned to
+Python 3.13+); the gateway runs pinned Node (native ABI dependency via
+`better-sqlite3`). Do not "unify" them — each interpreter choice carries a
+real constraint.
 
 ---
 
@@ -381,16 +330,12 @@ gateway runs pinned Node (native ABI dependency via `better-sqlite3`). Do not
       ~/Library/LaunchAgents/com.stevens.nats-subscriber.plist  # fill tokens
    launchctl load ~/Library/LaunchAgents/com.stevens.nats-subscriber.plist
 
-4. FALDA tap (shadow capture):
-   # set SOURCE_CONV_DIR (memory provider L0 JSONL dir) + FALDA_TENANT in plist
-   cp deploy/launchd/com.stevens.falda-tap.plist.template \
-      ~/Library/LaunchAgents/com.stevens.falda-tap.plist  # fill tokens
-   launchctl load ~/Library/LaunchAgents/com.stevens.falda-tap.plist
-
-5. Verify end-to-end:
+4. Verify end-to-end:
    - Publish a test envelope to sibline.<peer>.inbox; confirm peer receives.
-   - tail ~/.falda/tap.log; confirm new turns flow to /stream/add.
-   - curl 'localhost:8077/stream/search?q=test&tenant=<tenant>'; confirm capture.
+   - Point Hermes' memory hooks at the gateway (§1a) and confirm a written
+     turn is recallable:
+     curl -s localhost:8077/stream/search -H "Authorization: Bearer <token>" \
+       -H "X-Falda-Tenant: <tenant>" -d '{"q":"test"}'
 ```
 
 ### Secrets layout
@@ -405,17 +350,20 @@ gateway runs pinned Node (native ABI dependency via `better-sqlite3`). Do not
 
 ## 7. Checklist for a new harness
 
-1. Choose a stable `tenant` id for the agent.
+1. Choose a stable `tenant` id for the agent, and mint it a bearer token
+   (`FALDA_TOKENS`; see `docs/API.md` "Authentication").
 2. Stand up (or reuse) a FALDA gateway; confirm `/healthz`.
-3. Decide shadow vs. live; for shadow, run a tap + `compare_dualrun.py`.
+3. Wire the harness's memory hooks to the gateway with
+   `Authorization: Bearer <token>` + `X-Falda-Tenant: <tenant>` on every call.
 4. If sharing memory with another harness, declare a pool with explicit access.
 5. If coordinating via the message bus, run a subscriber on a modern Python and
    make the send path symmetric (file + broker).
-6. Keep the gateway off the public internet (no built-in auth).
+6. Keep the gateway off the public internet — its auth is a
+   routing/authorization boundary, not transport security.
 
 ---
 
-## 5. Install / bootstrap order (replication-grade)
+## 8. OpenClaw-side install / bootstrap order (replication-grade)
 
 The broker leg lives on the Hermes host (m1); see §4 above and
 `deploy/nats/` for the `nats-server.conf` 3-user ACL (note the
@@ -423,32 +371,33 @@ The broker leg lives on the Hermes host (m1); see §4 above and
 broker + streams exist, bring up the OpenClaw side in this order:
 
 ```
-1.  git checkout + cd falda
-2.  npm install            # use the pinned Node (see package.json engines)
-3.  npm rebuild better-sqlite3   # ABI must match the pinned Node; pin the
-                                 # absolute node path in any launchd plist env
-4.  mkdir -p ~/.openclaw/falda-dualrun ~/.openclaw/logs ~/.falda
-5.  (Hermes host) start nats-server + create streams (see §4 / deploy/nats/create-streams.sh)
-6.  (Hermes host) create durable consumers: sibline-ollie/ollie-inbox-durable,
-    sibline-broadcast/ollie-bcast-durable
-7.  start FALDA gateway:  launchctl bootstrap + kickstart
-    com.example.falda-gateway  ->  verify  curl -s localhost:8077/healthz
-8.  start the shadow tap:   com.example.falda-tap-openclaw
-                           ->  confirm /stream/add receiving tenant=openclaw
-9.  start the subscriber:   com.example.nats-subscriber
-                           ->  log shows js-subscribed filter=sibline.ollie.inbox
+1. git checkout + cd falda
+2. npm install            # use the pinned Node (see package.json engines)
+3. npm rebuild better-sqlite3   # ABI must match the pinned Node; pin the
+                                # absolute node path in any launchd plist env
+4. mkdir -p ~/.openclaw/logs ~/.falda
+5. (Hermes host) start nats-server + create streams (see §4 / deploy/nats/create-streams.sh)
+6. (Hermes host) create durable consumers: sibline-ollie/ollie-inbox-durable,
+   sibline-broadcast/ollie-bcast-durable
+7. start FALDA gateway:  launchctl bootstrap + kickstart
+   com.example.falda-gateway  ->  verify  curl -s localhost:8077/healthz
+8. start the subscriber:   com.example.nats-subscriber
+                          ->  log shows js-subscribed filter=sibline.ollie.inbox
+9. mint a bearer token + tenant for openclaw (§0 Auth), configure the FALDA
+   memory-provider plugin (§2a) with it
 10. verify end-to-end: publish a kind=ping to sibline.ollie.inbox; expect a
-    pong on sibline.<peer>.inbox + an `inbox appended` line in the subscriber log
+    pong on sibline.<peer>.inbox + an `inbox appended` line in the subscriber
+    log; confirm the memory-provider plugin can write/read via the gateway
 ```
 
 Plist templates with `REPLACE_ME_*` tokens are in `deploy/launchd/`
-(`com.example.falda-gateway`, `com.example.falda-tap-openclaw`,
-`com.example.nats-subscriber`). Replace `REPLACE_ME_HOME` /
-`REPLACE_ME_PYTHON` / `REPLACE_ME_FALDA_URL` before installing.
+(`com.example.falda-gateway`, `com.example.nats-subscriber`). Replace
+`REPLACE_ME_HOME` / `REPLACE_ME_PYTHON` / `REPLACE_ME_FALDA_URL` before
+installing.
 
 ---
 
-## 6. Secrets layout (OpenClaw side)
+## 9. Secrets layout (OpenClaw side)
 
 Nothing in this stack reads secrets from source. Concrete locations:
 
@@ -456,7 +405,7 @@ Nothing in this stack reads secrets from source. Concrete locations:
 |---|---|---|
 | Cross-agent webhook HMAC secret | file: `~/.openclaw/agent-secrets/kukla-webhook.env` (mode `0600`) | Sourced by `kukla_webhook_post.sh` as a fallback **before** the keychain lookup. Required because a login keychain is **locked in non-GUI SSH sessions**, so `security find-generic-password` returns empty there. File-first avoids that trap. |
 | NATS broker user/password | env file on each host, mode `0600` | Never inline in the plist; pass via `EnvironmentVariables` or a sourced env file. Broker ACL config is on the Hermes host (`deploy/nats/`). |
-| FALDA gateway | none | No built-in auth — bind to loopback only and keep off the public internet. |
+| FALDA bearer token (`FALDA_TOKENS`) | `~/.falda/falda_tokens.json`, mode `0600` | Never committed (git-ignored). Gateway auth is a routing/authorization boundary, not transport security — still bind to loopback/tailnet only and keep off the public internet. |
 
 Keychain-vs-file rule of thumb: anything a launchd/SSH/cron context must read
 unattended goes in a `0600` env file (keychain is unreliable headless);

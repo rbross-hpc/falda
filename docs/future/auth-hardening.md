@@ -6,6 +6,16 @@ capture a comparison of the auth approaches that now exist in the FALDA
 lineage, and a menu of hardening options for the one that shipped
 (`src/mcp_auth.ts`), so the analysis isn't lost as tribal knowledge.
 
+> **Update:** `proxy/falda_access_proxy.py` (referenced throughout as
+> "existing, already in this repo") was removed — it was written for FALDA's
+> retired unauthenticated/body-tenant era, and the external-demo use case it
+> served is retired too (`docs/future/reliability-hardening.md` finding 8).
+> All references to it below are now historical, describing a real prior
+> design point in this repo's lineage, not a currently-available surface. Its
+> one capability nothing else here replaces is TLS termination — a future
+> public-facing deployment would use a standard reverse proxy (nginx, Caddy)
+> in front of the in-process auth (`src/mcp_auth.ts`) instead.
+
 ## Background: the shared vulnerability
 
 Before per-request auth existed, the gateway resolved tenant identity
@@ -144,9 +154,10 @@ Ranked by how much it matters:
 4. **No TLS.** Documented as an explicit non-goal in `docs/MCP.md` (auth is
    an authorization boundary, not transport security); tokens and payloads
    cross the wire in cleartext. Acceptable on a private compose network or
-   loopback, not over anything untrusted. `proxy/falda_access_proxy.py`
-   already has a TLS-terminating pattern in this repo if a public-facing
-   need arises.
+   loopback, not over anything untrusted. If a public-facing need arises,
+   terminate TLS with a standard reverse proxy (nginx, Caddy) in front of
+   the in-process auth — `proxy/falda_access_proxy.py` (now removed) was
+   this repo's prior self-contained pattern for that.
 
 ## Proposed hardening options
 
@@ -200,11 +211,10 @@ extend the same default to the MCP server.
 
 Court's PR notes bearer tokens are "a pragmatic first factor" and that
 mTLS (client-cert → tenant/principal) fits the same overwrite/bind model if
-stronger caller identity is needed later. `proxy/falda_access_proxy.py`
-already establishes a TLS-termination pattern in this repo. Not proposed for
-near-term work; noted here so it isn't reinvented from scratch if the need
-arises (e.g., a genuinely public-facing deployment beyond the existing
-`proxy/` external-demo use case).
+stronger caller identity is needed later. Not proposed for near-term work;
+noted here so it isn't reinvented from scratch if the need arises (e.g., a
+genuinely public-facing deployment, which no longer exists now that the
+`proxy/` external-demo use case is retired).
 
 ## Suggested sequencing, if pursued
 
@@ -215,7 +225,8 @@ arises (e.g., a genuinely public-facing deployment beyond the existing
    (hard cutover vs. dual-accept) that deserves its own review rather than
    riding alongside B/C.
 3. **D (mTLS)** stays parked until there's an actual public-facing
-   deployment need beyond what `proxy/falda_access_proxy.py` already serves.
+   deployment need (the `proxy/` external-demo use case it would have served
+   no longer exists).
 
 ## Non-goals (kept explicitly out of scope here, per Court's PR #1)
 
@@ -233,10 +244,10 @@ out only to keep this document's scope bounded.
   Hard cutover is simpler to reason about and test; dual-accept is kinder to
   anyone who already has a hand-rolled token file deployed outside this
   repo's own `docker-setups` usage.
-- Should the three auth surfaces that now exist in the FALDA lineage
-  (in-process `mcp_auth.ts`, Court's standalone proxy, the pre-existing
-  `proxy/falda_access_proxy.py`) stay layered/independent as they are today,
-  or should the standalone-proxy pattern be retired in favor of always
-  using the in-process model now that it also fronts the MCP server? No
-  action proposed here either way — flagging it as a question for whoever
-  picks this up next.
+- The standalone-proxy pattern (`proxy/falda_access_proxy.py`) has already
+  been retired in favor of the in-process model (`src/mcp_auth.ts`), which
+  now fronts both the JSON gateway and the MCP server. If a public-facing
+  deployment is needed again, decide then whether to reintroduce a
+  standalone auth proxy or terminate TLS with a standard reverse proxy in
+  front of the existing in-process auth — no action proposed here either
+  way.

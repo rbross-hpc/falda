@@ -6,9 +6,6 @@ dist
 
 # Secrets — must never enter an image layer.
 falda_tokens.json
-proxy/falda_proxy_tokens.json
-proxy/falda_proxy.crt
-proxy/falda_proxy.key
 
 # Runtime data / not needed in the build context.
 falda-data/
@@ -22,8 +19,6 @@ example-blobs/
 test
 examples
 deck
-demo
 docs
 integrations
-proxy
 deploy

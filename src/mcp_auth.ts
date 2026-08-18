@@ -3,8 +3,9 @@
  *
  * Shared by both the MCP server (src/mcp.ts) and the JSON gateway
  * (src/gateway.ts) — one auth story for both front doors onto the pool
- * layer. Design, matching proxy/falda_access_proxy.py's clamp pattern but
- * extended for one container spanning multiple projects:
+ * layer. Token identifies a principal; the principal's allow-lists clamp
+ * which tenants/pools it may address — extended for one container spanning
+ * multiple projects:
  *
  *   - A bearer token identifies a PRINCIPAL (e.g. one opencode container/host).
  *   - Each principal has an explicit `tenants` allow-list (or ["*"] for a
@@ -18,8 +19,8 @@
  *   - A `pool` argument (per tool call) is checked against the principal's
  *     `pools` allow-list, "self" always implicitly allowed.
  *
- * Token file is hot-read per request (like the proxy) so rotating/adding a
- * token doesn't require a restart. Never committed — see .gitignore.
+ * Token file is hot-read per request so rotating/adding a token doesn't
+ * require a restart. Never committed — see .gitignore.
  */
 import { readFileSync } from "node:fs";
 

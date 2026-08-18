@@ -114,7 +114,7 @@ ships a `Dockerfile` running `falda serve` by default (see
 opencode-specific setup (Compose recipe, MCP config, auto-capture plugin).
 
 To connect an agent runtime (Hermes, OpenClaw, opencode, or your own) to
-FALDA — shadow or live, single-tenant or shared-pool — see
+FALDA — single-tenant or shared-pool — see
 [`docs/HARNESS_INTEGRATION.md`](docs/HARNESS_INTEGRATION.md).
 
 ### Roadmap and known gaps
