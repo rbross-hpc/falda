@@ -171,6 +171,15 @@ export class AtomTypeError extends Error {
   constructor(msg: string) { super(msg); this.name = "AtomTypeError"; }
 }
 
+/** Thrown when a legacy store cannot be safely upgraded because it already
+ *  violates an invariant a new unique index would enforce (e.g. duplicate
+ *  (session_id, turn_index) rows created before that constraint existed).
+ *  See docs/future/reliability-hardening.md finding 6 — we fail loudly
+ *  rather than silently deduplicating historical data. */
+export class LegacyMigrationError extends Error {
+  constructor(msg: string) { super(msg); this.name = "LegacyMigrationError"; }
+}
+
 // ─── FTS sanitizer ─────────────────────────────────────────────────────────────
 
 function toFtsQuery(raw: string): string {
@@ -297,8 +306,18 @@ export class Falda {
     sqliteVec.load(this.db);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
-    this.initSchema();
-    this.migrate();
+    // Phased, atomic setup (docs/future/reliability-hardening.md finding 6):
+    // base tables/virtual tables -> additive column migration -> indexes.
+    // Indexes are created last so that opening a genuinely old store never
+    // tries to CREATE INDEX on a column migrate() hasn't added yet. Wrapped
+    // in one transaction so a failure partway through an upgrade (including
+    // a duplicate-key LegacyMigrationError from createIndexes()) leaves the
+    // on-disk store exactly as it was, not half-migrated.
+    this.db.transaction(() => {
+      this.initSchema();
+      this.migrate();
+      this.createIndexes();
+    }).immediate();
   }
 
   private vecBuf(a: number[]): Buffer {
@@ -496,6 +515,11 @@ export class Falda {
     return !!row;
   }
 
+  /** Creates base tables and virtual tables only — no indexes. Indexes are
+   *  created later by createIndexes(), after migrate() has added any
+   *  missing columns, so that opening a genuinely old store never tries to
+   *  index a column that doesn't exist yet
+   *  (docs/future/reliability-hardening.md finding 6). */
   private initSchema() {
     const d = this.dim;
     this.db.exec(`
@@ -509,12 +533,6 @@ export class Falda {
         turn_id TEXT,
         seq INTEGER
       );
-      CREATE INDEX IF NOT EXISTS idx_stream_seq ON stream(seq);
-      CREATE INDEX IF NOT EXISTS idx_stream_session ON stream(session_id);
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_stream_turn_index
-        ON stream(session_id, turn_index) WHERE turn_index IS NOT NULL;
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_stream_turn_id
-        ON stream(session_id, turn_id) WHERE turn_id IS NOT NULL;
       CREATE VIRTUAL TABLE IF NOT EXISTS stream_fts
         USING fts5(content, id UNINDEXED, tokenize='porter unicode61');
       CREATE VIRTUAL TABLE IF NOT EXISTS stream_vec
@@ -536,9 +554,6 @@ export class Falda {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS idx_atoms_status ON atoms(status);
-      CREATE INDEX IF NOT EXISTS idx_atoms_type ON atoms(type);
-      CREATE INDEX IF NOT EXISTS idx_atoms_pinned ON atoms(pinned) WHERE pinned=1;
       CREATE VIRTUAL TABLE IF NOT EXISTS atoms_fts
         USING fts5(content, id UNINDEXED, tokenize='porter unicode61');
       CREATE VIRTUAL TABLE IF NOT EXISTS atoms_vec
@@ -550,7 +565,6 @@ export class Falda {
         added_at TEXT NOT NULL,
         PRIMARY KEY (atom_id, stream_id)
       );
-      CREATE INDEX IF NOT EXISTS idx_evidence_stream ON atom_evidence(stream_id);
 
       CREATE TABLE IF NOT EXISTS consolidation_decisions (
         id TEXT PRIMARY KEY,
@@ -564,7 +578,6 @@ export class Falda {
         candidate_content TEXT,
         candidate_confidence TEXT
       );
-      CREATE INDEX IF NOT EXISTS idx_decisions_pass ON consolidation_decisions(pass_id);
 
       CREATE TABLE IF NOT EXISTS distillation_passes (
         pass_id TEXT PRIMARY KEY,
@@ -581,8 +594,6 @@ export class Falda {
         prompt_version TEXT,
         distiller_version TEXT
       );
-      CREATE INDEX IF NOT EXISTS idx_passes_store ON distillation_passes(store_key);
-      CREATE INDEX IF NOT EXISTS idx_passes_started ON distillation_passes(started_at);
 
       CREATE TABLE IF NOT EXISTS pass_scene_effects (
         pass_id TEXT NOT NULL,
@@ -598,7 +609,6 @@ export class Falda {
         embedding_regenerated INTEGER NOT NULL DEFAULT 0,
         PRIMARY KEY (pass_id, scene_id)
       );
-      CREATE INDEX IF NOT EXISTS idx_pass_scene_effects_pass ON pass_scene_effects(pass_id);
 
       CREATE TABLE IF NOT EXISTS pass_core_effects (
         pass_id TEXT PRIMARY KEY,
@@ -623,8 +633,6 @@ export class Falda {
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
       );
-      CREATE INDEX IF NOT EXISTS idx_scenes_kind ON scenes(scene_kind);
-      CREATE INDEX IF NOT EXISTS idx_scenes_status ON scenes(status);
       CREATE VIRTUAL TABLE IF NOT EXISTS scenes_fts
         USING fts5(title, summary, scene_id UNINDEXED, tokenize='porter unicode61');
       CREATE VIRTUAL TABLE IF NOT EXISTS scenes_vec
@@ -635,7 +643,6 @@ export class Falda {
         atom_id TEXT NOT NULL REFERENCES atoms(id),
         PRIMARY KEY (scene_id, atom_id)
       );
-      CREATE INDEX IF NOT EXISTS idx_scene_atoms_atom ON scene_atoms(atom_id);
     `);
   }
 
@@ -644,7 +651,8 @@ export class Falda {
   private migrate() {
     const now = new Date().toISOString();
 
-    // stream: add turn_index, turn_id if missing (unique indexes already in initSchema IF NOT EXISTS)
+    // stream: add turn_index, turn_id if missing (dependent unique indexes
+    // are created afterward by createIndexes(), once the columns exist).
     if (this.tableExists("stream") && !this.hasColumn("stream", "turn_index")) {
       this.db.exec("ALTER TABLE stream ADD COLUMN turn_index INTEGER");
     }
@@ -661,7 +669,6 @@ export class Falda {
         )
         UPDATE stream SET seq = (SELECT rn FROM ranked WHERE ranked.id = stream.id)
       `);
-      this.db.exec("CREATE INDEX IF NOT EXISTS idx_stream_seq ON stream(seq)");
     }
 
     // scenes: add render_hash column for embedding re-index gating (Branch 4).
@@ -724,6 +731,82 @@ export class Falda {
     }
     if (this.tableExists("stream") && this.tableExists("stream_vec")) {
       this.db.exec("DELETE FROM stream_vec WHERE id NOT IN (SELECT id FROM stream)");
+    }
+  }
+
+  /** Creates every ordinary (non-virtual) index. Runs after migrate() so
+   *  every column an index depends on is guaranteed to already exist —
+   *  including on a store that started out as a genuinely old schema
+   *  (docs/future/reliability-hardening.md finding 6). All ordinary
+   *  indexes live here, not just the ones currently known to depend on a
+   *  migrated column, so a future migration that adds a new indexed column
+   *  can't reintroduce this bug by mistake. Idempotent (IF NOT EXISTS). */
+  private createIndexes() {
+    this.assertNoDuplicateTurnKeys();
+
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_stream_seq ON stream(seq);
+      CREATE INDEX IF NOT EXISTS idx_stream_session ON stream(session_id);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_stream_turn_index
+        ON stream(session_id, turn_index) WHERE turn_index IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_stream_turn_id
+        ON stream(session_id, turn_id) WHERE turn_id IS NOT NULL;
+
+      CREATE INDEX IF NOT EXISTS idx_atoms_status ON atoms(status);
+      CREATE INDEX IF NOT EXISTS idx_atoms_type ON atoms(type);
+      CREATE INDEX IF NOT EXISTS idx_atoms_pinned ON atoms(pinned) WHERE pinned=1;
+
+      CREATE INDEX IF NOT EXISTS idx_evidence_stream ON atom_evidence(stream_id);
+
+      CREATE INDEX IF NOT EXISTS idx_decisions_pass ON consolidation_decisions(pass_id);
+
+      CREATE INDEX IF NOT EXISTS idx_passes_store ON distillation_passes(store_key);
+      CREATE INDEX IF NOT EXISTS idx_passes_started ON distillation_passes(started_at);
+
+      CREATE INDEX IF NOT EXISTS idx_pass_scene_effects_pass ON pass_scene_effects(pass_id);
+
+      CREATE INDEX IF NOT EXISTS idx_scenes_kind ON scenes(scene_kind);
+      CREATE INDEX IF NOT EXISTS idx_scenes_status ON scenes(status);
+
+      CREATE INDEX IF NOT EXISTS idx_scene_atoms_atom ON scene_atoms(atom_id);
+    `);
+  }
+
+  /** Guards the two UNIQUE indexes created in createIndexes(). A legacy
+   *  store that predates those constraints could in principle already
+   *  contain duplicate (session_id, turn_index) or (session_id, turn_id)
+   *  rows; silently deduplicating would destroy data, so we fail loudly
+   *  with a clear, actionable error instead
+   *  (docs/future/reliability-hardening.md finding 6). */
+  private assertNoDuplicateTurnKeys(): void {
+    if (!this.tableExists("stream")) return;
+    if (this.hasColumn("stream", "turn_index")) {
+      const dup = this.db.prepare(`
+        SELECT session_id, turn_index, COUNT(*) AS n FROM stream
+        WHERE turn_index IS NOT NULL
+        GROUP BY session_id, turn_index HAVING n > 1 LIMIT 1
+      `).get() as { session_id: string; turn_index: number; n: number } | undefined;
+      if (dup) {
+        throw new LegacyMigrationError(
+          `Cannot upgrade store: duplicate stream rows for session_id=${dup.session_id} ` +
+          `turn_index=${dup.turn_index} (${dup.n} rows) would violate the new unique ` +
+          `idx_stream_turn_index constraint. Resolve the duplicates manually before reopening.`
+        );
+      }
+    }
+    if (this.hasColumn("stream", "turn_id")) {
+      const dup = this.db.prepare(`
+        SELECT session_id, turn_id, COUNT(*) AS n FROM stream
+        WHERE turn_id IS NOT NULL
+        GROUP BY session_id, turn_id HAVING n > 1 LIMIT 1
+      `).get() as { session_id: string; turn_id: string; n: number } | undefined;
+      if (dup) {
+        throw new LegacyMigrationError(
+          `Cannot upgrade store: duplicate stream rows for session_id=${dup.session_id} ` +
+          `turn_id=${dup.turn_id} (${dup.n} rows) would violate the new unique ` +
+          `idx_stream_turn_id constraint. Resolve the duplicates manually before reopening.`
+        );
+      }
     }
   }
 
