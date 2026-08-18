@@ -216,6 +216,111 @@ Caveats:
   root is actually being migrated together (or plan a separate
   `FALDA_ROOT` per differently-configured deployment).
 
+# Backing up and restoring FALDA
+
+Durable state under `FALDA_ROOT` spans several files that must be captured
+together and consistently: every self-tenant/pool `falda.db` (WAL mode,
+`src/falda.ts`), `distill_queue.db` and `recall_traces.db`
+(`src/runtime.ts`), `pools.json`/`EMBEDDING.json`, and each store's blob
+directory (`core.md`, `scenes/*.md`). **A plain `cp` of these files is not
+safe** — WAL mode means a file copied mid-checkpoint, or without its
+`-wal`/`-shm` sidecars, can be corrupt or missing recent writes.
+`falda backup` and `falda restore` snapshot every SQLite file with
+[`VACUUM INTO`](https://www.sqlite.org/lang_vacuum.html#vacuuminto), which
+produces one consistent, sidecar-free file safe to copy even while the
+store is open, then copy the JSON config and blob trees, and write a
+manifest with a SHA-256 checksum of every captured file.
+
+**Not backed up:** the bearer token file. It lives outside `FALDA_ROOT`
+(`src/runtime.ts` `resolveTokensPath`) and is a secret, not application
+data — back it up through your own secret-management path, separately.
+
+```bash
+# 1. Take a backup (safe to run against a live deployment — every SQLite
+#    file is snapshotted with VACUUM INTO, not copied raw):
+falda backup --root=/data --out=/backups/falda-2026-08-18
+
+# 2. (elsewhere / later) Restore into a FRESH root and verify:
+falda restore --from=/backups/falda-2026-08-18 --root=/data-restored
+
+# 3. Point FALDA_ROOT at the restored root and start `falda serve` there
+#    once you're satisfied with the verification output from step 2, or
+#    swap it into place of the original /data.
+```
+
+Or directly (e.g. inside the `falda` container in a Compose deployment):
+`node dist/backup.js --out=/backups/... ` / `node dist/restore.js
+--from=/backups/... --root=...`, same pattern as `node dist/reembed.js`
+above.
+
+## `falda backup`
+
+| Flag | Effect |
+|------|--------|
+| `--root=DIR` | Pool root to back up (default: `FALDA_ROOT` env or `./falda-data`) |
+| `--out=DIR` | Destination directory for the backup — must not already exist and be non-empty (a backup is always written into a fresh directory) |
+| `--tenant=T` | Only back up this tenant's self store (plus root-level files) |
+| `--pool=P` | Only back up this declared pool's store (plus root-level files) |
+| `--dry-run` | List which stores/files would be captured; no writes |
+
+What it captures, per store (every self-tenant + declared pool under
+`--root`, or one selected via `--tenant`/`--pool`) plus root-level files:
+
+1. `falda.db` via `VACUUM INTO` — skipped (not an error) for a declared
+   pool whose store has never been written to, since it has no db file yet.
+2. The store's blob directory (`core.md`, `scenes/*.md`), copied as-is.
+3. `pools.json`, `EMBEDDING.json`, `distill_queue.db` (`VACUUM INTO`),
+   `recall_traces.db` (`VACUUM INTO`) — whichever of these root-level files
+   exist.
+4. `backup-manifest.json`, listing every captured file's relative path,
+   byte size, and SHA-256 checksum, plus the backup's `falda_version` and
+   the root's locked embedding dimension/model from `EMBEDDING.json` (if
+   any).
+
+## `falda restore`
+
+| Flag | Effect |
+|------|--------|
+| `--from=DIR` | Backup directory, as written by `falda backup --out=DIR` |
+| `--root=DIR` | Target root to restore into (default: `FALDA_ROOT` env or `./falda-data`) |
+| `--dry-run` | Verify the backup and report what would be restored; no writes |
+| `--yes` | Required to restore into a **non-empty** target root |
+
+What it does:
+
+1. Reads `backup-manifest.json` and verifies every listed file's byte size
+   and SHA-256 checksum against the backup directory — a corrupt or
+   tampered backup is rejected before anything is copied.
+2. Refuses if the target root already has an `EMBEDDING.json` whose `dim`
+   disagrees with the backup's locked dimension — restoring a snapshot
+   taken at one dimension into a root locked to a different one would
+   leave the `vec0` tables inconsistent with the lock (same rationale as
+   `falda reembed`, `src/boot.ts` `enforceEmbeddingLock`).
+3. Refuses a non-empty target root unless `--yes` — **restoring into a
+   fresh directory and swapping it into place of the original is the
+   recommended path**, not restoring in place over a live root.
+4. Copies every captured file into the target root's original layout, then
+   runs a post-restore verification pass (the same `inspectStore` `falda
+   stats` uses) over every restored store and reports tier counts —
+   confirm these match what you expect before starting `falda serve`
+   against the restored root.
+
+Caveats:
+
+- **Run with the server stopped**, both when taking a backup meant to
+  represent a specific point in time for a planned migration/decommission,
+  and always before restoring — `falda restore` does not coordinate with a
+  running server, and copying files into a root a live process is writing
+  to is unsupported.
+- **`distill_watermark`/`core_state`/`store_dirty` rows ride along inside
+  each restored `falda.db`** but are explicitly disposable operational
+  cursors (`src/distill/watermark.ts`) — if you ever needed to restore an
+  older backup than the last one taken, losing recent progress on those
+  only costs an extra reconciliation pass on next boot, never data.
+- **The bearer token file is never included** — restoring a root does not
+  restore who's allowed to talk to it; provision the token file for the
+  restored deployment separately.
+
 # Reviewing distillation quality: `falda distill inspect`
 
 A successful LLM call is not evidence of successful distillation.

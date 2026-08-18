@@ -31,6 +31,8 @@
     "serve": "tsx src/server.ts",
     "stats": "tsx src/stats.ts",
     "reembed": "tsx src/reembed.ts",
+    "backup": "tsx src/backup.ts",
+    "restore": "tsx src/restore.ts",
     "distill-inspect": "tsx src/inspect/cli.ts",
     "show-recall": "tsx src/show/recall.ts",
     "example": "tsx examples/basic.ts",

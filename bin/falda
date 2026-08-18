@@ -34,6 +34,27 @@
 #                            model/dimension change".
 #                            ARGS: --root=DIR --tenant=T --pool=P
 #                            --dry-run --yes
+#   falda backup [ARGS]     Consistent-snapshot backup of everything under
+#                            FALDA_ROOT (or one --tenant/--pool) into a
+#                            fresh --out=DIR: every SQLite file via VACUUM
+#                            INTO (safe under WAL, unlike a plain file
+#                            copy), pools.json/EMBEDDING.json, and each
+#                            store's blob dir, plus a checksummed manifest.
+#                            Does NOT back up the bearer token file (a
+#                            secret, outside FALDA_ROOT). See
+#                            docs/OPERATIONS.md "Backing up and restoring
+#                            FALDA".
+#                            ARGS: --root=DIR --out=DIR --tenant=T --pool=P
+#                            --dry-run
+#   falda restore [ARGS]     Restore a FALDA_ROOT from a `falda backup`
+#                            output dir: verifies every file's checksum and
+#                            the backup's locked embedding dimension before
+#                            copying anything, then runs a post-restore
+#                            verification pass. Refuses a non-empty target
+#                            root without --yes. Run with the server
+#                            stopped — see docs/OPERATIONS.md "Backing up
+#                            and restoring FALDA".
+#                            ARGS: --from=DIR --root=DIR --dry-run --yes
 #   falda distill inspect [ARGS]
 #                            Read-only report of what distillation actually
 #                            decided (not merely whether it ran): extracted
@@ -93,7 +114,7 @@ cd "$ROOT"
 
 PORT="${FALDA_PORT:-8077}"
 
-usage() { sed -n '3,80p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '3,101p' "$0" | sed 's/^# \{0,1\}//'; }
 
 run_node_or_tsx() {
   # $1 = dist target (relative), $2 = src target (relative), remaining = args
@@ -129,6 +150,12 @@ case "$cmd" in
     ;;
   reembed)
     run_node_or_tsx "dist/reembed.js" "src/reembed.ts" "$@"
+    ;;
+  backup)
+    run_node_or_tsx "dist/backup.js" "src/backup.ts" "$@"
+    ;;
+  restore)
+    run_node_or_tsx "dist/restore.js" "src/restore.ts" "$@"
     ;;
   distill)
     sub="${1:-}"; shift || true
