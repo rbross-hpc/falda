@@ -42,7 +42,10 @@ curl -s localhost:8079/healthz   # {"ok":true,"mcp":true}
 
 MCP endpoint: `POST/GET/DELETE http://<host>:8079/mcp` (Streamable HTTP
 transport, stateless — a fresh session per connection), port configurable
-via `FALDA_MCP_PORT` (default `8079`).
+via `FALDA_MCP_PORT` (default `8079`). Bind host defaults to `127.0.0.1`
+(loopback-only), configurable via `FALDA_MCP_BIND` — set `0.0.0.0` for a
+containerized deployment reached via `docker -p` (binding loopback inside
+a container defeats port publishing; see the env table below).
 
 ## Auth model
 
@@ -186,6 +189,7 @@ API when run via `falda serve`). MCP-specific:
 | var | meaning | default |
 |---|---|---|
 | `FALDA_MCP_PORT` | port to listen on | `8079` |
+| `FALDA_MCP_BIND` | bind host — loopback-only by default; set `0.0.0.0` to expose beyond loopback (required for `docker -p` reachability) | `127.0.0.1` |
 | `FALDA_MCP_TOOLSET` | `default` (compact agent API) or `full` (+ tier-specific advanced tools) | `default` |
 | `FALDA_ROOT` | pool root dir (shared with the HTTP API) | `./falda-data` |
 | `FALDA_TOKENS` | canonical token file, shared by HTTP and MCP | `./falda_tokens.json` |

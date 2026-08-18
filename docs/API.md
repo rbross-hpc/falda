@@ -1,9 +1,15 @@
 # FALDA API
 
 All routes are `POST` with a JSON body and JSON response, except `/healthz` (`GET`).
-Default port: `8077` (`FALDA_PORT`). Served by `falda serve`, which runs
-this HTTP API alongside the MCP endpoint from one shared runtime — see
-`docs/MCP.md`. Pass `--no-mcp` for an HTTP-API-only process.
+Default port: `8077` (`FALDA_PORT`), bound to `127.0.0.1` by default
+(`FALDA_BIND` — set `0.0.0.0` to expose beyond loopback; containerized
+deployments reached via `docker -p` need this, since binding loopback
+inside a container defeats port publishing). Served by `falda serve`,
+which runs this HTTP API alongside the MCP endpoint from one shared
+runtime — see `docs/MCP.md`. Pass `--no-mcp` for an HTTP-API-only process.
+Every request body is capped at `FALDA_MAX_BODY_BYTES` (default 1 MiB,
+`<= 0` disables it) — an oversized body is rejected `413` before parsing
+or authentication.
 
 ## Authentication
 
@@ -33,8 +39,8 @@ non-empty token file (fail-fast — see `docs/POOLS.md` "Environment").
 and the MCP endpoint** — both authenticate against the same `TokenStore`
 (`src/runtime.ts` builds it once; `falda serve` hands the same instance to
 both protocol adapters). Auth is defense-in-depth on top of whatever
-network exposure you choose (e.g. binding to localhost); it does not itself
-change where the server listens.
+network exposure you choose (the server binds `127.0.0.1` by default — see
+`FALDA_BIND` above); it does not itself change where the server listens.
 
 ## Tier T0 — Stream
 

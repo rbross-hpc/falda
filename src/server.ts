@@ -53,6 +53,14 @@ import type { Server } from "node:http";
 export interface ServeOptions {
   httpPort?: number;
   mcpPort?: number;
+  /** Bind host for the HTTP API. Default 127.0.0.1 (or FALDA_BIND) — see
+   *  docs/future/reliability-hardening.md finding 11. */
+  httpHost?: string;
+  /** Bind host for the MCP endpoint. Default 127.0.0.1 (or FALDA_MCP_BIND). */
+  mcpHost?: string;
+  /** Max HTTP request body size in bytes, enforced before parsing/auth.
+   *  Default 1 MiB (or FALDA_MAX_BODY_BYTES); <= 0 disables the cap. */
+  maxBodyBytes?: number;
   /** Deprecated: sets both drain and sweep cadence when the split options
    *  below are omitted. Prefer drainIntervalMs/sweepIntervalMs. */
   workerIntervalMs?: number;
@@ -113,17 +121,99 @@ export class InFlightTracker {
   }
 }
 
-/** Start the HTTP/JSON API on its own listener, against the shared runtime. */
-export function startHttpApi(runtime: FaldaRuntime, port: number, inFlight = new InFlightTracker()): Server & { inFlight: InFlightTracker } {
+/**
+ * Default bind host for both listeners: loopback-only, not all-interfaces.
+ * See docs/future/reliability-hardening.md finding 11 / docs/future/
+ * auth-hardening.md Option C. Override with FALDA_BIND (HTTP) /
+ * FALDA_MCP_BIND (MCP) — e.g. "0.0.0.0" for a containerized deployment
+ * that needs `docker -p` to reach the listener from outside the container
+ * (binding loopback *inside* a container defeats port publishing, since
+ * the Docker proxy connects to the container's own address, not its
+ * loopback interface).
+ */
+const DEFAULT_BIND_HOST = "127.0.0.1";
+
+/**
+ * Default cap on a single HTTP request body, in bytes. Enforced before
+ * JSON parsing and before auth (src/gateway.ts's handleRequest only
+ * authenticates after the full body is available), so an unauthenticated
+ * caller can't force unbounded memory growth by streaming an oversized
+ * body. Override with FALDA_MAX_BODY_BYTES; <= 0 disables the cap. Does
+ * not apply to the MCP listener — src/mcp/server.ts's
+ * handleFaldaMcpRequest authenticates *before* the SDK's
+ * StreamableHTTPServerTransport reads any body, so the pre-auth-flood gap
+ * this closes doesn't exist there, and the SDK (not this module) owns
+ * that request's body stream. See docs/future/reliability-hardening.md
+ * finding 11.
+ */
+const DEFAULT_MAX_BODY_BYTES = 1024 * 1024; // 1 MiB
+
+function resolveBindHost(envVar: string, override?: string): string {
+  return override ?? process.env[envVar] ?? DEFAULT_BIND_HOST;
+}
+
+function resolveMaxBodyBytes(override?: number): number {
+  const raw = override ?? Number(process.env.FALDA_MAX_BODY_BYTES ?? DEFAULT_MAX_BODY_BYTES);
+  return Number.isFinite(raw) && raw > 0 ? raw : Infinity;
+}
+
+export interface StartHttpApiOpts {
+  host?: string;
+  maxBodyBytes?: number;
+}
+
+/**
+ * Start the HTTP/JSON API on its own listener, against the shared runtime.
+ *
+ * Returns a promise that resolves once the listener is actually bound
+ * (server.address() is populated) rather than the Server synchronously:
+ * passing an explicit host to net.Server#listen() makes Node resolve it
+ * via an async DNS lookup even for a literal IP like "127.0.0.1", unlike
+ * the previous host-less `listen(port, cb)` form, which bound
+ * synchronously. Awaiting "listening" keeps that guarantee for callers
+ * (serve(), tests) that read .address() right after starting.
+ */
+export function startHttpApi(
+  runtime: FaldaRuntime, port: number, inFlight = new InFlightTracker(), opts: StartHttpApiOpts = {},
+): Promise<Server & { inFlight: InFlightTracker }> {
+  const host = resolveBindHost("FALDA_BIND", opts.host);
+  const maxBodyBytes = resolveMaxBodyBytes(opts.maxBodyBytes);
   const server = createServer((req, res) => {
     if (req.method === "GET" && req.url === "/healthz") {
       res.writeHead(200, { "content-type": "application/json" });
       return res.end(JSON.stringify({ ok: true, tiers: ["stream", "atoms", "scenes", "core"], pools: true }));
     }
     if (req.method !== "POST") { res.writeHead(405); return res.end(); }
+    // Reject an oversized body before it's even fully read, and before
+    // handleRequest's auth check — see DEFAULT_MAX_BODY_BYTES doc comment
+    // and finding 11. Content-Length is a fast-path rejection (a caller
+    // that honestly declares an oversized body never has to be streamed
+    // at all); the running-total check below is the real defense against
+    // a missing/lying Content-Length with a chunked flood.
+    const declaredLength = Number(req.headers["content-length"]);
+    if (Number.isFinite(declaredLength) && declaredLength > maxBodyBytes) {
+      res.writeHead(413, { "content-type": "application/json" });
+      res.end(JSON.stringify({ error: "request body too large", limit: maxBodyBytes }));
+      req.destroy();
+      return;
+    }
     let body = "";
-    req.on("data", (c) => (body += c));
+    let rejected = false;
+    let received = 0;
+    req.on("data", (c) => {
+      if (rejected) return;
+      received += c.length;
+      if (received > maxBodyBytes) {
+        rejected = true;
+        res.writeHead(413, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "request body too large", limit: maxBodyBytes }));
+        req.destroy();
+        return;
+      }
+      body += c;
+    });
     req.on("end", () => {
+      if (rejected) return;
       const handled = (async () => {
         try {
           const parsed = body ? JSON.parse(body) : {};
@@ -141,12 +231,25 @@ export function startHttpApi(runtime: FaldaRuntime, port: number, inFlight = new
       inFlight.track(handled);
     });
   });
-  server.listen(port, () => console.log(`FALDA HTTP API listening on :${port} (root=${runtime.root})`));
-  return Object.assign(server, { inFlight });
+  return new Promise((resolve) => {
+    server.listen(port, host, () => {
+      console.log(`FALDA HTTP API listening on ${host}:${port} (root=${runtime.root})`);
+      resolve(Object.assign(server, { inFlight }));
+    });
+  });
 }
 
-/** Start the MCP endpoint on its own listener, against the shared runtime. */
-export function startMcp(runtime: FaldaRuntime, port: number, toolset?: ToolsetName): Server {
+export interface StartMcpOpts {
+  host?: string;
+}
+
+/**
+ * Start the MCP endpoint on its own listener, against the shared runtime.
+ * See startHttpApi's doc comment for why this returns a promise (the
+ * explicit host argument makes .listen() bind asynchronously).
+ */
+export function startMcp(runtime: FaldaRuntime, port: number, toolset?: ToolsetName, opts: StartMcpOpts = {}): Promise<Server> {
+  const host = resolveBindHost("FALDA_MCP_BIND", opts.host);
   const server = createServer((req, res) => {
     if (req.method === "GET" && req.url === "/healthz") {
       res.writeHead(200, { "content-type": "application/json" });
@@ -169,8 +272,12 @@ export function startMcp(runtime: FaldaRuntime, port: number, toolset?: ToolsetN
       }
     });
   });
-  server.listen(port, () => console.log(`FALDA MCP listening on :${port} (root=${runtime.root})`));
-  return server;
+  return new Promise((resolve) => {
+    server.listen(port, host, () => {
+      console.log(`FALDA MCP listening on ${host}:${port} (root=${runtime.root})`);
+      resolve(server);
+    });
+  });
 }
 
 /**
@@ -209,8 +316,8 @@ export async function serve(opts: ServeOptions = {}): Promise<ServeHandle> {
   });
   runtime.wakeDistiller = () => distiller.wake();
 
-  const httpServer = startHttpApi(runtime, httpPort);
-  const mcpServer = opts.noMcp ? null : startMcp(runtime, mcpPort, opts.mcpToolset);
+  const httpServer = await startHttpApi(runtime, httpPort, undefined, { host: opts.httpHost, maxBodyBytes: opts.maxBodyBytes });
+  const mcpServer = opts.noMcp ? null : await startMcp(runtime, mcpPort, opts.mcpToolset, { host: opts.mcpHost });
 
   let closed = false;
   return {

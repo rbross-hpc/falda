@@ -28,10 +28,20 @@ RUN npm run build
 # ---- runtime ----
 FROM node:24-trixie-slim AS runtime
 
+# FALDA_BIND/FALDA_MCP_BIND default to loopback-only outside a container
+# (see docs/future/reliability-hardening.md finding 11), but this image is
+# meant to be reached via `docker run -p 127.0.0.1:PORT:PORT ...` /
+# compose port publishing, which connects to the container's own address —
+# not its loopback interface. So both are set to 0.0.0.0 here; the
+# loopback-only guarantee for a published port comes from the publish spec
+# (e.g. "127.0.0.1:8079:8079"), not from this image binding loopback
+# internally.
 ENV NODE_ENV=production \
     FALDA_ROOT=/data \
     FALDA_PORT=8077 \
     FALDA_MCP_PORT=8079 \
+    FALDA_BIND=0.0.0.0 \
+    FALDA_MCP_BIND=0.0.0.0 \
     FALDA_TOKENS=/run/falda/tokens.json \
     FALDA_EMBED=local \
     FALDA_DIM=768

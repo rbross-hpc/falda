@@ -214,6 +214,9 @@ locally (Ollama, vLLM, llama.cpp) or against a self-hosted lab server.
 | `FALDA_ROOT`            | `./falda-data`                | pool root dir (all tenant/pool stores) |
 | `FALDA_PORT`            | `8077`                         | HTTP JSON API port                     |
 | `FALDA_MCP_PORT`        | `8079`                         | MCP endpoint port                      |
+| `FALDA_BIND`            | `127.0.0.1`                    | HTTP JSON API bind host — loopback-only by default; see "Bind address & request size limits" below |
+| `FALDA_MCP_BIND`        | `127.0.0.1`                    | MCP endpoint bind host — same loopback-only default |
+| `FALDA_MAX_BODY_BYTES`  | `1048576`                      | max HTTP request body size (bytes); oversized bodies get `413` before parsing/auth; `<= 0` disables the cap |
 | `FALDA_MCP_TOOLSET`     | `default`                      | `default` (compact agent API) or `full` (+ tier-specific advanced tools) |
 | `FALDA_TOKENS`          | `./falda_tokens.json`          | canonical bearer-token file, shared by HTTP and MCP (required — see `docs/API.md`) |
 | `FALDA_RECALL_BUDGET`      | `6000`  | `falda_recall`/`POST /recall` default budget (chars) for a deliberate ("explicit") call |
@@ -228,6 +231,27 @@ locally (Ollama, vLLM, llama.cpp) or against a self-hosted lab server.
 when embedding `Falda` directly as a library — see "As a library" above.
 `falda serve` always addresses stores through `FALDA_ROOT` + the pool layer
 (`docs/POOLS.md`), never a single `FALDA_DB`.
+
+**Bind address & request size limits:** both listeners bind `127.0.0.1`
+(loopback-only) by default — a bare host run of `falda serve` is not
+reachable from another machine unless you opt in. **Containerized
+deployments must set `FALDA_BIND=0.0.0.0` and `FALDA_MCP_BIND=0.0.0.0`**:
+binding loopback *inside* a container defeats `docker run -p`/compose port
+publishing, since Docker's port-forwarding connects to the container's own
+network address, not its internal loopback interface — safety in that case
+comes from the *publish spec* instead (e.g. `-p 127.0.0.1:8079:8079` keeps
+it host-loopback-only; a bare `8079:8079` exposes it on every host
+interface). The published Docker image (see `Dockerfile`) already sets both
+to `0.0.0.0` so `docker run -p 127.0.0.1:PORT:PORT ...` works out of the
+box. The HTTP API also rejects a request body larger than
+`FALDA_MAX_BODY_BYTES` (default 1 MiB) with `413`, checked as soon as
+possible — from a declared `Content-Length` if present, otherwise by
+aborting the connection mid-stream once the running total is exceeded —
+and always before JSON parsing or auth, so an unauthenticated caller can't
+force unbounded memory growth. The MCP endpoint has no equivalent cap: it
+authenticates before its SDK-owned transport reads any body, so the
+pre-auth-flood risk this closes doesn't apply there. See
+`docs/future/reliability-hardening.md` finding 11.
 
 Recommended open embedding models: `nomic-embed-text` (768), `BAAI/bge-base-en-v1.5`
 (768), `nomic-ai/nomic-embed-text-v1.5` (768). Set `FALDA_DIM` to match.

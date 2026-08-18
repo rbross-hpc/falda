@@ -88,6 +88,14 @@
 # Environment (see docs/API.md and docs/MCP.md for the full list):
 #   FALDA_PORT             HTTP JSON API port (default 8077).
 #   FALDA_MCP_PORT         MCP port (default 8079).
+#   FALDA_BIND             HTTP API bind host (default 127.0.0.1 — loopback
+#                            only; set 0.0.0.0 to expose beyond loopback,
+#                            e.g. inside a container reached via `docker -p`).
+#   FALDA_MCP_BIND         MCP endpoint bind host (default 127.0.0.1, same
+#                            0.0.0.0 caveat as FALDA_BIND).
+#   FALDA_MAX_BODY_BYTES   Max HTTP request body size in bytes (default
+#                            1048576 / 1 MiB); oversized bodies get 413
+#                            before parsing/auth. <= 0 disables the cap.
 #   FALDA_ROOT             Pool root dir (default ./falda-data).
 #   FALDA_TOKENS           Canonical token file, shared by HTTP and MCP.
 #   FALDA_DIM              Embedding dimensionality (default 768).

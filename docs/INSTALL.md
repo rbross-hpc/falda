@@ -96,7 +96,15 @@ container. `FALDA_ROOT=/data`, `FALDA_TOKENS=/run/falda/tokens.json`,
 `FALDA_PORT=8077`, `FALDA_MCP_PORT=8079`, and `FALDA_EMBED=local` are baked
 in as defaults (see the `Dockerfile`); override with `-e` as needed,
 including `FALDA_LLM_*` to point distillation at a real chat model (see
-`docs/API.md` "Distillation").
+`docs/API.md` "Distillation"). Both listeners default to binding
+`127.0.0.1` outside a container — but binding loopback *inside* a
+container defeats `docker -p` publishing (Docker's port-forwarding
+connects to the container's own address, not its internal loopback
+interface), so the image also bakes in `FALDA_BIND=0.0.0.0` and
+`FALDA_MCP_BIND=0.0.0.0`. The loopback-only guarantee above comes entirely
+from the `-p 127.0.0.1:PORT:PORT` publish spec in the `docker run`
+command, not from anything the container binds internally — a bare
+`-p 8077:8077` would expose it on every host interface.
 
 For the "one FALDA instance behind several containerized agents" deployment
 (Compose, shared network, per-project tenants), see
@@ -122,6 +130,9 @@ const hits = await mem.recall("kukla", "what should I remember?");
 |---|---|---|
 | `FALDA_PORT` | `8077` | HTTP API listen port |
 | `FALDA_MCP_PORT` | `8079` | MCP endpoint listen port |
+| `FALDA_BIND` | `127.0.0.1` | HTTP API bind host — loopback-only by default; set `0.0.0.0` for `docker -p` reachability (the shipped image already does) |
+| `FALDA_MCP_BIND` | `127.0.0.1` | MCP endpoint bind host — same loopback-only default/container caveat |
+| `FALDA_MAX_BODY_BYTES` | `1048576` | Max HTTP request body size (bytes); oversized bodies get `413` before parsing/auth; `<= 0` disables the cap |
 | `FALDA_ROOT` | `./falda-data` | Pool root dir (all tenant/pool stores) |
 | `FALDA_TOKENS` | `./falda_tokens.json` | Canonical bearer-token file, shared by HTTP and MCP (required — see `docs/API.md`) |
 | `FALDA_EMBED_BASE_URL` | _(unset)_ | OpenAI-compatible `/v1/embeddings` base URL |
