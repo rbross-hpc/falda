@@ -14,6 +14,7 @@ falda-data/
 *.tenant-aware.py
 opencode.json
 .opencode/
+PLAN.md
 
 # FALDA access proxy secrets (never commit)
 proxy/falda_proxy_tokens.json
