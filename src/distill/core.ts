@@ -22,6 +22,7 @@ import {
 import {
   initWatermarkSchema, getWatermark, setWatermark, passId,
   initCoreStateSchema, getCoreState, setCoreState, clearCoreState,
+  initDirtySchema, isDirty, markDirty, clearDirty,
 } from "./watermark.js";
 
 export interface LLMFn {
@@ -232,6 +233,7 @@ export async function distillOnce(
 
   initWatermarkSchema(db);
   initCoreStateSchema(db);
+  initDirtySchema(db);
 
   const result: DistillResult = {
     pass_id: "",
@@ -254,26 +256,45 @@ export async function distillOnce(
 
   const turns = store.queryStreamSeq({ afterSeq: afterSeq ?? 0, limit: windowSize });
 
-  if (!turns.length) {
-    log("[distill] no new turns, skipping");
+  // A store is truly a no-op only when there are no new turns to extract AND
+  // nothing has flagged it dirty (docs/future/reliability-hardening.md
+  // finding 2, docs/MODEL.md §8.7). The dirty flag is set by out-of-band
+  // atom/stream lifecycle mutations (supersede/merge/archive/hard-delete/
+  // evidence-affecting stream deletion, src/falda.ts's markStoreDirty) or by
+  // a previous pass whose L2/L3 phase failed to fully complete — either way,
+  // L2/L3 must get a chance to re-run against the CURRENT active-atom/scene
+  // set even though L1 has nothing new to process this time.
+  const dirty = isDirty(db, storeKey);
+  if (!turns.length && !dirty) {
+    log("[distill] no new turns and store is clean, skipping");
     result.pass_id = passId(storeKey, afterSeq, afterSeq ?? "empty");
     return result;
   }
 
-  const lastTurn = turns[turns.length - 1];
-  const pid = passId(storeKey, afterSeq, lastTurn.seq);
+  // lastTurn is only defined when there ARE new turns — a dirty-only pass
+  // (turns.length === 0, dirty === true) has no real lastTurn and must NOT
+  // advance the watermark to a fabricated value (see distillOncePass's L1
+  // section, which guards setWatermark on turns.length > 0).
+  const lastTurn = turns.length ? turns[turns.length - 1] : null;
+  // Reuse the exact "no new turns" pass-id expression the old early-return
+  // used to compute for a dirty-only pass, so it stays a stable, replayable
+  // id derived from "no new turns since afterSeq" rather than colliding
+  // with a future real pass's id once turns do arrive.
+  const pid = lastTurn ? passId(storeKey, afterSeq, lastTurn.seq) : passId(storeKey, afterSeq, afterSeq ?? "empty");
   result.pass_id = pid;
   result.turns_processed = turns.length;
-  log(`[distill] pass ${pid}: ${turns.length} turns (seq ${(afterSeq ?? 0) + 1}–${lastTurn.seq})`);
+  log(turns.length
+    ? `[distill] pass ${pid}: ${turns.length} turns (seq ${(afterSeq ?? 0) + 1}–${lastTurn!.seq})`
+    : `[distill] pass ${pid}: 0 turns, store is dirty — running L2/L3 reconciliation only`);
 
   // Pass metadata + effect log (falda distill inspect, src/inspect/). Only
-  // real (non-empty-window) passes are instrumented — see the early return
-  // above for the no-new-turns case, which never reaches here. Best-effort:
-  // a telemetry write failure must never abort distillation itself.
+  // real or dirty-triggered passes are instrumented — see the early return
+  // above for the fully-clean no-new-turns case, which never reaches here.
+  // Best-effort: a telemetry write failure must never abort distillation.
   try {
     store.recordPassStart({
       pass_id: pid, store_key: storeKey,
-      watermark_start: afterSeq, watermark_end: lastTurn.seq,
+      watermark_start: afterSeq, watermark_end: lastTurn?.seq ?? afterSeq,
       input_turn_count: turns.length,
       model: opts.model, prompt_version: opts.promptVersion, distiller_version: opts.distillerVersion,
     });
@@ -314,7 +335,7 @@ async function distillOncePass(
     storeKey: string; candidateLimit: number;
     topicSimilarityThreshold: number; sceneMatchThreshold: number; sceneReorgThreshold: number;
     verbose: boolean; log: (...args: any[]) => void;
-    turns: StreamTurn[]; afterSeq: number | null; lastTurn: StreamTurn;
+    turns: StreamTurn[]; afterSeq: number | null; lastTurn: StreamTurn | null;
     pid: string; result: DistillResult; sceneEffects: Map<string, SceneEffectAccum>;
   },
 ): Promise<DistillResult> {
@@ -333,17 +354,20 @@ async function distillOncePass(
   // synchronous, so ALL async work (LLM calls, embeddings, candidate search)
   // happens below, before the transaction opens. Nothing after that point
   // may await anything.
+  //
+  // Dirty-only pass (finding 2, docs/future/reliability-hardening.md): when
+  // turns.length === 0, this pass was triggered purely because the store is
+  // flagged dirty (an out-of-band lifecycle mutation or a previous failed
+  // L2/L3 attempt) — there is nothing for L1 to extract/consolidate, so the
+  // extraction/consolidation LLM calls are skipped entirely (candidates/
+  // writeOps/preparedAtoms all stay empty) and control falls straight
+  // through to L2/L3 below. The L1 transaction below still runs but does
+  // zero work in that case; critically it must NOT advance the watermark,
+  // since there is no real lastTurn to advance it to (see the setWatermark
+  // guard inside the transaction).
 
   const streamIds = turns.map((t) => t.id);
 
-  // Extract candidate atoms.
-  const extractRaw = await llm(extractionPrompt(
-    turns.map((t) => ({ role: t.role, content: t.content }))
-  ));
-  const candidates = parseCandidates(extractRaw);
-  log(`[distill] L1 extracted ${candidates.length} candidates`);
-
-  // For each candidate: recall existing atoms and get consolidation decision from LLM.
   interface L1WriteOp {
     action: "store" | "update" | "merge" | "skip";
     candidate: CandidateAtom;
@@ -354,31 +378,42 @@ async function distillOncePass(
   }
 
   const writeOps: L1WriteOp[] = [];
-  for (let i = 0; i < candidates.length; i++) {
-    const candidate = candidates[i];
-    const existingHits = await store.searchAtoms(candidate.content, candidateLimit);
-    const existing = existingHits.map((h) => ({
-      id: h.id, type: h.type, content: h.content, confidence: h.confidence,
-    }));
-    const decRaw = await llm(consolidationPrompt(candidate, existing));
-    const dec = parseConsolidation(decRaw);
-    // Normalize to stable first-occurrence uniqueness — the LLM can repeat
-    // an id in target_ids, which would otherwise cause duplicate lifecycle
-    // writes below.
-    const validTargetIds = [...new Set(
-      dec.target_ids.filter((id) => existing.some((e) => e.id === id)),
-    )];
-    const newId = atomIdFromContent(candidate.type, candidate.content);
-    const decId = `${pid}-dec-${i}`;
 
-    const action =
-      (dec.action === "store" || (validTargetIds.length === 0 && dec.action !== "skip")) ? "store"
-      : dec.action === "update" && validTargetIds.length === 1 ? "update"
-      : dec.action === "merge" && validTargetIds.length >= 1 ? "merge"
-      : "skip";
+  if (turns.length > 0) {
+    // Extract candidate atoms.
+    const extractRaw = await llm(extractionPrompt(
+      turns.map((t) => ({ role: t.role, content: t.content }))
+    ));
+    const candidates = parseCandidates(extractRaw);
+    log(`[distill] L1 extracted ${candidates.length} candidates`);
 
-    writeOps.push({ action, candidate, newId, validTargetIds, rationale: dec.rationale, decId });
-  }
+    // For each candidate: recall existing atoms and get consolidation decision from LLM.
+    for (let i = 0; i < candidates.length; i++) {
+      const candidate = candidates[i];
+      const existingHits = await store.searchAtoms(candidate.content, candidateLimit);
+      const existing = existingHits.map((h) => ({
+        id: h.id, type: h.type, content: h.content, confidence: h.confidence,
+      }));
+      const decRaw = await llm(consolidationPrompt(candidate, existing));
+      const dec = parseConsolidation(decRaw);
+      // Normalize to stable first-occurrence uniqueness — the LLM can repeat
+      // an id in target_ids, which would otherwise cause duplicate lifecycle
+      // writes below.
+      const validTargetIds = [...new Set(
+        dec.target_ids.filter((id) => existing.some((e) => e.id === id)),
+      )];
+      const newId = atomIdFromContent(candidate.type, candidate.content);
+      const decId = `${pid}-dec-${i}`;
+
+      const action =
+        (dec.action === "store" || (validTargetIds.length === 0 && dec.action !== "skip")) ? "store"
+        : dec.action === "update" && validTargetIds.length === 1 ? "update"
+        : dec.action === "merge" && validTargetIds.length >= 1 ? "merge"
+        : "skip";
+
+      writeOps.push({ action, candidate, newId, validTargetIds, rationale: dec.rationale, decId });
+    }
+  } // end: turns.length > 0 (extraction/consolidation skipped for a dirty-only pass)
 
   // Precompute (and validate) one embedding per UNIQUE non-skip atom id —
   // sequentially, not in parallel, to preserve existing call ordering and
@@ -505,8 +540,13 @@ async function distillOncePass(
       }
     }
 
-    // Advance watermark — last thing in the transaction.
-    setWatermark(db, storeKey, lastTurn.id, lastTurn.timestamp, lastTurn.seq);
+    // Advance watermark — last thing in the transaction. Only when there was
+    // a real lastTurn: a dirty-only pass (turns.length === 0) has nothing to
+    // advance the watermark to, and fabricating an advance would corrupt the
+    // L1 cursor (docs/future/reliability-hardening.md finding 2).
+    if (lastTurn) {
+      setWatermark(db, storeKey, lastTurn.id, lastTurn.timestamp, lastTurn.seq);
+    }
   });
 
   // .immediate() preserves the previous BEGIN IMMEDIATE write-lock timing;
@@ -601,7 +641,34 @@ async function distillOncePass(
     "SELECT id FROM atoms WHERE status='active' ORDER BY id"
   ).all() as Array<{ id: string }>;
 
-  if (allAtomRows.length > 0) {
+  if (allAtomRows.length === 0) {
+    // No active atoms left at all (e.g. the last one was archived/superseded/
+    // merged/hard-deleted) — retire every still-active topic scene. Without
+    // this branch, a store that goes from "some atoms" to "zero atoms" would
+    // leave stale topic scenes active forever, since the clustering loop
+    // below never runs when there's nothing to cluster (finding 2 —
+    // uncovered by the dirty-only reconciliation pass this phase adds,
+    // which is the first thing that ever actually exercises "zero active
+    // atoms, but scenes still need reconciling").
+    const staleTopics = db.prepare(
+      "SELECT * FROM scenes WHERE scene_kind='topic' AND status='active'"
+    ).all() as any[];
+    for (const et of staleTopics) {
+      const prevAtoms: string[] = JSON.parse(et.atom_ids ?? "[]");
+      await store.upsertScene({
+        scene_id: et.scene_id,
+        scene_kind: "topic",
+        title: et.title,
+        atom_ids: prevAtoms,
+        status: "retired",
+      });
+      noteSceneEffect({
+        scene_id: et.scene_id, scene_kind: "topic", title: et.title, effect: "retired",
+        members_before: prevAtoms.length, members_after: 0,
+        added: [], removed: prevAtoms, summary_regenerated: false, embedding_regenerated: false,
+      });
+    }
+  } else {
     // Get embeddings for all active atoms from atoms_vec.
     const atomVecs: AtomVec[] = [];
     for (const { id } of allAtomRows) {
@@ -726,9 +793,20 @@ async function distillOncePass(
   }
 
   // Lazy hash-gated title/summary + re-embed pass for changed scenes.
+  //
+  // L2 failure tracking (docs/future/reliability-hardening.md finding 2):
+  // a scene whose narration LLM call throws must NOT have content_hash
+  // advanced to newHash — persisting newHash despite failure would make
+  // hash-gating believe this scene's narration is up to date, permanently
+  // skipping the retry the failed attempt actually needs. Each scene is
+  // isolated (one scene's narration failure must not skip its siblings),
+  // but failures are counted so the pass as a whole can report incomplete
+  // reconciliation below.
   const activeScenes = db.prepare(
     "SELECT * FROM scenes WHERE status='active'"
   ).all() as any[];
+
+  let l2FailureCount = 0;
 
   for (const sc of activeScenes) {
     const atomIds: string[] = JSON.parse(sc.atom_ids ?? "[]");
@@ -742,13 +820,19 @@ async function distillOncePass(
 
     let newTitle = sc.title;
     let newSummary = sc.summary ?? null;
+    let narrationFailed = false;
 
     if (memberAtoms.length > 0 && llm) {
       try {
         newTitle = (await llm(sceneTitlePrompt(sc.scene_kind, memberAtoms))).trim().slice(0, 200);
         newSummary = (await llm(sceneSummaryPrompt(sc.scene_kind, newTitle, memberAtoms))).trim();
-      } catch {
-        // Keep provisional title/summary on LLM failure.
+      } catch (e) {
+        // Keep provisional title/summary on LLM failure, and — critically —
+        // do NOT advance content_hash below, so the next pass retries this
+        // scene's narration instead of silently accepting the old text.
+        narrationFailed = true;
+        l2FailureCount++;
+        log(`[distill] L2 scene narration failed for ${sc.scene_id}: ${e}`);
       }
     }
 
@@ -758,7 +842,7 @@ async function distillOncePass(
       title: newTitle || sc.title,
       atom_ids: atomIds,
       summary: newSummary,
-      content_hash: newHash,
+      content_hash: narrationFailed ? sc.content_hash : newHash,
       status: "active",
     });
 
@@ -774,8 +858,8 @@ async function distillOncePass(
       members_before: existingEffect?.members_before ?? atomIds.length,
       members_after: existingEffect?.members_after ?? atomIds.length,
       added: existingEffect?.added ?? [], removed: existingEffect?.removed ?? [],
-      summary_regenerated: true,
-      embedding_regenerated: renderChanged,
+      summary_regenerated: !narrationFailed,
+      embedding_regenerated: !narrationFailed && renderChanged,
     });
   }
 
@@ -833,6 +917,7 @@ async function distillOncePass(
       log(`[distill] L3 core unchanged (input hash matches), skipping`);
     }
   }
+  const l3Failed = coreEffect === "failed";
 
   // ── Persist the effect log + finalize pass metadata (best-effort) ────────
   try {
@@ -848,8 +933,45 @@ async function distillOncePass(
     const candidateCount = (db.prepare(
       "SELECT COUNT(*) c FROM consolidation_decisions WHERE pass_id=?"
     ).get(pid) as any).c as number;
+    // Telemetry always reports 'done' for distillOncePass's own outcome —
+    // the L2/L3-incomplete throw below is a SEPARATE signal (job/queue
+    // retry), not a rewrite of this best-effort audit row. This preserves
+    // docs/MODEL.md §8.5's rule that distillation_passes.status reflects
+    // distillOnce's own outcome; distillOnce's outer catch (unchanged from
+    // finding 1) is what actually flips this row to 'failed' when the
+    // throw below propagates.
     store.recordPassComplete({ pass_id: pid, status: "done", candidate_count: candidateCount });
   } catch { /* best-effort — pass data itself already committed */ }
+
+  // ── L2/L3 completeness gate (finding 2) ───────────────────────────────────
+  // L1's atomic transaction (finding 1) has already committed by this point
+  // — a throw here does NOT roll back L1's atom/evidence/decision/watermark
+  // writes, which is correct: L1's atomicity guarantee is about L1 alone
+  // (docs/MODEL.md §8.5). What this throw DOES do is propagate out through
+  // distillOnce's existing try/catch (which marks distillation_passes
+  // 'failed' and rethrows) to src/distill/worker.ts's runJob, whose catch
+  // calls failJob() instead of completeJob() — engaging the existing
+  // backoff/dead-letter retry policy for a persistently broken narration/
+  // synthesis LLM, rather than silently reporting pass success forever.
+  //
+  // The dirty flag is cleared ONLY on the fully-clean path below — every
+  // other exit from this function (including this throw) leaves it set, so
+  // the next attempt (retry or next sweep) re-runs L2/L3 against the
+  // current state. Since L2/L3 are pure, hash-gated functions of the
+  // current active-atom/scene set (docs/MODEL.md §8.5), re-running already-
+  // succeeded parts on retry is a correctly-priced no-op.
+  if (l2FailureCount > 0 || l3Failed) {
+    // Explicitly (re-)mark dirty — this pass may not have started dirty
+    // (e.g. a first-ever pass whose L1 succeeded but L2/L3 then failed), so
+    // simply "not calling clearDirty" is not sufficient on its own.
+    markDirty(db, storeKey, `L2/L3 incomplete: ${l2FailureCount} scene failure(s)${l3Failed ? ", core failed" : ""}`);
+    throw new Error(
+      `L2/L3 reconciliation incomplete: ${l2FailureCount} scene narration failure(s)` +
+      (l3Failed ? ", core synthesis failed" : ""),
+    );
+  }
+
+  clearDirty(db, storeKey);
 
   return result;
 }

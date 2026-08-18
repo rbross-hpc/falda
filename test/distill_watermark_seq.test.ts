@@ -114,6 +114,8 @@ describe("distill watermark: seq-based cursor", () => {
         `{"action":"store","target_ids":[],"rationale":"New fact."}`,
         // L2: episode title/summary for sess-A
         "Alpha session", "Alpha session summary.",
+        // L2: topic title/summary for the same atom's topic scene
+        "Alpha topic", "Alpha topic summary.",
         // L3: core
         "# Core\nAlpha.",
       ]);
@@ -139,6 +141,8 @@ describe("distill watermark: seq-based cursor", () => {
         // L2: episode for sess-A (still active), episode for sess-B (new)
         "Alpha session", "Alpha summary.",
         "Beta session", "Beta session summary.",
+        // L2: topic scene now covers both atoms (content_hash dirtied by the new atom)
+        "Alpha and Beta topic", "Combined topic summary.",
         // L3: core (structure changed)
         "# Core\nAlpha and Beta.",
       ]);

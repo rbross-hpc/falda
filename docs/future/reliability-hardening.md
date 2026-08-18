@@ -88,7 +88,8 @@ tests continue to pass unchanged (`test/distill_core.test.ts`,
 `test/data_model_schema.test.ts`).
 
 **2. L2/L3 failures and lifecycle-only changes are not independently
-retryable.** A pass with no new stream turns returns immediately
+retryable. — ✅ addressed**
+A pass with no new stream turns returns immediately
 (`src/distill/core.ts:257-261`), but the watermark advances at the end of
 L1, *before* L2 (scenes) and L3 (Core) run
 (`src/distill/core.ts:467-469,475-487`). If L2 throws, the worker
@@ -111,6 +112,87 @@ reconciliation state. A job must be able to run L2/L3 even against an
 empty T0 window. Persist a dirty/reconcile-needed flag and only mark a job
 complete once all required downstream phases succeed; never advance a
 scene's content hash when its requested narration failed.
+
+**Landed:** a new `store_dirty` table (`src/distill/watermark.ts`'s
+`initDirtySchema`/`markDirty`/`isDirty`/`clearDirty`), independent of
+`distill_watermark`, tracks "L2/L3 must run even with an empty T0 window."
+`Falda` gained a `storeKey` (`FaldaOptions.storeKey`, threaded from
+`PoolManager.resolve()` via `storeKeyFor()`) and a private
+`markStoreDirty()` called by every lifecycle method that can leave a scene
+or core stale: `supersedeAtom`, `mergeAtoms` (when losers are non-empty),
+`archiveAtom` (when a row was actually archived), `hardDeleteAtomsUnsafe`
+(when rows were actually removed), and `deleteStream` (when
+`affected_atom_ids` is non-empty) — a true no-op call to any of these does
+NOT mark dirty.
+
+`distillOnce`'s early-return now reads `isDirty()` alongside the existing
+turns-vs-watermark check: only a store with zero new turns AND no dirty
+flag is skipped. A dirty-only pass (zero new turns) skips extraction/
+consolidation entirely (no LLM calls, no candidate search) and falls
+through straight to L2/L3; the L1 transaction still runs but does nothing
+and, critically, does not advance the watermark when there is no real
+`lastTurn` (verified as a required test — a fabricated advance would
+corrupt the L1 cursor).
+
+L2/L3 failures are now tracked and propagated: a scene-narration failure
+is still isolated per-scene (one scene's failure doesn't skip its
+siblings) but is counted, and — the actual bug fix — `content_hash` is no
+longer advanced for a scene whose narration call failed (previously the
+new hash was persisted unconditionally, permanently defeating hash-gated
+retry for that scene; this was caught by 3 latent test bugs this phase
+uncovered — see below). A core-synthesis failure is tracked via the
+existing `coreEffect === "failed"` value. After the existing best-effort
+telemetry writes (unchanged — `distillation_passes`/effect rows are still
+best-effort per `docs/MODEL.md §8.5`), if either L2 or L3 failed, the
+function marks the store dirty again (in case it wasn't already) and
+throws — this propagates through `distillOnce`'s existing failure path
+(which sets `distillation_passes.status='failed'`) to
+`src/distill/worker.ts`'s `runJob`, whose catch calls `failJob()` instead
+of `completeJob()`, engaging the existing 30s→900s backoff / 8-attempt
+dead-letter policy rather than silently reporting success. The dirty flag
+is cleared only on the fully-clean path, so a retry (or the next sweep)
+re-runs L2/L3 against current state — safe because L2/L3 are pure,
+hash-gated functions of the active-atom/scene set.
+
+A second, independently-discovered bug was fixed as part of this phase:
+when a store's last active atom is forgotten (all atoms
+archived/superseded/merged/deleted), the topic-scene clustering block was
+skipped entirely (gated on `allAtomRows.length > 0`), so existing topic
+scenes were never retired even though `docs/MODEL.md §8.7` requires it.
+Fixed by adding an explicit zero-active-atoms branch that retires every
+still-active topic scene.
+
+`src/distill/worker.ts`'s sweep gate (`enqueueAll`) now enqueues a store
+when it has undistilled turns **or** is flagged dirty, even with zero
+undistilled turns — the only worker-side change. Per an explicit scope
+decision: marking a store dirty does **not** itself enqueue or wake a job
+(considered and deferred) — reconciliation waits for the next periodic
+sweep (`FALDA_SWEEP_INTERVAL_MS`, default 5 min), matching the existing
+passive-sweep latency for ordinary L1 work. `src/gateway.ts`'s
+atom-lifecycle HTTP routes are unchanged.
+
+Tests: `test/distill_l2_l3_reconcile.test.ts` (10 tests) — dirty-only
+reconciliation with an empty T0 window, a fully-clean store remaining a
+true no-op, L2 and L3 failures each failing the pass and leaving the store
+dirty (with a successful retry that clears it), and dirty-marking coverage
+for all five lifecycle methods including their no-op cases. 3 tests added
+to `test/distill_worker.test.ts`: the sweep gate enqueuing a
+dirty-but-caught-up store, a clean-and-caught-up store NOT being
+over-enqueued, and an L2/L3 failure resulting in `failJob()` (pending,
+`attempts > 0`) rather than `completeJob()`. Fixing this finding's
+content-hash bug surfaced 3 pre-existing tests
+(`test/distill_core.test.ts`'s "episode identity" and "sceneMatchThreshold
+=0" tests, `test/distill_watermark_seq.test.ts`'s cross-session test) that
+were silently relying on the swallowed-L2/L3-failure bug — their mock LLMs
+didn't supply enough responses for the topic scene's narration, and the
+old code masked that gap. All three were fixed by completing their mock
+response sequences, not by relaxing any assertion.
+
+**Considered, deferred:** no new `falda distill inspect`/`falda stats`
+surface for `store_dirty` was added — the finding's recommendation and
+this phase's confirmed scope only required correct reconciliation
+behavior, not new operator-facing dirty-state visibility. Revisit if an
+operational need for it emerges.
 
 ### High
 
