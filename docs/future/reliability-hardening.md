@@ -517,7 +517,8 @@ tables, container variant, caveats). `npm run build` clean; `npm test`
 380/380 (364 baseline + 16 new).
 
 **11. HTTP surface accepts unbounded request bodies before authentication,
-binds all interfaces, and has no rate limiting.** The HTTP listener
+binds all interfaces, and has no rate limiting. — ⚠️ partially addressed**
+The HTTP listener
 concatenates the full request body into memory with no size limit,
 timeout, or early auth check (`src/server.ts:81-89`); `handleRequest`
 authenticates only after the full body is parsed
@@ -532,6 +533,61 @@ doesn't cover.
 oversized/malformed bodies before JSON parsing; adopt `auth-hardening.md`
 Option C (loopback-default bind, opt-out via env) and consider basic rate
 limiting for exposed deployments.
+
+**Landed (body cap + bind):** `startHttpApi()` now enforces
+`FALDA_MAX_BODY_BYTES` (default 1 MiB, `<= 0` disables it) before both
+JSON parsing and `handleRequest`'s auth check: an honestly-declared
+oversized `Content-Length` is rejected immediately, and a streamed body
+with no (or a lying) `Content-Length` is aborted mid-flight — `req.destroy()`
+plus a `413` — the moment the running byte total exceeds the cap, so a
+flood is never buffered in full regardless of what the caller claims.
+Both `startHttpApi()` and `startMcp()` adopted `auth-hardening.md` Option C
+literally: bind host defaults to `127.0.0.1` (`FALDA_BIND` /
+`FALDA_MCP_BIND`), a deliberate breaking change for any deployment that
+relied on the previous all-interfaces default without its own port-publish
+discipline. A related implementation wrinkle surfaced during this phase:
+passing an explicit host to Node's `net.Server#listen()` makes the bind
+resolve asynchronously (an internal DNS lookup runs even for a literal IP
+like `127.0.0.1`), unlike the previous host-less `listen(port, cb)` form,
+which bound synchronously — so `startHttpApi()`/`startMcp()` now return
+`Promise<Server>` (resolving on the `listening` event) rather than a bare
+`Server`, and `serve()` awaits both, preserving every existing caller's
+assumption that `.address()` is populated immediately after start.
+
+**Container caveat, explicitly scoped as a deliberate tradeoff:** binding
+loopback *inside* a container defeats `docker run -p`/compose port
+publishing (Docker's forwarding connects to the container's own network
+address, not its internal loopback interface) — so a hard loopback default
+would have broken every existing containerized deployment of this image.
+Resolved by keeping the server-level default at `127.0.0.1` (matching
+Option C and protecting bare-host/no-compose-layer runs, the gap the
+finding actually names) while making the *shipped* `Dockerfile` bake in
+`FALDA_BIND=0.0.0.0`/`FALDA_MCP_BIND=0.0.0.0`, so `docker run -p
+127.0.0.1:PORT:PORT ...` keeps working unmodified — the loopback-only
+guarantee for a published port lives entirely in the publish spec, as it
+already did before this change. Any other containerized/compose deployment
+of this server (built from source rather than the published image, or
+reached over a compose-internal network by service name rather than
+published ports — the same reason `docker-setups/stacks/alpha-beta` needed
+this) must set both env vars explicitly; documented in `README.md`,
+`docs/API.md`, `docs/MCP.md`, `docs/INSTALL.md`, and
+`integrations/opencode/README.md`.
+
+**Deferred (rate limiting):** not implemented this phase. A real limiter
+needs its own policy decision (per-token vs. per-IP keying, sliding-window
+vs. token-bucket, `429`+`Retry-After` semantics, HTTP-only vs. also MCP,
+on-by-default vs. opt-in) that deserves independent review rather than
+riding alongside the body-cap/bind fixes above — tracked as a new backlog
+item, finding 14 below.
+
+Tests: `test/http_hardening.test.ts` — body under/over the cap (both the
+`Content-Length` fast-path and a chunked flood with no honest
+`Content-Length`, the latter also asserting the server stays healthy for a
+subsequent request), the cap disabled via `<= 0`, the oversized-body
+rejection happening before auth (a bad/missing token still gets `413`, not
+`401`), and both listeners' loopback default plus override via `serve()`
+options and `FALDA_BIND`. `npm run build` clean; `npm test` 388/388 (380
+baseline + 8 new).
 
 **12. Pool registry corruption is silently treated as an empty registry,
 and writes aren't atomic.** A malformed/unreadable `pools.json` becomes
@@ -559,6 +615,25 @@ declared nullable in the runtime DDL (`src/falda.ts:288-297` vs.
 *Recommendation:* compare normalized `sqlite_master.sql` (or explicit
 default/`NOT NULL`/index assertions) rather than names alone; fix the two
 known drifts above.
+
+**14. No rate limiting on the HTTP or MCP surfaces.** Split out of finding
+11 as a deliberately deferred sub-item, not independently discovered: an
+authenticated (or even unauthenticated-but-under-the-body-cap) caller can
+send requests as fast as the network allows with no server-side throttle,
+on either listener. Low risk for the current single-tenant-per-container
+deployment model, but a real gap for any exposed or multi-tenant-per-token
+deployment (e.g. a runaway or misbehaving agent loop hammering `/distill`
+or `falda_recall`).
+
+*Recommendation:* before implementing, resolve the open policy questions
+this needs (not attempted here, since they weren't reviewed as part of
+finding 11's scope): per-token vs. per-IP (or both) keying; sliding-window
+vs. token-bucket algorithm; `429` + `Retry-After` response shape; whether
+it applies to the MCP endpoint (the SDK owns that request's lifecycle,
+unlike the plain HTTP listener) or HTTP only; and on-by-default vs.
+opt-in via env (an opt-in default is lower-risk for existing deployments,
+matching how `FALDA_MAX_BODY_BYTES` and the loopback-bind defaults in
+finding 11 were rolled out).
 
 ### Note — not a code defect, but flag for rotation
 
@@ -596,8 +671,10 @@ duplicated here:
    operational reliability under restart/failure.
 3. **Backup/restore runbook** (finding 10) — currently entirely absent.
 4. **Request limits/timeouts + bind hardening** (findings 4, 11) — cheap,
-   high defense-in-depth value.
+   high defense-in-depth value. *(Finding 11's body-cap and bind-default
+   sub-items landed; rate limiting split out as finding 14, deferred
+   pending its own policy review.)*
 5. **Integration smoke tests** (findings 7, 8, 9) — restore confidence in
    shipped-but-unverified surfaces.
-6. Remaining medium items (5, 6, 12, 13) opportunistically alongside
+6. Remaining medium items (5, 6, 12, 13, 14) opportunistically alongside
    related work.

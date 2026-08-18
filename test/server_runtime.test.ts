@@ -86,18 +86,18 @@ describe("buildRuntime", () => {
 describe("HTTP and MCP share one runtime", () => {
   let runtime: FaldaRuntime;
   let root: string;
-  let httpServer: ReturnType<typeof startHttpApi>;
-  let mcpServer: ReturnType<typeof startMcp>;
+  let httpServer: Awaited<ReturnType<typeof startHttpApi>>;
+  let mcpServer: Awaited<ReturnType<typeof startMcp>>;
   let httpPort: number;
   let mcpPort: number;
 
   before(async () => {
     ({ runtime, root } = await makeTestRuntime());
-    httpServer = startHttpApi(runtime, 0);
+    httpServer = await startHttpApi(runtime, 0);
     // "full" toolset: this suite exercises falda_atoms_search directly to
     // prove HTTP/MCP share one store — that tool lives in the advanced
     // surface under the new compact-default toolset (see mcp/registry.ts).
-    mcpServer = startMcp(runtime, 0, "full");
+    mcpServer = await startMcp(runtime, 0, "full");
     httpPort = (httpServer.address() as any).port;
     mcpPort = (mcpServer.address() as any).port;
   });

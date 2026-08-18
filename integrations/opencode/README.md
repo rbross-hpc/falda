@@ -49,7 +49,13 @@ either way; the surfaces differ in what they expose:
 Both stay off the public internet — no TLS/rate-limiting of their own; bind
 to a private network/tailnet or Compose-internal network (terminate TLS in
 front with a standard reverse proxy, e.g. nginx or Caddy, if you need a
-public-facing front door).
+public-facing front door). Both listeners also default to binding
+`127.0.0.1` outside a container (`FALDA_BIND`/`FALDA_MCP_BIND`); the
+compose recipe below sets both to `0.0.0.0` (also baked into the published
+image) since `alpha`/`beta` reach `falda` over the compose network by
+service name, not through the published loopback ports — binding loopback
+*inside* the `falda` container would make it unreachable from the other
+containers, not just from outside the host.
 
 ## 1. Auth model in one paragraph
 
@@ -105,6 +111,12 @@ services:
       FALDA_ROOT: /data
       FALDA_PORT: "8077"
       FALDA_MCP_PORT: "8079"
+      # Already baked into the image (Dockerfile), shown here for clarity:
+      # containers reach falda by service name over the compose network,
+      # not through the published loopback ports, so both must bind all
+      # interfaces inside the container.
+      FALDA_BIND: "0.0.0.0"
+      FALDA_MCP_BIND: "0.0.0.0"
       FALDA_TOKENS: /run/falda/tokens.json
       FALDA_EMBED: local             # see "Embeddings" below to use a real model
       FALDA_DIM: "768"              # MUST match FALDA_EMBED_MODEL's real dim; see "Embeddings" (a mismatch refuses to boot — enforceEmbeddingLock)

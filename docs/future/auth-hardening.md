@@ -207,6 +207,16 @@ port-publish layer to rely on) or any future compose file that forgets the
 `127.0.0.1:` prefix. Mirrors Court's PR #2 intent for the gateway; would
 extend the same default to the MCP server.
 
+**Landed:** implemented as part of
+`docs/future/reliability-hardening.md` finding 11 (that finding reached
+this same gap independently) — `FALDA_BIND`/`FALDA_MCP_BIND`, default
+`127.0.0.1`, in `src/server.ts`'s `startHttpApi()`/`startMcp()` (this
+repo's actual listener call sites; not `src/gateway.ts`/`src/mcp.ts`,
+which only implement request handling). The shipped `Dockerfile` bakes in
+`0.0.0.0` for both so `docker run -p 127.0.0.1:PORT:PORT ...` keeps
+working — see finding 11's "Landed" note for the container-networking
+reasoning.
+
 ### Option D — Stronger caller identity (mTLS), deferred
 
 Court's PR notes bearer tokens are "a pragmatic first factor" and that
