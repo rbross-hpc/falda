@@ -356,7 +356,8 @@ build`/`install.sh` already assume a source checkout; not addressed by
 this phase.
 
 **8. Shipped external integrations still target the retired
-unauthenticated/body-tenant API.** The current server requires a bearer
+unauthenticated/body-tenant API. — ✅ addressed**
+The current server requires a bearer
 token and selects tenant via `X-Falda-Tenant`
 (`docs/API.md:10-24`, `src/gateway.ts:345-359`), but the shadow tap
 (`integrations/external-source/falda_tap.py:43-48,90-97`), the dual-run
@@ -375,6 +376,31 @@ contract elsewhere (`docs/HARNESS_INTEGRATION.md:88-101,145-169,217-230`).
 one contract throughout. None of these surfaces are covered by CI
 (`.github/workflows/ci.yml:27-34` runs only `npm ci && npm run build &&
 npm test`), so add at least a smoke check per integration.
+
+**Landed:** resolved by **retirement**, not by porting the four surfaces to
+the current auth contract. All four were reference/operational tooling for
+FALDA's retired unauthenticated era (a shadow-migration adapter pair, a
+sales/demo script, and a public-facing proxy whose stated purpose — adding
+auth in front of an unauthenticated gateway — no longer applies now that the
+gateway has native bearer + `X-Falda-Tenant` auth); none are exercised by
+the external-demo partners going forward. Removed entirely: `proxy/`,
+`integrations/external-source/`, `demo/`, and the two tap-only launchd
+templates (`deploy/launchd/com.stevens.falda-tap.plist.template`,
+`deploy/launchd/com.example.falda-tap-openclaw.plist.template`) — this also
+removed the repo's entire Python footprint (3 `.py` files) and its only
+embedded-Python script (in the demo's heredoc). `docs/HARNESS_INTEGRATION.md`
+was reconciled to the one current auth contract throughout (bearer +
+`X-Falda-Tenant`, no body-tenant), and its shadow-capture sections (built on
+the now-removed tap) were removed rather than ported — the guide now covers
+only the live memory-provider path for each harness. Dangling references to
+the removed paths were fixed in `.gitignore`, `.dockerignore`,
+`src/mcp_auth.ts` (comments), `docs/MCP.md`, `integrations/opencode/README.md`,
+`README.md`, and `docs/future/auth-hardening.md` (left as an analysis doc
+with a note that the proxy is retired and historical, per an explicit scope
+decision — not scrubbed of its comparison content). Note: this removes the
+repo's only TLS-terminating public front-end pattern; a future public-facing
+deployment would use a standard reverse proxy (nginx, Caddy) in front of the
+existing in-process auth instead — recorded in `docs/future/auth-hardening.md`.
 
 **9. OpenCode capture plugin can lose a turn on a failed flush. — ✅ addressed**
 `flush()` deletes the pending message from local state *before* calling

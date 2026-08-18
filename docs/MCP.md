@@ -86,11 +86,11 @@ tenants it may select via the header:
 - `tenants: ["proj-a", "proj-b"]` — the principal may only select one of
   these. Selecting any other tenant → tool call returns an error result
   (`token is not authorized for tenant "..."`).
-- **Why token authorizes but header selects** (rather than one-token-one-
-  tenant, as the REST-facing `proxy/` uses): a single container commonly
-  works across multiple projects. One token per container, one tenant header
-  per project's `opencode.json`, lets that container reach every project
-  it's authorized for without juggling per-project tokens.
+- **Why token authorizes but header selects** (rather than a fixed
+  one-token-one-tenant binding): a single container commonly works across
+  multiple projects. One token per container, one tenant header per
+  project's `opencode.json`, lets that container reach every project it's
+  authorized for without juggling per-project tokens.
 - A `pool` tool argument is checked against the principal's `pools`
   allow-list. `pool: "self"` (the default, omitted) is always allowed.
 - The token file is hot-read per request — rotating/adding a token doesn't
@@ -99,8 +99,8 @@ tenants it may select via the header:
 
 This is a routing/authorization boundary, not transport security — run the
 MCP server on a private network/tailnet. It has no TLS of its own; if you
-need a public-facing endpoint, terminate TLS in front of it (see
-`proxy/README.md` for the pattern FALDA already uses for the REST gateway).
+need a public-facing endpoint, terminate TLS in front of it with a standard
+reverse proxy (e.g. nginx, Caddy).
 
 ## Tools
 

@@ -17,12 +17,6 @@ opencode.json
 PLAN.md
 AGENTS.md
 
-# FALDA access proxy secrets (never commit)
-proxy/falda_proxy_tokens.json
-proxy/falda_proxy.crt
-proxy/falda_proxy.key
-proxy/proxy.log
-
 # FALDA canonical token file (never commit) — shared by HTTP API and MCP,
 # used by `falda serve`.
 falda_tokens.json
