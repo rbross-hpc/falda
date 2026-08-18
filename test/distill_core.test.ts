@@ -418,6 +418,9 @@ describe("distillOnce", () => {
         // L2 title/summary — LLM gives the episode a real title (not the provisional one).
         "Detector Incident — Q3",
         "The neutrino detector experienced an unexpected offline event.",
+        // L2 title/summary for the topic scene derived from the same atom.
+        "Detector Topic",
+        "Facts about the neutrino detector.",
         // L3 core
         "# Core\nDetector incident logged.",
       ]);
@@ -443,6 +446,9 @@ describe("distillOnce", () => {
         // L2 title/summary for the same episode — LLM may write a different title again.
         "Detector Incident Resolved",
         "Detector went offline and was subsequently restored.",
+        // L2 title/summary for the topic scene (membership changed, content_hash dirtied).
+        "Detector Topic Updated",
+        "Facts about the neutrino detector, now including its restoration.",
         // L3 core
         "# Core\nDetector restored.",
       ]);
@@ -555,8 +561,10 @@ describe("distillOnce", () => {
       const llmPass2 = makeMockLLM([
         `{"type":"fact","content":"Quantum field theory.","confidence":"high"}`,
         `{"action":"store","target_ids":[],"rationale":"New."}`,
-        // L2: episode (membership updated, no title change)
+        // L2: episode (membership updated, content_hash dirtied by new atom)
         "Particle session", "Updated.",
+        // L2: topic (membership updated too — same atom set feeds both scenes)
+        "Physics topic", "Particle physics and quantum field theory.",
         // L3: core regenerated
         "# Core\nParticle + QFT.",
       ]);

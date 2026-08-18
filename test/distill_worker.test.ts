@@ -20,7 +20,7 @@ import {
   initQueueSchema, enqueue, getJob, listJobs, PRIORITY_EXPLICIT, PRIORITY_PASSIVE,
 } from "../src/distill/queue.js";
 import { startDistiller, resolveWorkerIntervals } from "../src/distill/worker.js";
-import { initWatermarkSchema, setWatermark } from "../src/distill/watermark.js";
+import { initWatermarkSchema, setWatermark, initDirtySchema, markDirty } from "../src/distill/watermark.js";
 import { MetricsRegistry } from "../src/metrics.js";
 import type { LLMFnWithModel } from "../src/distill/llm.js";
 
@@ -589,6 +589,112 @@ describe("startDistiller: sweep gate (only enqueue stores with undistilled turns
         await new Promise((r) => setTimeout(r, 60)); // let a couple more ticks pass
         assert.equal(listJobs(queueDb, "proj-idle:self").length, 0, "idle store never enqueued");
         assert.equal(listJobs(queueDb, "proj-caught:self").length, 0, "caught-up store never enqueued");
+      } finally {
+        await distiller.stop();
+      }
+    } finally { cleanup(root); }
+  });
+
+  // docs/future/reliability-hardening.md finding 2: a store with NO
+  // undistilled turns (watermark == head) but a set store_dirty flag must
+  // still be enqueued by the sweep — dirty state is a second, independent
+  // trigger alongside the watermark-vs-head comparison above.
+  test("a store fully caught up on turns but flagged dirty IS enqueued by the sweep", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      const store = pools.resolve("proj-dirty", undefined, true);
+      await store.addStream("sess-1", [{ role: "user", content: "already distilled turn" }]);
+      const db = (store as any).db;
+      initWatermarkSchema(db);
+      const head = store.streamHeadSeq();
+      setWatermark(db, "proj-dirty:self", "some-turn-id", new Date().toISOString(), head);
+      // Caught up on turns (watermark == head) but flagged dirty directly,
+      // simulating an out-of-band lifecycle mutation.
+      initDirtySchema(db);
+      markDirty(db, "proj-dirty:self", "test: simulated lifecycle mutation");
+
+      const distiller = startDistiller(queueDb, pools, failingLlm, {
+        drainIntervalMs: 60_000, sweepIntervalMs: 20,
+      });
+      try {
+        const enqueuedOk = await waitFor(() => listJobs(queueDb, "proj-dirty:self").length > 0, 1000);
+        assert.ok(enqueuedOk, "dirty store is enqueued despite having no undistilled turns");
+      } finally {
+        await distiller.stop();
+      }
+    } finally { cleanup(root); }
+  });
+
+  test("a store caught up on turns with NO dirty flag is still not enqueued (dirty gate doesn't over-fire)", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      const store = pools.resolve("proj-clean", undefined, true);
+      await store.addStream("sess-1", [{ role: "user", content: "already distilled turn" }]);
+      const db = (store as any).db;
+      initWatermarkSchema(db);
+      const head = store.streamHeadSeq();
+      setWatermark(db, "proj-clean:self", "some-turn-id", new Date().toISOString(), head);
+      // No markDirty call — store_dirty table doesn't even exist yet.
+
+      const distiller = startDistiller(queueDb, pools, failingLlm, {
+        drainIntervalMs: 60_000, sweepIntervalMs: 15,
+      });
+      try {
+        await new Promise((r) => setTimeout(r, 120));
+        assert.equal(listJobs(queueDb, "proj-clean:self").length, 0, "clean, caught-up store stays un-enqueued");
+      } finally {
+        await distiller.stop();
+      }
+    } finally { cleanup(root); }
+  });
+});
+
+// docs/future/reliability-hardening.md finding 2: an L2/L3 failure inside
+// distillOnce() must propagate as a thrown error so runJob's catch calls
+// failJob() (existing backoff/dead-letter), not completeJob() — a silently
+// "successful" job would defeat retry entirely for a broken narration/
+// synthesis LLM.
+describe("startDistiller: L2/L3 failure engages the existing job retry (finding 2)", () => {
+  test("a job whose L2/L3 phase fails is left pending with attempts > 0, not marked done", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      const store = pools.resolve("proj-l2fail", undefined, true);
+      await store.addStream("sess-1", [{ role: "user", content: "the sensor reads nominal" }]);
+
+      // Extraction + consolidation succeed; every subsequent call (scene
+      // title/summary, core synthesis) throws — isolates the failure to
+      // L2/L3 without needing distill_core.test.ts's full mock-response
+      // machinery in this worker-level test.
+      let calls = 0;
+      const l2FailingLlm: LLMFnWithModel = Object.assign(
+        async (prompt: string) => {
+          calls++;
+          if (calls === 1) return `{"type":"fact","content":"The sensor reads nominal.","confidence":"high"}`;
+          if (calls === 2) return `{"action":"store","target_ids":[],"rationale":"New fact."}`;
+          throw new Error("stub LLM — L2/L3 intentionally fails");
+        },
+        { model: "stub" },
+      );
+
+      const jobId = enqueue(queueDb, "proj-l2fail:self");
+      const distiller = startDistiller(queueDb, pools, l2FailingLlm, {
+        drainIntervalMs: 20, sweepIntervalMs: 60_000,
+      });
+      try {
+        const attempted = await waitFor(() => (getJob(queueDb, jobId)?.attempts ?? 0) > 0, 2000);
+        assert.ok(attempted, "job was claimed and attempted");
+        const job = getJob(queueDb, jobId)!;
+        assert.equal(job.status, "pending", "job rescheduled via failJob, not completed");
+        assert.ok(job.error?.includes("L2/L3"), "recorded error reflects the L2/L3 failure");
       } finally {
         await distiller.stop();
       }

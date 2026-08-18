@@ -29,6 +29,7 @@
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Falda, type Embedder } from "./falda.js";
+import { storeKeyFor } from "./distill/queue.js";
 
 export type Access = "none" | "read" | "readwrite";
 
@@ -157,7 +158,7 @@ export class PoolManager {
   resolve(tenant: string, pool: string | undefined, write: boolean): Falda {
     this.vTenant(tenant);
     const p = pool ?? "self";
-    if (p === "self") return this.storeAt(this.selfStorePath(tenant));
+    if (p === "self") return this.storeAt(this.selfStorePath(tenant), storeKeyFor(tenant, undefined));
 
     this.vName(p);
     const decl = this.getPool(p);
@@ -165,7 +166,7 @@ export class PoolManager {
     const access = decl.members[tenant] ?? "none";
     if (access === "none") throw new PoolError("not_a_member", `tenant ${tenant} has no access to pool ${p}`);
     if (write && access !== "readwrite") throw new PoolError("read_only", `tenant ${tenant} has read-only access to pool ${p}`);
-    return this.storeAt(this.poolStorePath(p));
+    return this.storeAt(this.poolStorePath(p), storeKeyFor(tenant, p));
   }
 
   // ─── physical store paths ────────────────────────────────────────────────────
@@ -197,13 +198,17 @@ export class PoolManager {
     });
   }
 
-  /** Open (or reuse) the Falda store at a physical location. */
-  private storeAt(loc: { dir: string; db: string; blobs: string }): Falda {
+  /** Open (or reuse) the Falda store at a physical location. `storeKey`
+   *  (e.g. "<tenant>:self" or "<tenant>:<pool>") is threaded through so
+   *  lifecycle-mutation methods can mark the correct store dirty for L2/L3
+   *  reconciliation (docs/future/reliability-hardening.md finding 2) —
+   *  matches the same key the sweep/queue use for this store. */
+  private storeAt(loc: { dir: string; db: string; blobs: string }, storeKey: string): Falda {
     const key = loc.db;
     let s = this.stores.get(key);
     if (!s) {
       fs.mkdirSync(loc.dir, { recursive: true });
-      s = new Falda({ dbPath: loc.db, blobDir: loc.blobs, embed: this.embed, dim: this.dim });
+      s = new Falda({ dbPath: loc.db, blobDir: loc.blobs, embed: this.embed, dim: this.dim, storeKey });
       this.stores.set(key, s);
     }
     return s;

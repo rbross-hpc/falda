@@ -8,18 +8,24 @@
  *
  * Three responsibilities, on TWO independent timers:
  *   1. Enqueue (sweep): discover every self-store on disk and enqueue, at
- *      PASSIVE priority, only those with an undistilled turn — i.e.
+ *      PASSIVE priority, those with either an undistilled turn — i.e.
  *      streamHeadSeq() > the store's distillation watermark (never-
  *      distilled stores have no watermark row, treated as 0, so a store
  *      with any turns at all enqueues once; a backlogged store whose
  *      watermark trails its head stays enqueued across sweeps until it
- *      catches up). A store with nothing new since its last pass is
- *      skipped entirely — no queue row, no wasted drain tick (coalescing
- *      also dedups, so a tenant with a pending job is never double-queued).
- *      This makes distillation happen automatically with no external
- *      trigger, without enqueuing idle stores. Runs on sweepIntervalMs —
- *      deliberately slower than the drain, since sweeping is cheap
- *      discovery, not work.
+ *      catches up) — OR a set store_dirty flag (an out-of-band atom/stream
+ *      lifecycle mutation, or a previous pass whose L2/L3 phase failed to
+ *      fully complete — see docs/future/reliability-hardening.md finding 2
+ *      and src/falda.ts's markStoreDirty()), even with zero new turns. A
+ *      store with nothing new AND no dirty flag is skipped entirely — no
+ *      queue row, no wasted drain tick (coalescing also dedups, so a
+ *      tenant with a pending job is never double-queued). This makes
+ *      distillation (including L2/L3 reconciliation) happen automatically
+ *      with no external trigger, without enqueuing idle stores. Runs on
+ *      sweepIntervalMs — deliberately slower than the drain, since
+ *      sweeping is cheap discovery, not work. Marking a store dirty does
+ *      NOT itself enqueue/wake — reconciliation waits for the next sweep
+ *      tick at this same cadence, not lower latency.
  *   2. Drain: claim the next ready job (highest priority first — see
  *      src/distill/queue.ts) and run distillOnce() against its store. Runs
  *      on drainIntervalMs, ONE job per tick — this is the passive-backlog
@@ -86,7 +92,7 @@ import {
 } from "./queue.js";
 import { distillOnce } from "./core.js";
 import { PROMPT_VERSION } from "./prompts.js";
-import { getWatermark, initWatermarkSchema } from "./watermark.js";
+import { getWatermark, initWatermarkSchema, initDirtySchema, isDirty } from "./watermark.js";
 import { pruneRecallTraces, resolveRetentionDays } from "../recall/retention.js";
 import type { MetricsRegistry } from "../metrics.js";
 
@@ -291,21 +297,30 @@ export function startDistiller(
       const storeKey = storeKeyFor(tenant, undefined);
       try {
         const store = pools.resolve(tenant, undefined, false);
-        let hasNewTurns: boolean;
+        let needsPass: boolean;
         try {
           const db = (store as any).db as import("better-sqlite3").Database;
           // A store that has never been distilled has no distill_watermark
           // table yet — initialize it (idempotent, matches distillOnce's own
           // call) rather than treating "table missing" as a read failure.
           initWatermarkSchema(db);
+          initDirtySchema(db);
           const head = store.streamHeadSeq();
           const wm = getWatermark(db, storeKey);
-          hasNewTurns = head > (wm?.last_processed_seq ?? 0);
+          const hasNewTurns = head > (wm?.last_processed_seq ?? 0);
+          // A store also needs a pass when it's flagged dirty (finding 2,
+          // docs/future/reliability-hardening.md) — an out-of-band lifecycle
+          // mutation or a previous L2/L3 failure — even with zero new turns.
+          // This is the ONLY place dirty state affects enqueue timing:
+          // marking dirty itself does not enqueue/wake (see
+          // src/falda.ts's markStoreDirty doc comment); reconciliation waits
+          // for this periodic sweep, same cadence as passive L1 work.
+          needsPass = hasNewTurns || isDirty(db, storeKey);
         } catch (e) {
           console.error(`[falda-worker] sweep gate check failed for ${tenant}, enqueuing anyway:`, e);
-          hasNewTurns = true;
+          needsPass = true;
         }
-        if (hasNewTurns) {
+        if (needsPass) {
           enqueue(queueDb, storeKey);
           enqueued++;
         }

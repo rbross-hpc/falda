@@ -22,6 +22,7 @@ import { randomUUID, createHash } from "node:crypto";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { resolveLegacyAtomBudget } from "./recall/budgets.js";
+import { initDirtySchema, markDirty } from "./distill/watermark.js";
 
 export type Embedder = (text: string) => Promise<number[]>;
 
@@ -42,6 +43,18 @@ export interface FaldaOptions {
   embed: Embedder;
   dim?: number;
   recallWeights?: Partial<RecallWeights>;
+  /** The distillation store key this instance corresponds to (e.g.
+   *  "<tenant>:self" or "<tenant>:<pool>", matching
+   *  src/distill/queue.ts's storeKeyFor()). Used only to mark this store
+   *  dirty (docs/future/reliability-hardening.md finding 2) when a
+   *  lifecycle mutation happens outside distillOnce() — see
+   *  markStoreDirty(). Defaults to "default" when omitted, matching
+   *  distillOnce()'s own default storeKey, so existing callers/tests that
+   *  never set this still behave identically to before this option
+   *  existed (dirty-marking still works, just under a shared generic key
+   *  rather than a per-tenant one — harmless for tests that don't check
+   *  it, but production callers should supply the real key). */
+  storeKey?: string;
 }
 
 export interface RecallWeights {
@@ -271,12 +284,14 @@ export class Falda {
   private blobDir: string;
   private dim: number;
   private weights: RecallWeights;
+  private storeKey: string;
 
   constructor(opts: FaldaOptions) {
     this.embed = opts.embed;
     this.blobDir = opts.blobDir;
     this.dim = opts.dim ?? 768;
     this.weights = { ...DEFAULT_WEIGHTS, ...opts.recallWeights };
+    this.storeKey = opts.storeKey ?? "default";
     fs.mkdirSync(this.blobDir, { recursive: true });
     this.db = new Database(opts.dbPath);
     sqliteVec.load(this.db);
@@ -289,6 +304,32 @@ export class Falda {
   private vecBuf(a: number[]): Buffer {
     const f = new Float32Array(a);
     return Buffer.from(f.buffer, f.byteOffset, f.byteLength);
+  }
+
+  /**
+   * Mark this store as needing L2/L3 reconciliation on its next
+   * distillation pass, even if L1 has no new stream turns to process
+   * (docs/future/reliability-hardening.md finding 2, docs/MODEL.md §8.7).
+   * Called by every atom/stream lifecycle method that can leave a scene or
+   * core stale relative to the current active-atom set: supersedeAtom,
+   * mergeAtoms, archiveAtom, hardDeleteAtomsUnsafe, and deleteStream (when
+   * it actually affected some atom's evidence).
+   *
+   * Deliberately NOT part of the same write as the lifecycle change itself
+   * — this call is idempotent and safe to redo, so a crash between the
+   * lifecycle write and this mark just means the flag might not be set
+   * for one lifecycle change; the next explicit call to any of these
+   * methods (or a future distillOnce pass whose hash-gating recomputes
+   * differently) still catches any resulting inconsistency. A missed dirty
+   * mark costs at most a stale scene/core until the next relevant event —
+   * never corrupted or lost domain data — so this asymmetric tradeoff
+   * (simplicity over perfect atomicity) is acceptable here, unlike
+   * finding 1's L1 transaction where a missed write really did lose
+   * evidence/index consistency.
+   */
+  private markStoreDirty(reason: string): void {
+    initDirtySchema(this.db);
+    markDirty(this.db, this.storeKey, reason);
   }
 
   /** Validate an embedding vector's shape before it's ever written to
@@ -813,6 +854,9 @@ export class Falda {
       collectAndRemoveEvidence(rows.map((r) => r.id));
       deleted_count = this.db.prepare("DELETE FROM stream WHERE session_id=?").run(p.session_id).changes;
     }
+    if (affectedSet.size > 0) {
+      this.markStoreDirty(`deleteStream affected ${affectedSet.size} atom(s)' evidence`);
+    }
     return { deleted_count, affected_atom_ids: [...affectedSet] };
   }
 
@@ -870,7 +914,9 @@ export class Falda {
     this.db.prepare("UPDATE atoms SET status='superseded',updated_at=? WHERE id=?")
       .run(new Date().toISOString(), oldId);
     // Scene/core regeneration is handled lazily by the next distillOnce() pass
-    // via hash-gating (docs/MODEL.md §3.3, §8.3) — not eagerly here.
+    // via hash-gating (docs/MODEL.md §3.3, §8.3) — markStoreDirty() ensures
+    // that pass actually happens even with no new stream turns (finding 2).
+    this.markStoreDirty(`supersedeAtom ${oldId} -> ${newId}`);
   }
 
   /** Merge multiple atoms into a winner (losers become 'merged'). */
@@ -879,8 +925,10 @@ export class Falda {
     const stmt = this.db.prepare("UPDATE atoms SET status='merged',updated_at=? WHERE id=?");
     for (const id of loserIds) {
       stmt.run(now, id);
-      // Scene/core regeneration handled lazily by next distillOnce() pass.
     }
+    // Scene/core regeneration handled lazily by next distillOnce() pass;
+    // markStoreDirty() ensures that pass runs even with no new turns.
+    if (loserIds.length > 0) this.markStoreDirty(`mergeAtoms ${loserIds.length} loser(s) -> ${winnerId}`);
   }
 
   /**
@@ -892,7 +940,11 @@ export class Falda {
   archiveAtom(id: string): number {
     const res = this.db.prepare("UPDATE atoms SET status='archived',updated_at=? WHERE id=? AND status='active'")
       .run(new Date().toISOString(), id);
-    // Scene/core regeneration handled lazily by next distillOnce() pass.
+    // Scene/core regeneration handled lazily by next distillOnce() pass;
+    // markStoreDirty() ensures that pass runs even with no new turns. Only
+    // mark dirty if an atom was actually archived (changes > 0) — a no-op
+    // call (unknown/already-archived id) has nothing to reconcile.
+    if (res.changes > 0) this.markStoreDirty(`archiveAtom ${id}`);
     return res.changes;
   }
 
@@ -963,6 +1015,7 @@ export class Falda {
       this.db.prepare("DELETE FROM atoms_vec WHERE id=?").run(id);
       n += this.db.prepare("DELETE FROM atoms WHERE id=?").run(id).changes;
     }
+    if (n > 0) this.markStoreDirty(`hardDeleteAtomsUnsafe removed ${n} atom(s)`);
     return n;
   }
 
