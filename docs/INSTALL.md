@@ -106,6 +106,28 @@ from the `-p 127.0.0.1:PORT:PORT` publish spec in the `docker run`
 command, not from anything the container binds internally — a bare
 `-p 8077:8077` would expose it on every host interface.
 
+Distillation speaks two providers, selected by `FALDA_LLM_PROVIDER`:
+`openai` (the default — any OpenAI-compatible `/v1/chat/completions`
+endpoint, so local Ollama, vLLM, and llama.cpp all qualify) and `anthropic`
+(Anthropic's Messages API directly, with no compatibility shim in between).
+With the variable unset, nothing changes from previous releases.
+
+```bash
+docker run -d --name falda \
+  ...                                        # ports, volumes, tokens as above
+  -e FALDA_LLM_PROVIDER=anthropic \
+  -e FALDA_LLM_API_KEY="$ANTHROPIC_API_KEY" \
+  local/falda:latest
+```
+
+`FALDA_LLM_MODEL` defaults per provider — `gpt-4o-mini` for `openai`,
+`claude-haiku-4-5` for `anthropic` — so the API key is usually the only
+variable you have to set. The README's "Distillation" section has the full
+table; `docs/future/anthropic-llm-provider.md` explains why the provider is
+a switch rather than a base-URL swap (Anthropic exposes no
+OpenAI-compatible endpoint, so pointing `FALDA_LLM_BASE_URL` at it cannot
+work).
+
 For the "one FALDA instance behind several containerized agents" deployment
 (Compose, shared network, per-project tenants), see
 `integrations/opencode/README.md` §2b for the full recipe.
