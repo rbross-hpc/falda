@@ -434,6 +434,15 @@ affected** by the deletion, so a caller (or a reconciliation pass) can
 choose to re-evaluate them. The memory survives; its provenance is flagged
 stale rather than silently dangling or aggressively cascaded.
 
+`deleteStream` is the mechanism for physically removing raw turn content
+(retraction, correction, or privacy erasure) — it is only invoked by a
+caller (`POST /stream/delete`), never by the distillation pipeline itself.
+It removes the primary `stream` row, its `stream_fts`/`stream_vec` index
+rows, and its `atom_evidence` edges atomically: a deletion request either
+removes all four representations or none of them. The raw text and its
+embedding are not left recoverable in the index tables after a successful
+delete.
+
 ### 5.5 Provenance vs. audit — not the same table
 
 - **`atom_evidence`** answers *"what supports this atom existing, with this

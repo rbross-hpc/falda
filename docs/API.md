@@ -77,7 +77,9 @@ Ordering: `(session_id, turn_index)` when `turn_index` is present, else `ts`.
 
 Returns the atom ids whose provenance evidence was affected by the deletion.
 The atoms themselves are not auto-deleted; the caller may choose to
-re-evaluate or archive them.
+re-evaluate or archive them. Deletion removes the raw turn, its search/
+vector index rows, and its evidence edges atomically — deleted content is
+not recoverable from search after this call succeeds.
 
 ## Tier T1 — Atoms
 

@@ -713,6 +713,18 @@ export class Falda {
         }
       }
     }
+
+    // One-time repair for stores that ran deleteStream() before it cleaned
+    // up stream_fts/stream_vec (docs/future/reliability-hardening.md
+    // finding 5): remove any index rows whose id has no matching primary
+    // stream row. Idempotent — a store where deleteStream always cleaned
+    // up properly has nothing to remove here.
+    if (this.tableExists("stream") && this.tableExists("stream_fts")) {
+      this.db.exec("DELETE FROM stream_fts WHERE id NOT IN (SELECT id FROM stream)");
+    }
+    if (this.tableExists("stream") && this.tableExists("stream_vec")) {
+      this.db.exec("DELETE FROM stream_vec WHERE id NOT IN (SELECT id FROM stream)");
+    }
   }
 
   // ─── T0 Stream ──────────────────────────────────────────────────────────────
@@ -826,11 +838,21 @@ export class Falda {
     return this.hybridStream(query, limit);
   }
 
-  /** Delete stream turns. Returns the set of atom ids whose evidence was affected. */
+  /**
+   * Delete stream turns. Removes the primary row, its FTS and vector index
+   * rows, and its evidence edges atomically (docs/future/reliability-
+   * hardening.md finding 5) — deleteStream is the caller-invoked mechanism
+   * for physically removing raw turn content (retraction, correction, or
+   * privacy erasure; docs/MODEL.md §5.4), so leaving stale index rows
+   * behind would mean the "deleted" text is still recoverable and still
+   * occupies hybridStream's candidate slots. Returns the set of atom ids
+   * whose evidence was affected; per §5.4 the affected atoms themselves are
+   * never auto-deleted/archived.
+   */
   deleteStream(p: { ids?: string[]; session_id?: string }): { deleted_count: number; affected_atom_ids: string[] } {
     const affectedSet = new Set<string>();
 
-    const collectAndRemoveEvidence = (streamIds: string[]) => {
+    const removeIndexAndEvidence = (streamIds: string[]) => {
       if (!streamIds.length) return;
       const placeholders = streamIds.map(() => "?").join(",");
       const rows = this.db.prepare(
@@ -841,19 +863,30 @@ export class Falda {
       this.db.prepare(
         `DELETE FROM atom_evidence WHERE stream_id IN (${placeholders})`
       ).run(...streamIds);
+      this.db.prepare(
+        `DELETE FROM stream_fts WHERE id IN (${placeholders})`
+      ).run(...streamIds);
+      this.db.prepare(
+        `DELETE FROM stream_vec WHERE id IN (${placeholders})`
+      ).run(...streamIds);
     };
 
-    let deleted_count = 0;
-    if (p.ids?.length) {
-      collectAndRemoveEvidence(p.ids);
-      const del = this.db.prepare("DELETE FROM stream WHERE id=?");
-      for (const id of p.ids) deleted_count += del.run(id).changes;
-    } else if (p.session_id) {
-      const rows = this.db.prepare("SELECT id FROM stream WHERE session_id=?")
-        .all(p.session_id) as Array<{ id: string }>;
-      collectAndRemoveEvidence(rows.map((r) => r.id));
-      deleted_count = this.db.prepare("DELETE FROM stream WHERE session_id=?").run(p.session_id).changes;
-    }
+    const run = this.db.transaction(() => {
+      let deleted_count = 0;
+      if (p.ids?.length) {
+        removeIndexAndEvidence(p.ids);
+        const del = this.db.prepare("DELETE FROM stream WHERE id=?");
+        for (const id of p.ids) deleted_count += del.run(id).changes;
+      } else if (p.session_id) {
+        const rows = this.db.prepare("SELECT id FROM stream WHERE session_id=?")
+          .all(p.session_id) as Array<{ id: string }>;
+        removeIndexAndEvidence(rows.map((r) => r.id));
+        deleted_count = this.db.prepare("DELETE FROM stream WHERE session_id=?").run(p.session_id).changes;
+      }
+      return deleted_count;
+    });
+    const deleted_count = run.immediate();
+
     if (affectedSet.size > 0) {
       this.markStoreDirty(`deleteStream affected ${affectedSet.size} atom(s)' evidence`);
     }
