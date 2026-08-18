@@ -15,6 +15,7 @@ falda-data/
 opencode.json
 .opencode/
 PLAN.md
+AGENTS.md
 
 # FALDA access proxy secrets (never commit)
 proxy/falda_proxy_tokens.json
