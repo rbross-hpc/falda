@@ -468,8 +468,8 @@ still delivers correctly; and blank/no-pending calls remain true no-ops.
 ### Medium
 
 **10. No backup/restore or disaster-recovery procedure for the multi-file
-durable state.** Durable state spans per-tenant and per-pool SQLite
-databases in WAL mode (`src/falda.ts:253-257`), a separate
+durable state. — ✅ addressed** Durable state spans per-tenant and
+per-pool SQLite databases in WAL mode (`src/falda.ts:253-257`), a separate
 `distill_queue.db` and `recall_traces.db`
 (`src/runtime.ts:107-119`), `pools.json`, and filesystem blobs
 (`src/pools.ts:24-27`). WAL mode makes ad hoc file copying unsafe without
@@ -479,6 +479,42 @@ not backup, snapshotting, or restore validation.
 *Recommendation:* document (and ideally script) a consistent-snapshot
 backup procedure (e.g. SQLite online backup API or `VACUUM INTO`, plus
 blob dir + `pools.json`), and a restore/verification runbook.
+
+**Landed:** added `falda backup`/`falda restore` (`src/backup.ts`,
+`src/restore.ts`), following the offline/read-only conventions of `falda
+stats`/`falda reembed` (no `buildRuntime()`, no token file, no embedder;
+reuses `listAllStores`/`inspectStore` from `src/stats.ts`). `falda backup
+--out=DIR` snapshots every `falda.db`/`distill_queue.db`/
+`recall_traces.db` with `VACUUM INTO` (one consistent, sidecar-free file,
+safe to copy even against a live WAL-mode store — unlike `cp`), copies
+`pools.json`/`EMBEDDING.json` and every store's blob directory, and writes
+`backup-manifest.json` with a SHA-256 checksum of every captured file plus
+the source root's locked embedding dimension. A declared-but-never-written
+pool store backs up with no db/blobs, not an error. `falda restore
+--from=DIR --root=DIR` verifies every checksum and rejects a target root
+whose `EMBEDDING.json` dimension conflicts with the backup's before
+copying anything; refuses a non-empty target root unless `--yes`
+(restoring into a fresh root and swapping it into place is the
+recommended path, documented alongside the flag); then runs a
+post-restore verification pass (`inspectStore`) over every restored store.
+Wired as flat `backup`/`restore` verbs in `bin/falda` and `package.json`
+scripts, following the same `--dry-run`/`--yes` gate `falda reembed` uses
+for destructive/consequential operations. Explicitly does not capture the
+bearer token file (a secret outside `FALDA_ROOT`) — documented as a
+separate operator concern. Added `test/backup.test.ts` (16 tests): store
+selection/scoping, manifest completeness + checksum correctness, a
+`VACUUM INTO` snapshot opening cleanly as an ordinary SQLite file, refusal
+to back up into a non-empty `--out`, an unmaterialized-pool-store edge
+case, a full backup→restore→`inspectStore`-parity roundtrip cross-checked
+against the original root's own live report, a restored store opening
+under a live `Falda` and returning the original stream/atom/core content,
+root-level `distill_queue.db`/`recall_traces.db` restoring and reopening
+correctly, the non-empty-target and dimension-mismatch rejections, and a
+corrupted-backup checksum rejection. New top-level "Backing up and
+restoring FALDA" section added to `docs/OPERATIONS.md` (placed after the
+re-embedding runbook, same shape: rationale, numbered bash runbook, flag
+tables, container variant, caveats). `npm run build` clean; `npm test`
+380/380 (364 baseline + 16 new).
 
 **11. HTTP surface accepts unbounded request bodies before authentication,
 binds all interfaces, and has no rate limiting.** The HTTP listener
