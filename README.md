@@ -204,7 +204,7 @@ locally (Ollama, vLLM, llama.cpp) or against a self-hosted lab server.
 
 | Env var                   | Default                        | Notes                                  |
 |---------------------------|--------------------------------|----------------------------------------|
-| `FALDA_EMBED`           | *(unset)*                      | embedder mode: `local` (deterministic, offline) or `remote` (calls `FALDA_EMBED_BASE_URL`); unset + no base URL defaults to `local`, unset + a base URL configured defaults to `remote` |
+| `FALDA_EMBED`           | *(unset)*                      | embedder mode: `local` (deterministic, offline — **not semantic**, see below), `onnx` (a real model in-process, no server), or `remote` (calls `FALDA_EMBED_BASE_URL`); unset + no base URL defaults to `local`, unset + a base URL configured defaults to `remote` |
 | `FALDA_EMBED_BASE_URL`  | `http://localhost:11434/v1`    | embeddings endpoint                    |
 | `FALDA_EMBED_API_KEY`   | `x`                            | bearer token (`x` for keyless local)   |
 | `FALDA_EMBED_MODEL`     | `nomic-embed-text`             | embedding model id                     |
@@ -255,6 +255,42 @@ pre-auth-flood risk this closes doesn't apply there. See
 
 Recommended open embedding models: `nomic-embed-text` (768), `BAAI/bge-base-en-v1.5`
 (768), `nomic-ai/nomic-embed-text-v1.5` (768). Set `FALDA_DIM` to match.
+
+#### A real model with no server: `FALDA_EMBED=onnx`
+
+The `local` embedder is a character-position hash, not a model. It never
+errors, but it carries no meaning — so dense recall contributes nothing and
+only FTS5/BM25 does real work. (Measured: it scores *"Bananas are usually
+yellow when ripe"* as **more** similar to *"The cryostat target temperature is
+4.2 K."* than *"How cold does the dilution fridge need to be?"* — see
+[`docs/future/onnx-embedder.md`](docs/future/onnx-embedder.md).)
+
+`FALDA_EMBED=onnx` runs a real sentence-embedding model **inside the FALDA
+process** through ONNX Runtime — no Ollama, no daemon, no network at query
+time:
+
+```bash
+npm install @huggingface/transformers   # optional, not installed by default
+FALDA_EMBED=onnx falda serve
+```
+
+The default model is `Xenova/bge-base-en-v1.5` at 768 dimensions, matching
+`FALDA_DIM`'s default, so a fresh install needs no dim configuration. It
+downloads (~440MB) once on first boot and is cached. Override with
+`FALDA_EMBED_MODEL` — but note other models have other dimensions, and
+switching a store that already holds vectors requires `falda reembed`.
+
+That first boot takes minutes, and the server accepts no connections until it
+finishes — so the download reports itself on stderr rather than looking hung:
+
+```
+falda: downloading the embedding model Xenova/bge-base-en-v1.5. This happens
+       once and is then cached; interrupting it loses the partial download.
+falda:   onnx/model.onnx 0%
+falda:   onnx/model.onnx 10%
+```
+
+Later boots load from the cache in about 200ms and print nothing.
 
 ### CLI-client environment variables
 

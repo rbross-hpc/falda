@@ -135,9 +135,10 @@ const hits = await mem.recall("kukla", "what should I remember?");
 | `FALDA_MAX_BODY_BYTES` | `1048576` | Max HTTP request body size (bytes); oversized bodies get `413` before parsing/auth; `<= 0` disables the cap |
 | `FALDA_ROOT` | `./falda-data` | Pool root dir (all tenant/pool stores) |
 | `FALDA_TOKENS` | `./falda_tokens.json` | Canonical bearer-token file, shared by HTTP and MCP (required — see `docs/API.md`) |
+| `FALDA_EMBED` | _(unset)_ | Embedder mode: `local` (deterministic, offline, **not semantic**), `onnx` (a real model in-process, no server), or `remote` (an OpenAI-compatible endpoint). Unset infers from `FALDA_EMBED_BASE_URL` — see the precedence list below |
 | `FALDA_EMBED_BASE_URL` | _(unset)_ | OpenAI-compatible `/v1/embeddings` base URL |
 | `FALDA_EMBED_API_KEY` | _(unset)_ | API key for the embedder, if required |
-| `FALDA_EMBED_MODEL` | `nomic-embed-text` | Embedding model id |
+| `FALDA_EMBED_MODEL` | `nomic-embed-text` | Embedding model id (`Xenova/bge-base-en-v1.5` when `FALDA_EMBED=onnx`) |
 | `FALDA_EMBED_STRICT` | _(unset)_ | `1` turns an unconfigured embedder (no `FALDA_EMBED`/`FALDA_EMBED_BASE_URL`) into a startup `FATAL` instead of the silent local-embedder fallback below — opt in for production |
 
 `FALDA_DB` (a single store's SQLite path) applies only when embedding
@@ -146,21 +147,38 @@ stores through `FALDA_ROOT` + the pool layer.
 
 With no embedder configured, FALDA uses a built-in **deterministic local
 embedder** so `falda serve` and all four tiers work fully offline out of the
-box (lexical FTS5/BM25 recall plus a no-network dense vector). Set
-`FALDA_EMBED_BASE_URL` (or `FALDA_EMBED=remote`) to switch to a real
-embedding model — local Ollama, self-hosted vLLM/llama.cpp, or any
-OpenAI-compatible service — for production-quality dense + hybrid recall.
+box. Be clear about what that is, though: it hashes character positions
+rather than modelling meaning, so dense recall contributes nothing and only
+FTS5/BM25 does real retrieval. It is a placeholder that keeps the system
+running, not a working embedder.
+
+Two ways to get a real one:
+
+- **`FALDA_EMBED=onnx`** — runs a sentence-embedding model *inside* the FALDA
+  process through ONNX Runtime. No server, no daemon, no network at query
+  time. Costs one `npm install @huggingface/transformers` (~380MB) and a
+  one-time model download (~440MB, cached). See the README's
+  "A real model with no server" section.
+- **`FALDA_EMBED_BASE_URL`** (or `FALDA_EMBED=remote`) — an OpenAI-compatible
+  `/v1/embeddings` service: local Ollama, self-hosted vLLM/llama.cpp, or a
+  hosted endpoint. Adds a deployment step; adds no dependency.
 
 Embedder selection precedence (all server entry points, via `src/runtime.ts`):
 
 - `FALDA_EMBED=local` → force the offline deterministic embedder.
+- `FALDA_EMBED=onnx` → run a real model in-process via ONNX Runtime (no server; requires `npm install @huggingface/transformers`).
 - `FALDA_EMBED=remote` → require a configured `/v1/embeddings` endpoint.
 - unset + `FALDA_EMBED_BASE_URL` present → remote.
 - unset + no base URL → offline local default (unless `FALDA_EMBED_STRICT=1`, which makes this case a startup FATAL instead — see `docs/OPERATIONS.md` "Startup embedding verification").
 
-Every server entry point also probes the configured remote embedder once at
-boot (calls it, checks the returned vector's length against `FALDA_DIM`)
-before locking that config into `EMBEDDING.json` — a down endpoint or a
+An explicit `FALDA_EMBED` always wins: `FALDA_EMBED=onnx` is used even when
+`FALDA_EMBED_BASE_URL` is also set.
+
+Every server entry point also probes the configured embedder once at boot
+(calls it, checks the returned vector's length against `FALDA_DIM`) before
+locking that config into `EMBEDDING.json`. Both `remote` and `onnx` are
+probed; the deterministic `local` embedder is not, having nothing to reach.
+A down endpoint, an uninstalled `@huggingface/transformers`, or a
 model/dimension mismatch fails boot immediately rather than corrupting
 recall later. Changing `FALDA_EMBED_MODEL`/`FALDA_DIM` on a store that
 already has data requires `falda reembed` to rebuild its vector indexes
@@ -172,6 +190,14 @@ change".
 > run `falda serve` under a *different* Node major version you may see
 > `ERR_DLOPEN_FAILED` / `NODE_MODULE_VERSION` mismatch. Fix: run FALDA under
 > the same Node you installed with, or rebuild with `npm rebuild better-sqlite3`.
+>
+> The same applies to `onnxruntime-node`, pulled in by
+> `@huggingface/transformers` if you opt into `FALDA_EMBED=onnx` (see
+> `README.md`). It ships prebuilt binaries for macOS, Linux and Windows, so a
+> normal install compiles nothing — but it is a second native addon with the
+> same Node-version pinning caveat. It is an **optional dependency, declared
+> nowhere in `package.json`**: nothing installs it unless you ask for it, so
+> deployments using `local` or `remote` embedders are unaffected.
 
 ## Uninstall
 

@@ -7,7 +7,13 @@
  */
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-import { makeEmbedder, makeLocalEmbedder, type EmbedderConfig } from "./embedder.js";
+import {
+  makeEmbedder,
+  makeLocalEmbedder,
+  makeOnnxEmbedder,
+  resolveOnnxModel,
+  type EmbedderConfig,
+} from "./embedder.js";
 import type { Embedder } from "./falda.js";
 
 /**
@@ -29,6 +35,7 @@ export function selectEmbedder(dim: number, label = "FALDA"): Embedder {
   const hasRemote = !!process.env.FALDA_EMBED_BASE_URL;
   const strict = process.env.FALDA_EMBED_STRICT === "1";
   if (mode === "local") { console.log(`${label} embedder: local (offline, deterministic)`); return makeLocalEmbedder(dim); }
+  if (mode === "onnx") { console.log(`${label} embedder: onnx (in-process, ${resolveOnnxModel()})`); return makeOnnxEmbedder(); }
   if (mode === "remote" || hasRemote) { console.log(`${label} embedder: remote (${process.env.FALDA_EMBED_BASE_URL ?? "http://localhost:11434/v1"})`); return makeEmbedder(); }
   if (strict) {
     console.error(
@@ -65,14 +72,25 @@ export function selectEmbedder(dim: number, label = "FALDA"): Embedder {
 export async function probeEmbedder(embed: Embedder, dim: number, label = "FALDA"): Promise<number | null> {
   const mode = (process.env.FALDA_EMBED ?? "").toLowerCase();
   const hasRemote = !!process.env.FALDA_EMBED_BASE_URL;
-  if (mode === "local" || (!hasRemote && mode !== "remote")) return null; // local embedder: skip
+  // Skipped only for the deterministic local embedder. onnx IS probed: its
+  // model has a fixed dimension that need not match FALDA_DIM (all-MiniLM and
+  // bge-small are 384-dim), and the probe is the one place that mismatch can
+  // be caught before it becomes a raw sqlite-vec error on every operation.
+  // Probing also front-loads the model download, so a first run fails or warms
+  // at boot rather than inside someone's first recall.
+  if (mode === "local" || (!hasRemote && mode !== "remote" && mode !== "onnx")) return null;
 
   let vec: number[];
   try {
     vec = await embed("falda embedding startup probe");
   } catch (e: any) {
-    console.error(`FATAL: ${label} embedding probe failed — could not reach the configured embedder ` +
-      `(FALDA_EMBED_BASE_URL=${process.env.FALDA_EMBED_BASE_URL ?? "?"}): ${String(e?.message ?? e)}`);
+    const where = mode === "onnx"
+      ? `FALDA_EMBED=onnx, model ${process.env.FALDA_EMBED_MODEL ?? "(default)"} — the optional ` +
+        `dependency @huggingface/transformers may not be installed ` +
+        `(npm install @huggingface/transformers), or the model failed to download`
+      : `FALDA_EMBED_BASE_URL=${process.env.FALDA_EMBED_BASE_URL ?? "?"}`;
+    console.error(`FATAL: ${label} embedding probe failed — could not use the configured embedder ` +
+      `(${where}): ${String(e?.message ?? e)}`);
     process.exit(1);
   }
   if (!Array.isArray(vec) || vec.length !== dim) {

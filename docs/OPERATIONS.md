@@ -167,6 +167,39 @@ falda reembed --yes
 #    boot clean against the EMBEDDING.json falda reembed just wrote.
 ```
 
+## Switching between in-process ONNX models
+
+`FALDA_EMBED=onnx` needs a re-embed for the same reason, and it is easier to
+trip over: the default `Xenova/bge-base-en-v1.5` is 768-dimensional, but two
+other common choices — `Xenova/bge-small-en-v1.5` and
+`Xenova/all-MiniLM-L6-v2` — are **384**. Changing `FALDA_EMBED_MODEL` between
+them changes the dimension underneath a store that already holds vectors.
+
+```bash
+# 1. Stop every `falda serve` process against this root.
+
+# 2. Preview (no writes). Note FALDA_DIM must match the NEW model:
+FALDA_ROOT=/data FALDA_EMBED=onnx FALDA_DIM=384 \
+FALDA_EMBED_MODEL=Xenova/bge-small-en-v1.5 \
+falda reembed --dry-run
+
+# 3. Run it for real:
+FALDA_ROOT=/data FALDA_EMBED=onnx FALDA_DIM=384 \
+FALDA_EMBED_MODEL=Xenova/bge-small-en-v1.5 \
+falda reembed --yes
+```
+
+The first run against a new model downloads it (~90–440MB depending on the
+model) before any re-embedding starts, so allow for that on step 2.
+
+Two caveats specific to this path. The `pooling: "cls"` strategy in
+`src/embedder.ts` is chosen for BGE models; `all-MiniLM` is trained for mean
+pooling, so it will work but score slightly worse than it should until
+pooling becomes configurable (see `docs/future/onnx-embedder.md`). And
+`enforceEmbeddingLock` is the guard that is *supposed* to stop you booting
+against a mismatched store — verify `EMBEDDING.json` actually exists under
+`FALDA_ROOT` before relying on it.
+
 Or directly, e.g. inside the `falda` container in a Compose deployment where
 `bin/falda` isn't on `PATH` but `dist/` is (same pattern as `docker compose
 exec falda node dist/stats.js`): `node dist/reembed.js --dry-run` / `node
