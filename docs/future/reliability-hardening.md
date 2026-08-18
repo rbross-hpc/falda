@@ -314,7 +314,7 @@ join-filtered display); a fourth test seeds a pre-fix-style orphan
 (primary row deleted, index rows left behind) and asserts it is gone
 after reopening the store.
 
-**6. Legacy-schema migration can fail before `migrate()` runs.**
+**6. Legacy-schema migration can fail before `migrate()` runs. — ✅ addressed**
 `initSchema()` creates indexes against newer columns (`stream.seq`
 `src/falda.ts:298`, `stream.turn_index` `src/falda.ts:300-303`,
 `atoms.status`/`atoms.pinned` `src/falda.ts:325,327`) immediately at
@@ -329,6 +329,29 @@ created by the current schema (`test/data_model_schema.test.ts:455-474`)
 *Recommendation:* create base tables, add missing columns, and only then
 create column-dependent indexes/constraints (or move to versioned
 migrations). Add fixtures for every supported historical schema.
+
+**Landed:** split store initialization into three ordered phases run
+inside one `db.transaction(...).immediate()` — `initSchema()` (base
+tables/virtual tables only, no indexes), `migrate()` (additive column
+backfills, unchanged), `createIndexes()` (new — every ordinary index,
+moved here in full rather than just the five previously-known offenders,
+so a future migration that adds an indexed column can't reintroduce this
+bug). `createIndexes()` guards the two UNIQUE turn indexes with
+`assertNoDuplicateTurnKeys()`, which throws a new `LegacyMigrationError`
+naming the offending `session_id`/`turn_index` (or `turn_id`) rather than
+silently deduplicating historical data or letting a raw SQLite constraint
+error surface. Wrapping all three phases in one immediate transaction
+means a failed upgrade (including a `LegacyMigrationError`) leaves the
+on-disk store byte-for-byte as it was, never half-migrated. Added
+`test/migration_legacy.test.ts` with real on-disk historical fixtures
+(built directly with `better-sqlite3`/`sqlite-vec`, bypassing `Falda`'s
+constructor) for: the original pre-Branch-A layout (no
+`turn_index`/`turn_id`/`seq`, no atom lifecycle columns), the
+Branch-A/pre-`seq` layout, the pre-`render_hash`/pre-candidate-audit
+layout, and two duplicate-key fixtures that must fail loudly. Confirmed
+the fixtures reproduce the original bug by reverting the fix locally and
+observing `no such column: seq` thrown at construction. `npm run build`
+clean; `npm test` 364/364 (359 baseline + 5 new).
 
 **7. `falda smoke` invokes a nonexistent npm script. — ✅ addressed**
 Both `bin/falda smoke` (`bin/falda:117-119`) and `install.sh`
