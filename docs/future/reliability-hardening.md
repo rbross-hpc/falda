@@ -662,8 +662,8 @@ on corrupt content and is a no-op on missing/valid content (mirroring
 layout section warns on a corrupt (not absent) registry. `npm run build`
 clean; `npm test` 403/403 (388 baseline + 15 new).
 
-**13. Schema/doc drift test compares shape, not semantics.** The
-runtime-vs-doc schema comparison checks table/column names only
+**13. Schema/doc drift test compares shape, not semantics. — ✅ addressed**
+The runtime-vs-doc schema comparison checks table/column names only
 (`test/schema_doc_sync.test.ts:138-159`), not defaults, constraints, or
 nullability. A concrete drift already exists: `docs/schema/tables.sql`
 documents the passive-priority default as `100`, while the runtime schema
@@ -676,6 +676,60 @@ declared nullable in the runtime DDL (`src/falda.ts:288-297` vs.
 *Recommendation:* compare normalized `sqlite_master.sql` (or explicit
 default/`NOT NULL`/index assertions) rather than names alone; fix the two
 known drifts above.
+
+**Landed:** chose the explicit default/`NOT NULL`/index-assertion approach
+over full normalized `sqlite_master.sql` text comparison — the latter fights
+the `float[DIM]` vec0 placeholder, `CHECK` clause formatting, and
+ALTER-appended columns landing at the end of `PRAGMA table_info` rather than
+inline where the doc documents them (the same brittleness the original
+name-only test was designed to avoid; its header comment already explained
+why). `test/schema_doc_sync.test.ts`'s doc parser now also extracts each
+column's `NOT NULL` presence and normalized `DEFAULT` literal (matching
+`PRAGMA table_info`'s `dflt_value` string form, e.g. `"0"`, `"'active'"`,
+`"'[]'"`), and each `CREATE [UNIQUE] INDEX` statement's name and (if
+partial) normalized `WHERE` clause; the live-schema side reads the same
+information via `PRAGMA table_info` and `sqlite_master.sql`. All three
+databases' comparison tests now assert nullability, default, and index
+(including partial-`WHERE`) parity in addition to the pre-existing name-set
+checks. Scoped to ordinary tables only — FTS5/vec0 virtual tables report no
+meaningful `notnull`/`dflt_value` via `PRAGMA table_info` regardless of their
+declaring DDL, so those keep the original name-only check (documented in the
+file's header comment); `sqlite_autoindex_*` rows (SQLite's own implicit
+index for a `UNIQUE`/`PRIMARY KEY` constraint) are excluded from the index
+comparison since they aren't a separately-declared `CREATE INDEX` and are
+already covered by the column-level check. No PK-specific nullability
+normalization was needed: SQLite reports a composite-`PRIMARY KEY` column as
+`notnull:0` unless the column definition also carries an explicit
+`NOT NULL` (which every such column in this schema already does), so a
+literal "does the column text contain `NOT NULL`" parse applied identically
+to both the doc and the live schema naturally agrees with `PRAGMA
+table_info`.
+
+Of the two "known drifts" this finding named, only one was still live by the
+time this phase started: `distill_jobs.priority`'s documented default was
+already corrected to `0` (matching `PRIORITY_PASSIVE`) by an earlier
+finding's docs update, so no runtime or doc change was needed there — the
+new semantic test now guards it going forward. `stream.seq`'s *DDL*
+nullability was already consistent between runtime and doc (both declare it
+nullable; SQLite cannot add a `NOT NULL` constraint via `ALTER TABLE`
+without a full table rebuild, so the column is intentionally left nullable
+at the schema level even though the seq-migration backfill and every current
+write path always assign a value). The actual defect was a misleading
+`docs/schema/tables.sql:33` comment ("never null after migration") that
+implied a DDL guarantee that doesn't exist — reworded to state the accurate,
+narrower guarantee (nullable in DDL; non-null in practice for all rows
+written by current code).
+
+Verified the guard actually catches drift (not just documents intent): with
+`src/falda.ts` locally and temporarily edited to (a) change
+`atoms.priority`'s default, (b) add `NOT NULL` to `atoms.background`, and
+(c) drop the partial `WHERE` from `idx_atoms_pinned`, the corresponding new
+assertion failed with a clear per-column/per-index message each time;
+reverted after confirming each failure mode. Tests:
+`test/schema_doc_sync.test.ts` (same 4 test blocks, extended with the new
+assertions — no new top-level test count). `npm run build` clean; `npm test`
+490/490 (unchanged from this phase's baseline, since prior in-repo work
+already grew the suite from 403 to 490 before this finding was picked up).
 
 **14. No rate limiting on the HTTP or MCP surfaces.** Split out of finding
 11 as a deliberately deferred sub-item, not independently discovered: an
@@ -738,5 +792,6 @@ duplicated here:
 5. **Integration smoke tests** (findings 7, 8, 9) — restore confidence in
    shipped-but-unverified surfaces.
 6. Remaining medium items (5, 6, 13, 14) opportunistically alongside
-   related work. *(Finding 12 landed: atomic writes + fail-loud registry
-   validation for `pools.json`.)*
+   related work. *(Findings 12 and 13 landed: atomic writes + fail-loud
+   registry validation for `pools.json`; semantic — not just name-set —
+   schema/doc drift assertions. Finding 14, rate limiting, remains open.)*
