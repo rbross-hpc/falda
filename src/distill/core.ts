@@ -72,6 +72,7 @@ const DEFAULT_TOPIC_SIMILARITY_THRESHOLD = 0.5;
 const DEFAULT_SCENE_MATCH_THRESHOLD = 0.5;
 const DEFAULT_SCENE_REORG_THRESHOLD = 0.7;
 const DEFAULT_CONSOLIDATION_BATCH = 20;
+const DEFAULT_CONSOLIDATION_MAX_CHARS = 0;
 
 /** Candidates per batched consolidation call. 1 restores the historical
  *  one-call-per-candidate behaviour. Chunking is not optional: the extraction
@@ -80,6 +81,21 @@ const DEFAULT_CONSOLIDATION_BATCH = 20;
 function consolidationBatchSize(): number {
   const raw = Number(process.env.FALDA_DISTILL_CONSOLIDATION_BATCH);
   return Number.isInteger(raw) && raw >= 1 ? raw : DEFAULT_CONSOLIDATION_BATCH;
+}
+
+/** Approximate char budget for one batched consolidation prompt, as a proxy
+ *  for input tokens (no tokenizer is available here, and one would still be
+ *  model-specific — a self-hosted deployment can point at anything). <= 0
+ *  disables the check, which is also the default: FALDA_DISTILL_CONSOLIDATION_BATCH
+ *  alone was the existing knob, and a new deployment should not have its
+ *  batch sizing silently reshaped by a second cap it never asked for. Each
+ *  candidate brings its own retrieved-neighbour text (up to candidateLimit
+ *  existing atoms, full content each — see consolidationBatchPrompt), so a
+ *  batch's built prompt size varies per chunk and can't be predicted from
+ *  batchSize alone. */
+function consolidationMaxChars(): number {
+  const raw = Number(process.env.FALDA_DISTILL_CONSOLIDATION_MAX_CHARS);
+  return Number.isFinite(raw) ? raw : DEFAULT_CONSOLIDATION_MAX_CHARS;
 }
 
 // ─── LLM response parsers ─────────────────────────────────────────────────────
@@ -229,6 +245,67 @@ export function parseConsolidationBatch(
     try { accept(JSON.parse(trimmed)); } catch { /* skip malformed line */ }
   }
   return out;
+}
+
+/** Group retrieved candidates into consolidation-batch chunks, respecting
+ *  both `batchSize` (candidate count) and `maxChars` (approximate input
+ *  size, via the prompt this batch would actually build — each candidate's
+ *  neighbour set varies in size, so byte cost per candidate is not uniform
+ *  and can't be predicted from count alone). Greedy packing fills each
+ *  chunk closer to the cap than blind halving would, preserving more of
+ *  batching's token savings.
+ *
+ *  maxChars <= 0 disables the size check entirely, reproducing the historical
+ *  fixed-stride chunking byte for byte.
+ *
+ *  A lone candidate whose own prompt already exceeds maxChars is still sent
+ *  — there is nothing smaller to try — matching the "never drop a candidate"
+ *  rule the individual-retry fallback already follows. `warn` is called in
+ *  that case so the operator has a trail without failing the pass. */
+function packConsolidationChunks<T>(
+  items: T[],
+  batchSize: number,
+  maxChars: number,
+  buildPrompt: (chunk: T[]) => string,
+  warn: (msg: string) => void,
+): T[][] {
+  if (maxChars <= 0) {
+    const chunks: T[][] = [];
+    for (let start = 0; start < items.length; start += batchSize) {
+      chunks.push(items.slice(start, start + batchSize));
+    }
+    return chunks;
+  }
+
+  const chunks: T[][] = [];
+  let current: T[] = [];
+
+  const startNewChunk = (item: T) => {
+    current = [item];
+    const size = buildPrompt(current).length;
+    if (size > maxChars) {
+      warn(
+        `[distill] a single candidate's consolidation prompt (${size} chars) exceeds ` +
+          `FALDA_DISTILL_CONSOLIDATION_MAX_CHARS (${maxChars}); sending it alone`,
+      );
+    }
+  };
+
+  for (const item of items) {
+    if (current.length === 0) {
+      startNewChunk(item);
+      continue;
+    }
+    const tentative = [...current, item];
+    if (tentative.length <= batchSize && buildPrompt(tentative).length <= maxChars) {
+      current = tentative;
+    } else {
+      chunks.push(current);
+      startNewChunk(item);
+    }
+  }
+  if (current.length > 0) chunks.push(current);
+  return chunks;
 }
 
 // ─── Stable atom id from content hash (for idempotent re-runs) ────────────────
@@ -480,6 +557,7 @@ async function distillOncePass(
 
     // Phase 2: one consolidation decision per candidate, batched where possible.
     const batchSize = consolidationBatchSize();
+    const maxChars = consolidationMaxChars();
     const decisions: ConsolidationDecision[] = new Array(retrieved.length);
 
     const decideIndividually = async (i: number): Promise<void> => {
@@ -492,8 +570,11 @@ async function distillOncePass(
       // add prompt scaffolding for no saving.
       for (let i = 0; i < retrieved.length; i++) await decideIndividually(i);
     } else {
-      for (let start = 0; start < retrieved.length; start += batchSize) {
-        const chunk = retrieved.slice(start, start + batchSize);
+      const chunks = packConsolidationChunks(
+        retrieved, batchSize, maxChars, consolidationBatchPrompt, log,
+      );
+      let start = 0;
+      for (const chunk of chunks) {
         const raw = await llm(consolidationBatchPrompt(chunk));
         const parsed = parseConsolidationBatch(raw, chunk.length);
         for (let j = 0; j < chunk.length; j++) {
@@ -501,6 +582,7 @@ async function distillOncePass(
           if (dec) decisions[start + j] = dec;
           else await decideIndividually(start + j); // never drop a candidate
         }
+        start += chunk.length;
       }
     }
 

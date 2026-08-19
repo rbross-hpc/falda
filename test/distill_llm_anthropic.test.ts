@@ -196,4 +196,62 @@ describe("distill LLM: openai path unchanged", () => {
     assert.equal(req.body.temperature, 0, "the OpenAI path keeps its existing behaviour");
     assert.equal(resolveLLMModel({}), "gpt-4o-mini");
   });
+
+  test("a normal finish_reason does not throw", async () => {
+    captured = [];
+    respond = () => ({
+      status: 200,
+      json: { choices: [{ finish_reason: "stop", message: { content: "fine" } }] },
+    });
+
+    const llm = makeLLM({ baseUrl, apiKey: "sk-openai" });
+    assert.equal(await llm("go"), "fine", "finish_reason: stop is not truncation");
+  });
+
+  test("throws when finish_reason is length, since the reply may be truncated", async () => {
+    captured = [];
+    respond = () => ({
+      status: 200,
+      json: { choices: [{ finish_reason: "length", message: { content: '{"actions": [{"in' } }] },
+    });
+
+    const llm = makeLLM({ baseUrl, apiKey: "sk-openai" });
+    await assert.rejects(
+      () => llm("go"),
+      /truncated/i,
+      "a truncated reply must fail loudly instead of a batch parser silently resolving nothing",
+    );
+  });
+
+  test("the length-truncation error mentions batching as a possible cause, not the only one", async () => {
+    captured = [];
+    respond = () => ({
+      status: 200,
+      json: { choices: [{ finish_reason: "length", message: { content: "x" } }] },
+    });
+
+    const llm = makeLLM({ baseUrl, apiKey: "sk-openai" });
+    await assert.rejects(
+      () => llm("go"),
+      (err: Error) => {
+        assert.match(err.message, /FALDA_DISTILL_CONSOLIDATION_BATCH/);
+        assert.match(err.message, /if this is a batched consolidation call/i,
+          "phrased as one possible cause among others, since this guard applies to " +
+          "every OpenAI-path call (extraction, synthesis, single-candidate consolidation), " +
+          "not only batched consolidation");
+        return true;
+      },
+    );
+  });
+
+  test("missing/non-string content throws a clear error instead of a raw TypeError", async () => {
+    captured = [];
+    respond = () => ({
+      status: 200,
+      json: { choices: [{ finish_reason: "stop" }] },
+    });
+
+    const llm = makeLLM({ baseUrl, apiKey: "sk-openai" });
+    await assert.rejects(() => llm("go"), /no usable message content/i);
+  });
 });
