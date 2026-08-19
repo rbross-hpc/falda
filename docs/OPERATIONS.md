@@ -489,6 +489,53 @@ future `distillOnce` regression case.
   "did distillation execute" (job status, dead-letter, backlog age);
   `inspect` answers "what did successful distillation decide."
 
+## Browsing distillation history
+
+The optional `analysis/` Python package provides a Textual TUI over the same
+audit data. It is independently packaged and locked, so installing the Falda
+server does not install Python or TUI dependencies.
+
+Install [uv](https://docs.astral.sh/uv/getting-started/installation/) first. On
+systems using Snap, classic confinement must be acknowledged explicitly:
+
+```bash
+sudo snap install astral-uv --classic
+uv --version
+```
+
+Run the following from the Falda repository root, without `sudo`. Stop the
+server first so the database and `core.md` represent one quiescent point in
+time. `uv sync` creates or updates only `analysis/.venv`; it does not install
+analysis dependencies into the Falda server package.
+
+```bash
+uv sync --project analysis --locked
+uv run --project analysis falda-analysis --root=/path/to/falda-data --tenant=my-agent
+```
+
+`--root` is the Falda data directory containing `tenants/`, not the repository
+directory unless the deployment stores its data there.
+
+The TUI opens only `tenants/<tenant>/self/falda.db` in SQLite read-only mode.
+It starts at the oldest audited pass, supports all-history and last-24-hours
+views, compares each selection with the previous chronological pass, surfaces
+failed and likely zero-input reconciliation passes, and keeps T0 evidence and
+unchanged T2 scenes collapsed by default. Select a changed or unchanged scene
+and press Enter to inspect its reconstructed before/after atom membership,
+exact added/removed atoms, immutable atom content, and current atom status.
+The current store summary and atom statuses are current state, not historical
+snapshots.
+
+This is an audit-delta browser, not a snapshot browser. It explicitly reports
+missing or non-retained data for visible passes: deleted T0 turns, absent
+best-effort effect rows, historical atom status/counts, complete
+scene content, and historical core text. Scene membership is labeled complete
+only when it can be replayed from a recorded creation baseline with matching
+member counts; otherwise the zoom labels it partial or unavailable and still
+shows the exact delta atoms. A zero-input pass is labeled likely reconciliation
+because the historical dirty reason is not retained; only the store's current
+`store_dirty` reason can be shown exactly.
+
 # Previewing a recall: `falda show recall`
 
 `falda stats` and `falda distill inspect` are deliberately offline: no

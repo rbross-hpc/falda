@@ -9,6 +9,10 @@ example.db*
 *.log
 .DS_Store
 __pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
 falda-data/
 *.bak-premerge-*
 *.tenant-aware.py

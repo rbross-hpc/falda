@@ -101,10 +101,12 @@ A few sibling CLIs cover the rest of day-2 operations: `falda reembed`
 rebuilds vector indexes after an embedding model/dimension change; `falda
 distill inspect` reviews what a distillation pass actually decided (which
 memories were extracted, stored, updated, merged, or skipped, and why —
-also read-only and offline); `falda show recall` views a recall (by
-default, the most recent one) through a *running* server, since a real
-recall needs the configured embedder. See
-[`docs/OPERATIONS.md`](docs/OPERATIONS.md) for all four.
+also read-only and offline); the optional Python `falda-analysis` package
+browses those audit deltas chronologically in a TUI (see
+[Browsing distillation history](docs/OPERATIONS.md#browsing-distillation-history)
+for uv installation and usage); `falda show recall` views a recall (by default,
+the most recent one) through a *running* server, since a real recall needs the
+configured embedder. See [`docs/OPERATIONS.md`](docs/OPERATIONS.md) for details.
 
 For deployments where many agents (e.g. containerized opencode instances)
 share one FALDA over a network, point them at the MCP endpoint. This repo
