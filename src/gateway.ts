@@ -366,6 +366,13 @@ export async function handleRequest(
     if (e instanceof PoolError) {
       const status = e.code === "no_such_pool" ? 404
         : (e.code === "not_a_member" || e.code === "read_only") ? 403
+        // corrupt_registry is a server-side data problem, not a client
+        // error — with boot-time validation (src/boot.ts's
+        // requirePoolRegistry) a live server should never reach this at
+        // request time; this mapping is defense-in-depth for a registry
+        // file corrupted while already running. See
+        // docs/future/reliability-hardening.md finding 12.
+        : e.code === "corrupt_registry" ? 500
         : 400;
       return { status, body: { error: e.message, code: e.code } };
     }

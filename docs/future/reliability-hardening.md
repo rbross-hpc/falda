@@ -590,7 +590,7 @@ options and `FALDA_BIND`. `npm run build` clean; `npm test` 388/388 (380
 baseline + 8 new).
 
 **12. Pool registry corruption is silently treated as an empty registry,
-and writes aren't atomic.** A malformed/unreadable `pools.json` becomes
+and writes aren't atomic. — ✅ addressed** A malformed/unreadable `pools.json` becomes
 `{pools:{}}` with no error surfaced (`src/pools.ts:76-83`), and updates are
 an unprotected read-modify-write that overwrites the file directly
 (`src/pools.ts:82-84,97-105,112-124,127-137`). Concurrent admin requests
@@ -600,6 +600,67 @@ databases remain on disk.
 
 *Recommendation:* validate the registry at boot and fail loudly on
 malformed content; write via temp-file + atomic rename.
+
+**Landed:** `PoolManager.saveReg()` now writes through a new exported
+`writeFileAtomic()` helper (`src/pools.ts`): write to a sibling `.tmp` file
+in the same directory, `fsync` it, `rename()` over the target (same-
+filesystem rename is atomic under POSIX — a reader or a crash mid-write
+sees either the complete old file or the complete new one, never a
+truncated mix), then best-effort `fsync` the parent directory; the temp
+file is cleaned up on any failure. `loadReg()` no longer swallows a bad
+read into `{pools:{}}`: a missing file is still the legitimate first-run
+case, but a present-and-unreadable, invalid-JSON, or structurally-wrong
+(new `validateRegistry()` — checks `pools` is an object, each entry's
+`name` matches its key, `members` maps to valid `Access` values,
+`created_at`/`updated_at` are strings) file now throws a new
+`PoolError("corrupt_registry")` naming exactly what's wrong, from every
+read path (`getPool`/`listPools`/`poolsForTenant`/`resolve`). This closes
+the actual destructive bug: throwing before any mutator can reach
+`saveReg()` means a corrupt-but-recoverable file can no longer be
+permanently overwritten with an empty registry by the very next admin
+write — it's left on disk for an operator to fix by hand or restore from a
+`falda backup` snapshot.
+
+New `requirePoolRegistry()` (`src/boot.ts`, mirroring
+`enforceEmbeddingLock`/`requireTokenFile`'s existing fail-fast pattern) is
+called from `buildRuntime()` right after those two: if `pools.json` exists
+and is corrupt, `falda serve` logs a `FATAL` message and `process.exit(1)`
+rather than booting a server that would report every declared pool as
+missing. A missing file is a silent no-op (legitimate first boot).
+Deliberately does not attempt to recover from a stray interrupted-write
+`.tmp` file left in the directory — an unrenamed temp isn't guaranteed
+complete either, so recovery is left to the operator rather than guessed
+at automatically. `src/gateway.ts` maps the new `corrupt_registry` code to
+`500` (a live server should never hit this at request time once boot
+validation is in place; this is defense-in-depth for a registry corrupted
+while already running). `src/stats.ts`'s layout section had the same
+silent-swallow bug (`listPoolStores`/`inspectLayout`'s pool-count read) —
+`inspectLayout` now surfaces a `warn`-level warning naming the corrupt file
+instead of silently reporting zero pools (kept non-fatal, since `falda
+stats` is a read-only inspector, not a boot gate).
+
+**Explicitly out of scope (not attempted):** cross-process write locking.
+Atomic rename makes each individual write all-or-nothing and safe against
+concurrent *readers*, but two `falda serve` processes sharing one
+`FALDA_ROOT` can still race as concurrent *writers* (last-writer-wins on
+a true read-modify-write collision) — this matches the finding's actual
+recommendation (temp-file + atomic rename, not locking); a true
+multi-writer lock would be a larger, separate change. In-process, the pool-
+admin mutators are synchronous JS and cannot interleave with each other.
+
+Tests: `test/pool_registry.test.ts` (15 tests) — atomic writes leave no
+temp file behind (including recovery in the presence of a stale leftover
+temp from a hypothetical prior interrupted write); a corrupt registry
+throws `corrupt_registry` from every read path and is never subsequently
+overwritten (the core regression, verified via byte-identical on-disk
+content after failed read/mutation attempts); six structurally-invalid-
+but-valid-JSON shapes are rejected; a missing file remains a legitimate
+first-run state; a fresh `PoolManager` reading the same root back proves
+declare/update/grant roundtrip correctly; `requirePoolRegistry` exits(1)
+on corrupt content and is a no-op on missing/valid content (mirroring
+`test/mcp_auth.test.ts`'s `requireTokenFile` test style); `falda stats`'
+layout section warns on a corrupt (not absent) registry. `npm run build`
+clean; `npm test` 403/403 (388 baseline + 15 new).
 
 **13. Schema/doc drift test compares shape, not semantics.** The
 runtime-vs-doc schema comparison checks table/column names only
@@ -676,5 +737,6 @@ duplicated here:
    pending its own policy review.)*
 5. **Integration smoke tests** (findings 7, 8, 9) — restore confidence in
    shipped-but-unverified surfaces.
-6. Remaining medium items (5, 6, 12, 13, 14) opportunistically alongside
-   related work.
+6. Remaining medium items (5, 6, 13, 14) opportunistically alongside
+   related work. *(Finding 12 landed: atomic writes + fail-loud registry
+   validation for `pools.json`.)*

@@ -5,10 +5,11 @@
  * and embedding-lock enforcement so a store's dense vectors are never
  * silently corrupted by a mismatched model/dim across processes.
  */
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { makeEmbedder, makeLocalEmbedder, type EmbedderConfig } from "./embedder.js";
 import type { Embedder } from "./falda.js";
+import { validateRegistry, PoolError } from "./pools.js";
 
 /**
  * Embedder selection:
@@ -115,4 +116,42 @@ export function enforceEmbeddingLock(root: string, dim: number, label = "FALDA")
     process.exit(1);
   }
   console.log(`${label} embedding lock: OK model=${model} dim=${dim}`);
+}
+
+/**
+ * Boot-time assertion: FATAL + exit(1) if root/pools.json exists but is
+ * unreadable, not valid JSON, or structurally not a registry. Mirrors
+ * requireTokenFile/enforceEmbeddingLock — fail loud and immediately rather
+ * than silently booting a server that will report every declared pool as
+ * missing (PoolManager.loadReg() previously swallowed this into an empty
+ * registry) and, worse, permanently destroy the corrupt-but-recoverable
+ * file on the very next pool-admin write. A missing pools.json is a
+ * legitimate first-run state and is not an error here.
+ *
+ * Deliberately does NOT attempt to recover from a stray
+ * `pools.json.*.tmp` left by an interrupted write — a temp file that
+ * never reached its rename is not guaranteed complete either, so trusting
+ * it could resurrect a half-written registry. Recovery is an operator
+ * action (fix pools.json by hand, or restore from a `falda backup`), not
+ * something boot should guess at. See
+ * docs/future/reliability-hardening.md finding 12.
+ */
+export function requirePoolRegistry(root: string, label = "FALDA"): void {
+  const regPath = join(root, "pools.json");
+  if (!existsSync(regPath)) return;
+  try {
+    const raw = readFileSync(regPath, "utf8");
+    const parsed = JSON.parse(raw);
+    validateRegistry(parsed, regPath);
+  } catch (e: any) {
+    const reason = e instanceof PoolError ? e.message : `${JSON.stringify(regPath)} could not be read/parsed: ${e?.message ?? e}`;
+    console.error(
+      `FATAL: ${label} pool registry problem — ${reason}. Every declared pool ` +
+      `would appear undeclared, and the next pool-admin write would permanently ` +
+      `overwrite this file with an empty registry. Fix ${regPath} by hand, or ` +
+      `restore it from a 'falda backup' snapshot (see docs/OPERATIONS.md), then restart.`,
+    );
+    process.exit(1);
+  }
+  console.log(`${label} pool registry OK: ${regPath}`);
 }
