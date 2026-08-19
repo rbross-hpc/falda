@@ -210,6 +210,27 @@ Summary:
 
 ---
 
+## 2c. Claude Code
+
+Claude Code is closer to opencode than to Hermes/OpenClaw: it also consumes
+external tools via MCP and extends its behaviour via a plugin, rather than a
+bespoke memory-provider interface. The Claude Code plugin
+(`integrations/claude-code/`) reimplements the same four hook-driven
+behaviours as the opencode capture plugin
+(`integrations/opencode/plugin/falda-capture.ts`) — auto-capture, auto-recall
+on the first prompt, an auto-distill trigger on compaction, and a second
+recall on the first prompt after a compaction — adapted for Claude Code's
+process-per-hook execution model instead of opencode's long-lived in-process
+plugin. It talks to the same MCP endpoint (`src/mcp.ts`, port `8079`) as
+opencode and calls the same `falda_*` tools.
+
+Full setup recipe (install, the three credential env vars, feature flags,
+troubleshooting): [`integrations/claude-code/README.md`](../integrations/claude-code/README.md).
+Design rationale for why the port diverges from opencode where it does:
+[`docs/future/claude-code-plugin.md`](future/claude-code-plugin.md).
+
+---
+
 ## 3. Shared-pool collaboration between harnesses
 
 When the two harnesses should share a slice of memory (not their whole stores),

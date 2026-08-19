@@ -1,0 +1,13 @@
+{
+  "name": "falda",
+  "owner": {
+    "name": "FALDA"
+  },
+  "plugins": [
+    {
+      "name": "falda-memory",
+      "source": "./integrations/claude-code",
+      "description": "Clustered hierarchical memory for Claude Code, backed by FALDA."
+    }
+  ]
+}

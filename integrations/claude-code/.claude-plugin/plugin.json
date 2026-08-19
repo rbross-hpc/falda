@@ -1,0 +1,11 @@
+{
+  "name": "falda-memory",
+  "description": "Clustered hierarchical memory for Claude Code, backed by FALDA: automatic turn capture, per-task recall injection, and distillation on compaction.",
+  "version": "0.1.0",
+  "author": {
+    "name": "FALDA"
+  },
+  "homepage": "https://github.com/rick-stevens-ai/falda",
+  "license": "Apache-2.0",
+  "keywords": ["memory", "agent", "recall", "falda", "mcp"]
+}

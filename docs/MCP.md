@@ -208,3 +208,26 @@ Compose service, MCP config, auto-capture plugin) for containerized
 opencode agents. This repo's `Dockerfile` builds an image whose default
 `CMD` is `falda serve` — both this MCP endpoint and the HTTP API from one
 container.
+
+## Claude Code integration
+
+The Claude Code plugin (`integrations/claude-code/README.md`) is a second
+client of this same MCP endpoint and this same tool set — `falda_recall`,
+`falda_remember`, `falda_forget`, `falda_distill`, `falda_distill_status`,
+`falda_whoami`, `falda_stream_add`. It reimplements the opencode capture
+plugin's four hook-driven behaviours (auto-capture, auto-recall,
+auto-distill-on-compact, post-compaction recall) as Claude Code hooks
+instead of an in-process opencode plugin, calling the same tools against
+the same server.
+
+**Statelessness contract.** This endpoint accepts stateless, single-shot
+`tools/call` requests: a bare JSON-RPC POST with no prior `initialize`
+handshake and no `Mcp-Session-Id` header is a supported way to call it, not
+an implementation accident. The Claude Code plugin's hooks rely on this —
+they speak MCP with a small dependency-free `fetch`-based client
+(`integrations/claude-code/hooks/lib/mcp.mjs`) rather than
+`@modelcontextprotocol/sdk`, precisely because no session/handshake state
+needs to be kept between one hook process and the next. Responses may be
+framed as `text/event-stream` (a single `data: ` line) or as plain
+`application/json`; either is a supported response shape for a stateless
+call.
