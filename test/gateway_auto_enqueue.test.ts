@@ -268,9 +268,11 @@ describe("parseCandidates: fence and array tolerance", () => {
       ]);
       const llm = makeMockLLM([
         arrayResponse,
-        // consolidation for each candidate
-        `{"action":"store","target_ids":[],"rationale":"New."}`,
-        `{"action":"store","target_ids":[],"rationale":"New."}`,
+        // One batched consolidation reply covering both candidates.
+        JSON.stringify([
+          { candidate: 0, action: "store", target_ids: [], rationale: "New." },
+          { candidate: 1, action: "store", target_ids: [], rationale: "New." },
+        ]),
         "Test session", "Test.",
         "Test topic", "Test.",
         "Test topic 2", "Test 2.",

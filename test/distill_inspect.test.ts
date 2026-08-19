@@ -54,8 +54,12 @@ describe("distill inspect", () => {
         `{"type":"fact","content":"The deploy script lives in bin/release.","confidence":"high"}`,
         `{"type":"fact","content":"Run docker compose up --build.","confidence":"low"}`,
       ].join("\n"),
-      `{"action":"store","target_ids":[],"rationale":"New durable fact."}`,
-      `{"action":"skip","target_ids":[],"rationale":"Transient operational command, not durable memory."}`,
+      // Batched: one reply covering both candidates (see
+      // docs/future/distill-consolidation-batching.md).
+      JSON.stringify([
+        { candidate: 0, action: "store", target_ids: [], rationale: "New durable fact." },
+        { candidate: 1, action: "skip", target_ids: [], rationale: "Transient operational command, not durable memory." },
+      ]),
       "Deploy workflow session", "Discussed the deploy script location.",
       "Deployment tooling", "Covers deployment scripts and tooling.",
       "# Agent core\n\nKnows deploy script in bin/release.",

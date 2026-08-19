@@ -16,7 +16,7 @@ import { unlinkSync, existsSync } from "node:fs";
 import type { Falda, AtomType, AtomConfidence, SceneKind, StreamTurn } from "../falda.js";
 import { VALID_TYPES, VALID_CONFIDENCE } from "./prompts.js";
 import {
-  extractionPrompt, consolidationPrompt,
+  extractionPrompt, consolidationPrompt, consolidationBatchPrompt,
   sceneTitlePrompt, sceneSummaryPrompt, coreSynthesisPrompt,
 } from "./prompts.js";
 import {
@@ -71,6 +71,16 @@ const DEFAULT_CANDIDATE_LIMIT = 8;
 const DEFAULT_TOPIC_SIMILARITY_THRESHOLD = 0.5;
 const DEFAULT_SCENE_MATCH_THRESHOLD = 0.5;
 const DEFAULT_SCENE_REORG_THRESHOLD = 0.7;
+const DEFAULT_CONSOLIDATION_BATCH = 20;
+
+/** Candidates per batched consolidation call. 1 restores the historical
+ *  one-call-per-candidate behaviour. Chunking is not optional: the extraction
+ *  prompt puts no ceiling on how many candidates it may return, so a single
+ *  prompt is unbounded at the tail. */
+function consolidationBatchSize(): number {
+  const raw = Number(process.env.FALDA_DISTILL_CONSOLIDATION_BATCH);
+  return Number.isInteger(raw) && raw >= 1 ? raw : DEFAULT_CONSOLIDATION_BATCH;
+}
 
 // ─── LLM response parsers ─────────────────────────────────────────────────────
 
@@ -128,7 +138,7 @@ function parseCandidates(raw: string): CandidateAtom[] {
   return results;
 }
 
-interface ConsolidationDecision {
+export interface ConsolidationDecision {
   action: "store" | "update" | "merge" | "skip";
   target_ids: string[];
   rationale: string;
@@ -155,6 +165,70 @@ function parseConsolidation(raw: string): ConsolidationDecision {
   } catch {
     return { action: "skip", target_ids: [], rationale: "parse error" };
   }
+}
+
+const CONSOLIDATION_ACTIONS = ["store", "update", "merge", "skip"] as const;
+
+/** Parse a batched consolidation reply into one decision per candidate.
+ *
+ *  Returns a dense array of length `n`; `undefined` means "no usable decision
+ *  for this candidate", which the caller retries individually. That gap is
+ *  deliberately distinct from a parsed `action: "skip"` — `parseConsolidation`
+ *  collapses malformed input into a skip, and reusing it here would make one
+ *  bad reply look like N deliberate skips and silently discard a whole chunk.
+ *
+ *  Decisions are correlated by their stated `candidate` index, never by array
+ *  position. An out-of-range, non-integer, or repeated index is dropped rather
+ *  than applied: a lost decision costs one candidate, but a misattributed one
+ *  writes a wrong consolidation into memory with no trace.
+ *
+ *  Tries to parse the payload as a JSON array first; if the array contains no
+ *  accepted decisions (or is not an array), falls back to line-by-line scanning
+ *  for parseable JSON objects. This ensures that a bare single-decision object
+ *  with an array field does not mistake the field for the batch. */
+export function parseConsolidationBatch(
+  raw: string,
+  n: number,
+): Array<ConsolidationDecision | undefined> {
+  const out: Array<ConsolidationDecision | undefined> = new Array(n).fill(undefined);
+
+  const accept = (obj: any): boolean => {
+    const idx = obj?.candidate;
+    if (!Number.isInteger(idx) || idx < 0 || idx >= n) return false;
+    if (out[idx] !== undefined) return false; // duplicate index: keep the first
+    const action = obj?.action;
+    if (!CONSOLIDATION_ACTIONS.includes(action)) return false;
+    out[idx] = {
+      action,
+      target_ids: Array.isArray(obj.target_ids) ? obj.target_ids.map(String) : [],
+      rationale: typeof obj.rationale === "string" ? obj.rationale : "",
+    };
+    return true;
+  };
+
+  // Strip markdown code fences, mirroring parseCandidates.
+  const stripped = raw.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
+
+  const arrStart = stripped.indexOf("[");
+  const arrEnd = stripped.lastIndexOf("]");
+  if (arrStart !== -1 && arrEnd > arrStart) {
+    try {
+      const arr = JSON.parse(stripped.slice(arrStart, arrEnd + 1));
+      if (Array.isArray(arr)) {
+        let accepted = 0;
+        arr.forEach((item) => { if (accept(item)) accepted++; });
+        if (accepted > 0) return out;
+      }
+    } catch { /* fall through to the line scan */ }
+  }
+
+  // Line scan: accept any line that is a parseable JSON object.
+  for (const line of stripped.split("\n")) {
+    const trimmed = line.trim().replace(/,$/, "");
+    if (!trimmed.startsWith("{")) continue;
+    try { accept(JSON.parse(trimmed)); } catch { /* skip malformed line */ }
+  }
+  return out;
 }
 
 // ─── Stable atom id from content hash (for idempotent re-runs) ────────────────
@@ -387,15 +461,54 @@ async function distillOncePass(
     const candidates = parseCandidates(extractRaw);
     log(`[distill] L1 extracted ${candidates.length} candidates`);
 
-    // For each candidate: recall existing atoms and get consolidation decision from LLM.
-    for (let i = 0; i < candidates.length; i++) {
-      const candidate = candidates[i];
+    // Phase 1: retrieve each candidate's neighbours. These are reads only
+    // (searchAtoms), and no atom is written until after this whole section, so
+    // hoisting them out of the decision loop changes no behaviour.
+    const retrieved: Array<{
+      candidate: CandidateAtom;
+      existing: Array<{ id: string; type: string; content: string; confidence: string }>;
+    }> = [];
+    for (const candidate of candidates) {
       const existingHits = await store.searchAtoms(candidate.content, candidateLimit);
-      const existing = existingHits.map((h) => ({
-        id: h.id, type: h.type, content: h.content, confidence: h.confidence,
-      }));
-      const decRaw = await llm(consolidationPrompt(candidate, existing));
-      const dec = parseConsolidation(decRaw);
+      retrieved.push({
+        candidate,
+        existing: existingHits.map((h) => ({
+          id: h.id, type: h.type, content: h.content, confidence: h.confidence,
+        })),
+      });
+    }
+
+    // Phase 2: one consolidation decision per candidate, batched where possible.
+    const batchSize = consolidationBatchSize();
+    const decisions: ConsolidationDecision[] = new Array(retrieved.length);
+
+    const decideIndividually = async (i: number): Promise<void> => {
+      const raw = await llm(consolidationPrompt(retrieved[i].candidate, retrieved[i].existing));
+      decisions[i] = parseConsolidation(raw);
+    };
+
+    if (batchSize <= 1 || retrieved.length <= 1) {
+      // Historical path, byte for byte. Also the N=1 case, where batching would
+      // add prompt scaffolding for no saving.
+      for (let i = 0; i < retrieved.length; i++) await decideIndividually(i);
+    } else {
+      for (let start = 0; start < retrieved.length; start += batchSize) {
+        const chunk = retrieved.slice(start, start + batchSize);
+        const raw = await llm(consolidationBatchPrompt(chunk));
+        const parsed = parseConsolidationBatch(raw, chunk.length);
+        for (let j = 0; j < chunk.length; j++) {
+          const dec = parsed[j];
+          if (dec) decisions[start + j] = dec;
+          else await decideIndividually(start + j); // never drop a candidate
+        }
+      }
+    }
+
+    // Phase 3: turn decisions into write ops.
+    for (let i = 0; i < retrieved.length; i++) {
+      const candidate = retrieved[i].candidate;
+      const existing = retrieved[i].existing;
+      const dec = decisions[i];
       // Normalize to stable first-occurrence uniqueness — the LLM can repeat
       // an id in target_ids, which would otherwise cause duplicate lifecycle
       // writes below.

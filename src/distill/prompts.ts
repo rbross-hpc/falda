@@ -124,3 +124,47 @@ Write a markdown core document that:
 
 Output ONLY the markdown document.`;
 }
+
+/** Batched form of consolidationPrompt: the same instructions, sent once, over
+ *  N candidates. Each candidate keeps its own retrieved neighbour set — those
+ *  genuinely differ per candidate and cannot be shared — so only the
+ *  instruction block is deduplicated. Decisions come back keyed by the
+ *  candidate index printed here. */
+export function consolidationBatchPrompt(
+  items: Array<{
+    candidate: { type: string; content: string; confidence: string };
+    existing: Array<{ id: string; type: string; content: string; confidence: string }>;
+  }>,
+): string {
+  const blocks = items.map((item, i) => {
+    const existingList = item.existing.map((a, j) =>
+      `    ${j + 1}. [${a.id}] (${a.type}, ${a.confidence}) ${a.content}`
+    ).join("\n");
+    return `Candidate ${i}:
+  type: ${item.candidate.type}
+  confidence: ${item.candidate.confidence}
+  content: ${item.candidate.content}
+  Existing active memories for this candidate:
+${existingList || "    (none)"}`;
+  }).join("\n\n");
+
+  return `You are a memory consolidation assistant. Decide what to do with each candidate memory below, given the existing memories listed for that candidate.
+
+${blocks}
+
+Output a JSON array with exactly one object per candidate, each with:
+  candidate: the candidate's number as given above
+  action: "store" | "update" | "merge" | "skip"
+  target_ids: array of existing memory ids affected (empty for store/skip)
+  rationale: one sentence explaining the decision
+
+Rules:
+- "store": candidate is new knowledge not covered by any existing memory.
+- "update": candidate refreshes or corrects one existing memory (provide that id in target_ids).
+- "merge": candidate unifies 2+ existing memories into one (provide all ids in target_ids).
+- "skip": candidate is redundant, transient, or low-value.
+- Only list ids from that candidate's own existing memories.
+- Decide each candidate independently. Include every candidate exactly once.
+
+Output ONLY the JSON array, no other text.`;
+}

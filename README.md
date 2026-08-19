@@ -178,10 +178,12 @@ curl -s -X POST http://localhost:8077/distill \
 
 | Env var                 | Default                     | Notes |
 |-------------------------|-----------------------------|-------|
-| `FALDA_LLM_BASE_URL`    | `http://localhost:11434/v1` | chat-completions endpoint |
-| `FALDA_LLM_API_KEY`     | `x`                         | bearer token for chat endpoint |
-| `FALDA_LLM_MODEL`       | `gpt-4o-mini`               | extraction/synthesis model id |
-| `FALDA_LLM_TIMEOUT_MS`  | `120000`                    | request timeout for the chat endpoint — a stalled LLM fails the pass (retried with backoff) instead of hanging indefinitely |
+| `FALDA_LLM_PROVIDER`    | `openai`                    | `openai` (any OpenAI-compatible chat-completions endpoint — Ollama, vLLM, llama.cpp) or `anthropic` (Anthropic's Messages API; see below) |
+| `FALDA_LLM_BASE_URL`    | `http://localhost:11434/v1` | chat-completions endpoint. On `anthropic`, an optional baseURL override for a gateway — unset uses Anthropic's own default |
+| `FALDA_LLM_API_KEY`     | `x`                         | bearer token for chat endpoint. On `anthropic`, unset falls back to the SDK's `ANTHROPIC_API_KEY` lookup |
+| `FALDA_LLM_MODEL`       | `gpt-4o-mini`               | extraction/synthesis model id (`claude-haiku-4-5` when `FALDA_LLM_PROVIDER=anthropic`) |
+| `FALDA_LLM_TIMEOUT_MS`  | `120000`                    | request timeout, both providers — a stalled LLM fails the pass (retried with backoff) instead of hanging indefinitely |
+| `FALDA_DISTILL_CONSOLIDATION_BATCH` | `20` | candidates decided per consolidation call. Distillation decides them in batches of this size instead of one call each — an estimated ~47% fewer input tokens at 15 candidates. `1` restores one call per candidate |
 | `FALDA_DRAIN_INTERVAL_MS`  | `60000`                  | how often the worker drains one ready job from the queue |
 | `FALDA_SWEEP_INTERVAL_MS`  | `300000`                 | how often the worker auto-enqueues every self-store, and prunes `recall_traces.db` |
 | `FALDA_WORKER_INTERVAL_MS` | *(unset)*                | **deprecated**: sets both of the above when they're unset — set the split vars instead |
@@ -194,6 +196,29 @@ was already in flight (bounded by `FALDA_SHUTDOWN_GRACE_MS`), then closing
 storage — so a container restart or `Ctrl-C` doesn't cut off an in-flight
 request mid-response or close a SQLite handle while a distillation pass is
 still writing. A second signal during shutdown forces an immediate exit.
+
+Distillation defaults to a **self-hosted** model, and nothing about that
+changes unless you opt in. `FALDA_LLM_PROVIDER=anthropic` exists for
+deployments that would rather pay per token than run one:
+
+```bash
+FALDA_LLM_PROVIDER=anthropic \
+FALDA_LLM_API_KEY=sk-ant-... \
+FALDA_LLM_MODEL=claude-haiku-4-5 \
+  falda serve
+```
+
+On Anthropic models where extended thinking runs by default, thinking
+tokens count against the same `max_tokens` budget as the visible reply, so
+pairing a large `FALDA_DISTILL_CONSOLIDATION_BATCH` with such a model can
+truncate a pass — the default batch of 20 leaves ample headroom.
+
+This is the one place FALDA can reach a hosted service, and only when
+explicitly configured — see
+[`docs/future/anthropic-llm-provider.md`](docs/future/anthropic-llm-provider.md)
+for the design and its trade-offs. **Embeddings are unaffected:** Anthropic
+publishes no embeddings endpoint, so `FALDA_EMBED_*` still needs a local
+model or another OpenAI-compatible service.
 
 ---
 
