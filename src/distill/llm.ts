@@ -115,7 +115,30 @@ function makeOpenAILLM(cfg: LLMConfig, model: string): LLMFnWithModel {
     }
     if (!resp.ok) throw new Error(`LLM ${resp.status}: ${await resp.text()}`);
     const j = (await resp.json()) as any;
-    return j.choices[0].message.content as string;
+    const choice = j.choices?.[0];
+    if (choice?.finish_reason === "length") {
+      // The reply was cut off mid-JSON before the model finished. Returning
+      // it would let a batch parser resolve nothing and silently fall back
+      // to retrying every candidate individually — or hand a non-batch
+      // caller truncated JSON with no signal anything went wrong. Throw so
+      // the worker's failJob/backoff sees it, mirroring the Anthropic path's
+      // max_tokens guard below. A too-large FALDA_DISTILL_CONSOLIDATION_BATCH
+      // is one possible cause, but not the only one (any prompt can hit the
+      // server/model's own output cap), so the message names it as a
+      // suspect rather than the definitive cause.
+      throw new Error(
+        "LLM reply was truncated (finish_reason: length) before finishing; " +
+          "if this is a batched consolidation call, FALDA_DISTILL_CONSOLIDATION_BATCH " +
+          "may be too large for this model/output",
+      );
+    }
+    const content = choice?.message?.content;
+    if (typeof content !== "string") {
+      throw new Error(
+        `LLM returned no usable message content (finish_reason: ${choice?.finish_reason ?? "unknown"})`,
+      );
+    }
+    return content;
   } as LLMFnWithModel;
 }
 

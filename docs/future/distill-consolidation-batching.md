@@ -132,6 +132,60 @@ structured output for each entry. N = 50 becomes 3 calls rather than 50.
 restores exactly the current one-call-per-candidate behaviour, which is both
 the escape hatch and the regression test.
 
+### Input-side cap: `FALDA_DISTILL_CONSOLIDATION_MAX_CHARS`
+
+`FALDA_DISTILL_CONSOLIDATION_BATCH` bounds candidate *count*, not built-prompt
+*size*. Each candidate in a chunk carries its own retrieved neighbour set
+(`candidateLimit`, default 8, existing atoms — full `content` each, see
+`consolidationBatchPrompt`), so a chunk's actual prompt size depends on
+neighbour content, not just how many candidates it holds. A batch of 20
+candidates each with 8 verbose neighbours can be considerably larger than a
+batch of 20 short ones.
+
+`FALDA_DISTILL_CONSOLIDATION_MAX_CHARS` — integer, default `0` (disabled).
+When set to a positive value, `distillOnce`'s chunking becomes size-aware:
+candidates are still capped at `FALDA_DISTILL_CONSOLIDATION_BATCH` per chunk,
+but a chunk is closed early — before adding the next candidate — if the
+built prompt (via the same `consolidationBatchPrompt` that will actually be
+sent) would exceed the cap. This is a greedy pack, not a fixed split: it
+fills each chunk closer to the cap than blind halving would, since per-
+candidate cost is not uniform.
+
+The cap is a character count, not a token count — no tokenizer is used
+(one would be model-specific, and the self-hosted OpenAI path can point at
+any model). Treat it as a rough proxy (~4 chars/token is a commonly cited
+heuristic for English text) and leave headroom.
+
+A lone candidate whose own built prompt already exceeds the cap is still
+sent alone — there's nothing smaller to try, and dropping it would violate
+the "never drop a candidate" rule the individual-retry fallback already
+follows. A verbose-mode log line records this so an operator can see it
+happened, without failing the pass.
+
+Left disabled by default: it's a second knob on top of
+`FALDA_DISTILL_CONSOLIDATION_BATCH`, and a deployment that hasn't hit an
+input-size problem shouldn't have its batch sizing silently reshaped by a
+cap it never asked for.
+
+### Output-side guard: truncated replies must fail loudly, on both providers
+
+The Anthropic path already throws when `stop_reason === "max_tokens"`
+(`src/distill/llm.ts`) rather than returning a reply that may be truncated
+mid-JSON — silently returning it would let the batch parser (or the
+single-decision parser) resolve nothing, and a batch would collapse into N
+wasted individual retries with no signal anywhere that truncation happened.
+
+The OpenAI-compatible path did not have the same guard: `makeOpenAILLM`
+returned `choices[0].message.content` unconditionally. It now checks
+`choices[0].finish_reason` and throws on `"length"`, mirroring the Anthropic
+behaviour so the worker's `failJob`/backoff sees a truncated reply as a
+failure to retry rather than a successful pass over unusable output. The
+error names `FALDA_DISTILL_CONSOLIDATION_BATCH` as one *possible* cause
+(phrased that way deliberately — this guard applies to every OpenAI-path
+call, including extraction, synthesis, and single-candidate consolidation,
+not only batched consolidation, so a too-large batch is not the only thing
+that can trigger it).
+
 ## Alternatives rejected
 
 **Anthropic Batch API (~50% discount).** Asynchronous, with a turnaround of up
@@ -166,3 +220,13 @@ instruction block. Worth doing on its own merits; it is not a cost measure.
 - a chunk boundary at exactly `BATCH` and at `BATCH + 1` candidates
 - `FALDA_DISTILL_CONSOLIDATION_BATCH=1` reproduces the current call pattern,
   guarding the escape hatch
+- `FALDA_DISTILL_CONSOLIDATION_MAX_CHARS` unset reproduces fixed-stride
+  chunking byte for byte
+- a tight `FALDA_DISTILL_CONSOLIDATION_MAX_CHARS` splits a chunk that would
+  otherwise fit by count alone, and drops no candidate
+- a lone candidate exceeding `FALDA_DISTILL_CONSOLIDATION_MAX_CHARS` is still
+  sent, not dropped
+- an unresolved candidate inside a size-capped chunk still falls back
+  individually
+- the OpenAI path throws on `finish_reason: "length"`, mirroring the
+  Anthropic path's `stop_reason: "max_tokens"` guard

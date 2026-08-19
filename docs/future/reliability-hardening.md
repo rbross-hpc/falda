@@ -983,6 +983,67 @@ in this function (mark dirty, count as an L3 failure, let the existing
 engage the retry path) rather than silently proceeding as if nothing went
 wrong.
 
+**20. [Medium] Batched consolidation prompts are unbounded on the input
+side, and the OpenAI path had no output-truncation guard. — ✅ addressed**
+`FALDA_DISTILL_CONSOLIDATION_BATCH` (found 15–19's context) bounds candidate
+*count* per consolidation call, not built-prompt *size*: each candidate in a
+chunk carries its own retrieved neighbour set — up to `candidateLimit`
+(default 8) existing atoms with full `content` each
+(`src/distill/prompts.ts:133-149`) — so a chunk's actual prompt size depends
+on neighbour content, not candidate count alone, and nothing capped it.
+Separately, the Anthropic path already throws when a reply is truncated
+mid-JSON (`stop_reason: "max_tokens"`, `src/distill/llm.ts:148-157`), but the
+OpenAI-compatible path (the default, self-hosted path) had no equivalent —
+`makeOpenAILLM` returned `choices[0].message.content` unconditionally,
+regardless of `finish_reason`.
+
+*Impact:* an oversized batch (a verbose extraction pass paired with a large
+`FALDA_DISTILL_CONSOLIDATION_BATCH`) could build a prompt that exceeds a
+model's input window with no warning beforehand. On the OpenAI path, a
+truncated reply was silently accepted as a successful call whose
+batch-parser found nothing to resolve, thrashing into a full set of
+per-candidate retries with no signal anywhere that truncation — not normal
+malformed output — was the cause.
+
+**Landed:** two independent fixes.
+
+1. `makeOpenAILLM` (`src/distill/llm.ts`) now checks `finish_reason` and
+   throws on `"length"`, mirroring the Anthropic path's guard, so the
+   worker's `failJob`/backoff sees a truncated reply as a failure to retry
+   rather than a successful pass over unusable output. The error names
+   `FALDA_DISTILL_CONSOLIDATION_BATCH` as one *possible* cause, not the
+   definitive one — the guard applies to every OpenAI-path call (extraction,
+   synthesis, single-candidate consolidation too), not only batched
+   consolidation. Also hardened: missing/non-string `message.content` now
+   throws a clear error instead of a raw `TypeError`.
+2. New `FALDA_DISTILL_CONSOLIDATION_MAX_CHARS` (`src/distill/core.ts`,
+   default `0`/disabled) — an approximate char-count proxy for input size (no
+   tokenizer is used; one would be model-specific and the self-hosted path
+   can point at any model). When set positive, `distillOnce`'s batch-chunking
+   (`packConsolidationChunks()`) becomes size-aware: candidates are still
+   capped at `FALDA_DISTILL_CONSOLIDATION_BATCH` per chunk, but a chunk is
+   closed early if adding the next candidate would push its *actual* built
+   prompt (via the same `consolidationBatchPrompt` that gets sent) over the
+   cap. This is a greedy pack, not a fixed split — it fills each chunk closer
+   to the cap than blind halving, since per-candidate cost varies with
+   neighbour-set size. A lone candidate whose own prompt already exceeds the
+   cap is still sent alone (nothing smaller exists — dropping it would
+   violate the batching feature's existing "never drop a candidate" rule);
+   a verbose-mode log records this so an operator has a trail without
+   failing the pass.
+
+Left disabled by default (`<= 0`): a positive value is a second knob on top
+of `FALDA_DISTILL_CONSOLIDATION_BATCH`, and a deployment that hasn't hit an
+input-size problem shouldn't have its existing batch sizing silently
+reshaped by a cap it never opted into.
+
+Tests: `test/distill_llm_anthropic.test.ts` extended with the OpenAI
+`finish_reason` cases (normal, `"length"`, message wording, missing
+content); `test/distill_consolidation_batch.test.ts` extended with the
+disabled-by-default, tight-cap-splits-a-chunk, lone-candidate-still-sent,
+and unresolved-candidate-in-a-size-capped-chunk-still-falls-back cases. `npm
+run build` clean; `npm test` 498/498 (490 baseline + 8 new).
+
 ### Note — not a code defect, but flag for rotation
 
 `falda_tokens.json` in this checkout contains a bearer token with
@@ -1042,3 +1103,6 @@ duplicated here:
    above are caveats on already-landed work, not new implementation items,
    but should be resolved alongside 15–19 if this area gets picked up
    again.
+8. **Finding 20** — batched-consolidation input-size cap and OpenAI-path
+   truncation guard — landed. Independent of 15–19; picked up out of order
+   since it was small and self-contained.

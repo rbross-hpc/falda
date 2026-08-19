@@ -384,3 +384,164 @@ describe("distillOnce: batched consolidation", () => {
     }
   });
 });
+
+describe("distillOnce: consolidation input-size cap (FALDA_DISTILL_CONSOLIDATION_MAX_CHARS)", () => {
+  function withEnv(name: string, value: string | undefined, fn: () => Promise<void>) {
+    const prev = process.env[name];
+    if (value === undefined) delete process.env[name];
+    else process.env[name] = value;
+    return fn().finally(() => {
+      if (prev === undefined) delete process.env[name];
+      else process.env[name] = prev;
+    });
+  }
+
+  test("disabled by default: an unset cap reproduces fixed-stride chunking", async () => {
+    await withEnv("FALDA_DISTILL_CONSOLIDATION_BATCH", "2", async () => {
+      await withEnv("FALDA_DISTILL_CONSOLIDATION_MAX_CHARS", undefined, async () => {
+        const { s, blobDir } = makeStore();
+        try {
+          await s.addStream("sess-1", [{ role: "user", content: "three facts" }]);
+          const three = JSON.stringify([
+            { type: "fact", content: "F1.", confidence: "high" },
+            { type: "fact", content: "F2.", confidence: "high" },
+            { type: "fact", content: "F3.", confidence: "high" },
+          ]);
+          const { fn, prompts } = makeRecordingLLM([
+            three,
+            JSON.stringify([
+              { candidate: 0, action: "store", target_ids: [], rationale: "n" },
+              { candidate: 1, action: "store", target_ids: [], rationale: "n" },
+            ]),
+            JSON.stringify([{ candidate: 0, action: "store", target_ids: [], rationale: "n" }]),
+            ...TAIL,
+          ]);
+          const result = await distillOnce(s, fn, { storeKey: "batch-cap-off:self" });
+          assert.equal(result.atoms_stored, 3);
+          const consolidationPrompts = prompts.filter((p) =>
+            p.includes("memory consolidation assistant"));
+          assert.equal(consolidationPrompts.length, 2,
+            "with no char cap, chunking is governed by batch size alone (ceil(3/2) = 2)");
+        } finally { cleanup(s, blobDir); }
+      });
+    });
+  });
+
+  test("a tight cap splits a chunk that would otherwise fit by count alone", async () => {
+    await withEnv("FALDA_DISTILL_CONSOLIDATION_BATCH", "3", async () => {
+      // Long candidate content (no retrieved neighbours needed) drives up
+      // each chunk's built-prompt size deterministically, independent of
+      // search-retrieval behaviour. The cap is set to fit exactly one such
+      // candidate's own chunk but not two.
+      const bigContent = "F1 " + "x".repeat(400) + ".";
+      const oneCandidatePrompt = consolidationBatchPrompt([
+        { candidate: { type: "fact", content: bigContent, confidence: "high" }, existing: [] },
+      ]);
+      const cap = oneCandidatePrompt.length + 20; // fits one, not two
+      await withEnv("FALDA_DISTILL_CONSOLIDATION_MAX_CHARS", String(cap), async () => {
+        const { s, blobDir } = makeStore();
+        try {
+          await s.addStream("sess-1", [{ role: "user", content: "three facts" }]);
+          const three = JSON.stringify([
+            { type: "fact", content: bigContent, confidence: "high" },
+            { type: "fact", content: bigContent.replace("F1", "F2"), confidence: "high" },
+            { type: "fact", content: bigContent.replace("F1", "F3"), confidence: "high" },
+          ]);
+          const { fn, prompts } = makeRecordingLLM([
+            three,
+            // Cap forces one candidate per chunk -> three individual-shaped
+            // batch calls (each carrying just "Candidate 0").
+            JSON.stringify([{ candidate: 0, action: "store", target_ids: [], rationale: "n" }]),
+            JSON.stringify([{ candidate: 0, action: "store", target_ids: [], rationale: "n" }]),
+            JSON.stringify([{ candidate: 0, action: "store", target_ids: [], rationale: "n" }]),
+            ...TAIL,
+          ]);
+          const result = await distillOnce(s, fn, { storeKey: "batch-cap-tight:self" });
+          assert.equal(result.atoms_stored, 3, "no candidate was dropped by the size cap");
+          const consolidationPrompts = prompts.filter((p) =>
+            p.includes("memory consolidation assistant"));
+          assert.equal(consolidationPrompts.length, 3,
+            "the cap forced three single-candidate chunks instead of one batch of three");
+          // Content check, not just count: an unresolved-candidate fallback
+          // to decideIndividually() also lands in this filter and could
+          // coincidentally match the same call count as three genuinely
+          // size-capped one-candidate chunks. Only a chunk holding more than
+          // one candidate would ever mention "Candidate 1" — assert none do,
+          // proving every batch call really was size 1, not a single
+          // 3-candidate batch plus two individual retries.
+          assert.ok(consolidationPrompts.every((p) => !p.includes("Candidate 1")),
+            "no chunk held more than one candidate — the cap forced true 1-candidate chunks, " +
+            "not a single 3-candidate batch that happened to need per-candidate fallback");
+        } finally { cleanup(s, blobDir); }
+      });
+    });
+  });
+
+  test("a lone candidate exceeding the cap is still sent, not dropped", async () => {
+    await withEnv("FALDA_DISTILL_CONSOLIDATION_BATCH", "5", async () => {
+      await withEnv("FALDA_DISTILL_CONSOLIDATION_MAX_CHARS", "1", async () => {
+        const { s, blobDir } = makeStore();
+        try {
+          await s.addStream("sess-1", [{ role: "user", content: "two facts" }]);
+          const { fn, prompts } = makeRecordingLLM([
+            TWO_CANDIDATES,
+            // Cap of 1 char forces every candidate into its own chunk.
+            JSON.stringify([{ candidate: 0, action: "store", target_ids: [], rationale: "n" }]),
+            JSON.stringify([{ candidate: 0, action: "store", target_ids: [], rationale: "n" }]),
+            ...TAIL,
+          ]);
+          const result = await distillOnce(s, fn, { storeKey: "batch-cap-tiny:self" });
+          assert.equal(result.atoms_stored, 2, "both candidates were sent despite exceeding the cap");
+          const consolidationPrompts = prompts.filter((p) =>
+            p.includes("memory consolidation assistant"));
+          assert.equal(consolidationPrompts.length, 2, "each candidate got its own chunk");
+          // Content check: with the cap disabled, both candidates would land
+          // in one 2-candidate chunk instead, whose single decideIndividually
+          // fallback (for the one unresolved index) happens to also produce
+          // 2 consolidation-labelled calls and 2 stored atoms — so count
+          // alone does not discriminate cap-enabled from cap-disabled here.
+          // Only a genuine 2-candidate batch chunk would ever mention
+          // "Candidate 1".
+          assert.ok(consolidationPrompts.every((p) => !p.includes("Candidate 1")),
+            "each candidate was sent in its own 1-candidate chunk, not batched together " +
+            "and resolved via individual-retry fallback");
+        } finally { cleanup(s, blobDir); }
+      });
+    });
+  });
+
+  test("an unresolved candidate in a size-capped chunk still falls back individually", async () => {
+    await withEnv("FALDA_DISTILL_CONSOLIDATION_BATCH", "5", async () => {
+      await withEnv("FALDA_DISTILL_CONSOLIDATION_MAX_CHARS", "1", async () => {
+        const { s, blobDir } = makeStore();
+        try {
+          await s.addStream("sess-1", [{ role: "user", content: "two facts" }]);
+          const { fn, prompts } = makeRecordingLLM([
+            TWO_CANDIDATES,
+            // Candidate 0's own 1-candidate chunk fails to resolve...
+            JSON.stringify([]),
+            // ...so it retries individually, in the single-decision format.
+            `{"action":"store","target_ids":[],"rationale":"retried"}`,
+            // Candidate 1's own 1-candidate chunk resolves normally.
+            JSON.stringify([{ candidate: 0, action: "store", target_ids: [], rationale: "n" }]),
+            ...TAIL,
+          ]);
+          const result = await distillOnce(s, fn, { storeKey: "batch-cap-fallback:self" });
+          assert.equal(result.atoms_stored, 2, "no candidate lost across the size-capped + retry path");
+          const consolidationPrompts = prompts.filter((p) =>
+            p.includes("memory consolidation assistant"));
+          // Content check: with the cap disabled, both candidates would be
+          // sent in one 2-candidate chunk, and an all-unresolved reply for
+          // that chunk degrades to the same 2-candidate-stored outcome via
+          // decideIndividually() for both — so atoms_stored alone does not
+          // discriminate cap-enabled chunking (two separate 1-candidate
+          // batch calls) from cap-disabled chunking (one 2-candidate batch
+          // call plus individual retries). Only a genuine 2-candidate batch
+          // chunk would ever mention "Candidate 1".
+          assert.ok(consolidationPrompts.every((p) => !p.includes("Candidate 1")),
+            "each candidate was size-capped into its own 1-candidate chunk");
+        } finally { cleanup(s, blobDir); }
+      });
+    });
+  });
+});
