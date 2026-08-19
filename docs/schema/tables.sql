@@ -30,7 +30,10 @@ CREATE TABLE IF NOT EXISTS stream (
   ts TEXT NOT NULL,
   turn_index INTEGER,          -- per-session order (nullable, caller-supplied)
   turn_id TEXT,                -- per-session idempotency token (nullable, caller-supplied)
-  seq INTEGER                  -- store-global order, assigned at insert, never null after migration
+  seq INTEGER                  -- store-global order; nullable in DDL (SQLite can't add NOT NULL via
+                                -- ALTER without a table rebuild), but backfilled non-null for every
+                                -- row written by current code (fresh inserts and the seq-migration
+                                -- backfill both always assign a value)
 );
 CREATE INDEX IF NOT EXISTS idx_stream_seq ON stream(seq);
 CREATE INDEX IF NOT EXISTS idx_stream_session ON stream(session_id);
