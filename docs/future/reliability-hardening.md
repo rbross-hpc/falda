@@ -516,6 +516,27 @@ re-embedding runbook, same shape: rationale, numbered bash runbook, flag
 tables, container variant, caveats). `npm run build` clean; `npm test`
 380/380 (364 baseline + 16 new).
 
+**Residual gap identified in a later audit, not yet addressed:** each
+individual SQLite file is captured consistently (`VACUUM INTO`), but
+`runBackup()` snapshots stores, blobs, and root-level files sequentially
+with no cross-file lock or generation barrier
+(`src/backup.ts:181-203`) — `writeCore()` also writes `core.md` directly
+outside any of this (`src/falda.ts` — see finding 19's L3 Core-deletion
+context for the same file). Against a live, actively-distilling deployment,
+a backup can therefore capture, e.g., a `falda.db` whose `core_state` says
+Core is current alongside a `core.md` file from a different point in time
+(or briefly absent, per finding 19), or a `pools.json` that disagrees with
+which stores were actually snapshotted. `docs/OPERATIONS.md`'s "captured
+together and consistently" wording overstates this: the accurate guarantee
+is per-file consistency, not a single coherent point-in-time image of the
+whole root. The existing advice to stop `falda serve` before backing up for
+a true point-in-time snapshot remains correct and is the recommended path
+for anything relying on backup for migration rather than approximate
+disaster recovery; this gap is about the *live*-backup claim specifically.
+Not re-numbered as a separate finding since it's a caveat on already-landed
+work, not a new code path — tracked here so the "Landed" note stays
+accurate.
+
 **11. HTTP surface accepts unbounded request bodies before authentication,
 binds all interfaces, and has no rate limiting. — ⚠️ partially addressed**
 The HTTP listener
@@ -588,6 +609,28 @@ rejection happening before auth (a bad/missing token still gets `413`, not
 `401`), and both listeners' loopback default plus override via `serve()`
 options and `FALDA_BIND`. `npm run build` clean; `npm test` 388/388 (380
 baseline + 8 new).
+
+**Residual gap identified in a later audit, not yet addressed:** the "no
+body cap on MCP" scoping decision above assumed authentication fully
+protects the MCP listener from an unbounded body. That's true for the
+*unauthenticated*-flood case this finding targeted, but not for an
+*authenticated* one: `handleFaldaMcpRequest()` authenticates the bearer
+token first (`src/mcp/server.ts:94-104`), then hands the request to the MCP
+SDK's `StreamableHTTPServerTransport`, which buffers and fully parses the
+JSON body (`await req.json()` inside the SDK) with no size limit of its
+own. Any valid token — a compromised one, a buggy client, or simply a
+caller that doesn't know better — can send an arbitrarily large MCP POST
+body and force full in-memory buffering + JSON parsing before the SDK's own
+handling runs, in the same process as the HTTP listener and the
+distillation worker. This is a distinct defect from the deferred rate
+limiting in finding 14 below (one request being unbounded, vs. request
+*frequency* being unbounded) and was missed because "the SDK owns that
+request's body stream" was read as "therefore already handled," not
+"therefore needs its own explicit cap." *Recommendation:* wrap the request
+stream in the same kind of byte-counting guard `startHttpApi()` already
+uses before handing it to the SDK (or pre-read a capped body and supply it
+via the SDK's `parsedBody` option), with its own env var if MCP's typical
+payload size differs meaningfully from the JSON API's.
 
 **12. Pool registry corruption is silently treated as an empty registry,
 and writes aren't atomic. — ✅ addressed** A malformed/unreadable `pools.json` becomes
@@ -750,6 +793,196 @@ opt-in via env (an opt-in default is lower-risk for existing deployments,
 matching how `FALDA_MAX_BODY_BYTES` and the loopback-bind defaults in
 finding 11 were rolled out).
 
+### Later audit pass (2026-08-19) — findings 15–19
+
+The following five findings were identified in a follow-up read-only audit
+after findings 1–14 above had already landed (or, for 14, been deferred).
+Numbered sequentially rather than re-sorted into the Critical/High/Medium
+sections above, to avoid renumbering findings already referenced by commit
+messages and `PLAN.md`; each carries its own severity tag instead.
+
+**15. [High] The distillation worker can run more than one job concurrently
+despite its single-worker design.** The timed `drain()` loop has no busy/in-flight
+guard before claiming another job (`src/distill/worker.ts:246-256`); the
+periodic timer that invokes it does not await the previous tick before
+scheduling the next one (`src/distill/worker.ts:355`). The wake path
+(`falda_distill`/`POST /distill`) has its own separate re-entrancy guard,
+`waking` (`src/distill/worker.ts:264-284`), which does not exclude a timed
+drain running at the same moment. Both paths write into the same single
+`inFlight` variable (`src/distill/worker.ts:250-255,273-279`), so whichever
+path started most recently silently overwrites the handle `stop()` awaits
+(`src/distill/worker.ts:366-373`) — an earlier still-running job becomes
+untracked. `enqueue()`'s coalescing only checks `pending` rows
+(`src/distill/queue.ts:122-124`), not `running` ones, so a second
+`falda_distill` call for a store already mid-pass creates or wakes a second
+claim rather than being absorbed.
+
+*Impact:* any pass that runs longer than `FALDA_DISTILL_DRAIN_MS` lets the
+next timer tick start a second pass; a wake can independently overlap a
+timed pass. Two concurrent passes against the same store can race L2 scene
+creation/reconciliation and lifecycle writes, clear the dirty flag out of
+order (finding 2), and leave conflicting `distillation_passes`
+completion/failure rows. A graceful shutdown (finding 4) can also close
+storage while an overwritten, no-longer-tracked pass is still writing to it,
+since `stop()` can only await whichever job is in the `inFlight` slot at
+that moment.
+
+*Recommendation:* give the worker one authoritative "am I currently running
+a job" state, checked and set atomically by both `drain()` and
+`drainHighPriority()` before either claims a job — not two independent
+`waking`/no-`inFlight`-guard checks. Track every in-flight job (not just the
+most recent) so `stop()` can await all of them. Consider having `enqueue()`
+also coalesce against `running` rows for the same `store_key`, or accept a
+same-store overlapping claim as impossible only once the guard above is in
+place. Existing tests cover wake-vs-wake overlap only
+(`test/distill_worker.test.ts`); add timer-vs-timer and timer-vs-wake
+overlap cases once fixed.
+
+**16. [High] Malformed LLM output during distillation is silently
+discarded, and the pass still reports success.** Extraction output is parsed
+line-by-line/as-a-JSON-array; any line or array element that fails
+`validateCandidate()` is dropped with no error
+(`src/distill/core.ts:93-138`) — the finding's line-scan branch has a bare
+`catch { /* skip malformed line */ }`. If every line in a reply is
+malformed, `candidates` is simply empty and the pass proceeds
+(`src/distill/core.ts:456-462`), still advancing the watermark past the
+source turns at the end of the same transaction
+(`src/distill/core.ts:656-662`). Separately, a per-candidate consolidation
+reply that fails to parse, or names an unrecognized `action`, is converted
+into an applied `"skip"` decision rather than a retryable failure
+(`src/distill/core.ts:147-168`) — the candidate's evidence is never
+attached to any atom and the content only survives in
+`consolidation_decisions.candidate_content`
+(`src/distill/core.ts:643-653`), which no operator surface currently
+compares against expectation. `docs/MODEL.md:842-848` documents that an
+invalid `type`/`confidence` should fail extraction as a *retryable* error —
+the implementation instead treats it as "nothing to see here."
+
+*Impact:* a single transient malformed model reply (truncated output, a
+model that ignores the "output ONLY JSON" instruction, an upstream hiccup
+mid-generation) can permanently mark a batch of source turns as processed
+while storing zero durable memories for them — the queue's retry/backoff
+machinery (finding 3) never engages, because `distillOnce` returns
+successfully. The same swallow can silently discard a *validly extracted*
+candidate whose separate consolidation-decision call happened to come back
+malformed, even though extraction itself succeeded.
+
+*Recommendation:* treat a reply that is expected to contain output but
+parses to zero usable items as a distinguishable failure mode (at minimum,
+log it at `error` level and increment a countable metric/warning surfaced
+by `falda distill inspect`/`falda stats`); consider making it retryable
+(matching `docs/MODEL.md`'s documented contract) rather than an
+indistinguishable, watermark-advancing no-op. The batched-consolidation
+path (`consolidationBatchPrompt`/`parseConsolidationBatch`, merged after
+finding 12) already falls back to `decideIndividually()` per undecided
+candidate rather than silently skipping (`src/distill/core.ts:494-503`) —
+extend that same "never silently drop a candidate" discipline to the
+all-malformed-extraction and single-consolidation-parse-failure cases.
+
+**17. [High] `falda restore` trusts manifest paths and leaves stale state
+behind on in-place restore.** `readManifest()` only checks that `stores`/`top_level`
+are arrays (`src/restore.ts:56-66`); nothing validates that any entry's
+`rel_path` is a normalized, non-absolute, non-`..`-containing relative path
+before it is joined to the backup directory for checksum verification
+(`src/restore.ts:72-91`) or to the target root for copying
+(`src/restore.ts:157-167`). A backup whose manifest has been tampered with
+(or corrupted in a way that survives JSON parsing) can therefore make
+`verifyManifestFiles()` read, hash, and report as "verified" a file outside
+the backup directory, and make `runRestore()`'s `copyRecursive()` write to a
+path outside `--root`. The manifest's own SHA-256 fields cannot catch this,
+since whoever controls `rel_path` also controls the expected hash next to
+it. Separately, `--yes` in-place restore (`src/restore.ts:149-168`) only
+*copies* what the manifest lists — it never removes anything already
+present in a non-empty target that the backup doesn't mention, including a
+restored database's own stale `-wal`/`-shm` sidecars left over from before
+the restore, or stores/blobs created in the target after the backup was
+taken. `docs/OPERATIONS.md`'s runbook and `bin/falda restore --help`'s
+usage text both describe `--yes` as a supported in-place mode without this
+caveat.
+
+*Impact:* restoring an untrusted, shared, or tampered backup is a
+path-traversal risk (arbitrary read within the restoring process's
+permissions during verification; arbitrary write during copy) — relevant
+any time a backup is transferred between environments, stored in
+shared/less-trusted storage, or handled by tooling that doesn't originate
+from `falda backup` itself. Independently, even a fully trustworthy backup
+restored `--yes` in place can leave the target in a state that is neither
+the old data nor a clean copy of the backup — stale WAL frames can be
+replayed by the next open of the "restored" database, and files unlisted in
+an older/scoped backup silently survive the restore.
+
+*Recommendation:* reject any manifest entry whose `rel_path` is empty,
+absolute, contains `..` segments, or whose resolved path (backup-side and
+target-side) does not remain strictly beneath the respective root; reject
+duplicate destination paths and symlink entries. For in-place restore,
+either remove it in favor of always staging into a fresh directory and
+atomically swapping it into place (the already-recommended and
+already-safer path), or, if retained, explicitly delete pre-existing
+database sidecar files and document precisely what "restore in place" does
+and does not purge.
+
+**18. [Medium] Scene upserts commit structural/index changes before the
+asynchronous embedding step, with no transaction spanning the whole
+operation.**
+`upsertScene()` writes the scene row and `scene_atoms` membership first
+(`syncSceneStructure()`, synchronous, `src/falda.ts:1313-1365`), then
+separately awaits `syncSceneRendering()` (`src/falda.ts:1380-1404`), which
+deletes and rewrites the FTS row immediately, then — only if the render
+hash changed — deletes the existing vector row and `await`s the embedder
+before inserting a new one. No transaction wraps `upsertScene()`'s two
+phases (contrast with finding 1's atom writer and finding 5's
+`deleteStream()`, both of which do wrap their multi-representation writes
+in one `db.transaction(...).immediate()`).
+
+*Impact:* an embedder timeout or error during `syncSceneRendering()`
+surfaces as a rejected `/scenes/upsert`/`falda_recall`-adjacent call, but
+the scene's structural row, `scene_atoms` membership, and FTS entry have
+already been committed — and, if a render-hash change triggered a
+re-embed, the *previous* vector row has already been deleted before the
+new one's embed call is awaited. A crash or transient failure at that exact
+point leaves the scene with no vector row at all until a later pass
+happens to touch it again. Distillation's own scene-narration callers tie
+into finding 2's L2/L3 retry loop for eventual repair, but a direct
+`/scenes/upsert` caller (or `falda_remember`'s scene-adjacent paths, if
+any) has no automatic repair and, meanwhile, lexical (FTS) and vector
+recall can disagree about a scene that partially failed.
+
+*Recommendation:* apply the same pattern already used for atoms (finding 1)
+and stream deletion (finding 5): compute/validate the embedding *before*
+opening a transaction, then commit the scene row, `scene_atoms`, FTS
+delete+insert, and vector delete+insert together inside one
+`db.transaction(...).immediate()`, so a failure anywhere in the sequence
+rolls back the whole upsert rather than leaving a partially-applied scene.
+
+**19. [Medium] A failed Core-deletion during L3 is swallowed, and the pass
+reports success with stale Core content left on disk.** When a pass determines no
+active scenes remain, it attempts to delete `core.md` and clear
+`core_state`; the `unlinkSync()` call is wrapped in a bare
+`try { ... } catch {}` (`src/distill/core.ts:997-999`), and `core_state` is
+cleared *unconditionally* immediately afterward regardless of whether the
+delete actually succeeded. The pass then proceeds to its normal
+finalization and, absent any other L2/L3 failure, clears the store's dirty
+flag (`src/distill/core.ts:1087`) — finding 2's mechanism for scheduling a
+retry.
+
+*Impact:* a permissions error, a transient filesystem failure, or `core.md`
+being open/locked by another process at the moment of deletion leaves the
+stale Core file physically present and still returned by recall (T3),
+while `core_state` — the record L3 uses to decide whether Core needs
+regenerating/deleting — has already been cleared as if the deletion
+succeeded. Because the dirty flag is also cleared on this path, no future
+pass will retry the deletion unless some unrelated lifecycle mutation
+happens to mark the store dirty again for an independent reason; with no
+new turns arriving, the stale Core can persist indefinitely.
+
+*Recommendation:* only clear `core_state` after `unlinkSync()` actually
+succeeds (or the file was already absent); on a genuine delete failure,
+record it the same way a narration/synthesis failure is recorded elsewhere
+in this function (mark dirty, count as an L3 failure, let the existing
+`l3Failed`/`markDirty` propagation at `src/distill/core.ts:1076-1085`
+engage the retry path) rather than silently proceeding as if nothing went
+wrong.
+
 ### Note — not a code defect, but flag for rotation
 
 `falda_tokens.json` in this checkout contains a bearer token with
@@ -795,3 +1028,17 @@ duplicated here:
    related work. *(Findings 12 and 13 landed: atomic writes + fail-loud
    registry validation for `pools.json`; semantic — not just name-set —
    schema/doc drift assertions. Finding 14, rate limiting, remains open.)*
+7. **Later-audit findings 15–19** — not yet started. Suggested order by
+   risk: **15** (worker concurrency — can corrupt in-flight distillation
+   state and defeats graceful shutdown), **16** (malformed-LLM-output data
+   loss — silent, permanent, and currently indistinguishable from normal
+   operation), **17** (restore path-traversal/stale-state — conditional on
+   restoring an untrusted or already-imperfect backup, but a real
+   filesystem-boundary defect), then **18** and **19** (scene-upsert
+   partial-commit and Core-deletion-swallow — both real but narrower-impact
+   correctness gaps with existing partial mitigations via finding 2's
+   retry loop for the distillation-triggered paths). The residual gaps
+   recorded against findings 10 (backup coherence) and 11 (MCP body cap)
+   above are caveats on already-landed work, not new implementation items,
+   but should be resolved alongside 15–19 if this area gets picked up
+   again.
