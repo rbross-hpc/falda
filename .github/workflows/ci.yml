@@ -33,6 +33,26 @@ jobs:
       - name: Test suite
         run: npm test
 
+  analysis:
+    name: optional analysis package
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+      - name: Install analysis dependencies
+        run: uv sync --project analysis --locked --all-groups
+      - name: Lint analysis package
+        run: uv run --project analysis ruff check analysis
+      - name: Type-check analysis package
+        run: uv run --project analysis mypy analysis/src analysis/tests
+      - name: Test analysis package
+        run: uv run --project analysis pytest
+
   origin-clean:
     name: origin-clean guard
     runs-on: ubuntu-latest
