@@ -35,7 +35,7 @@ import { join as pathJoin } from "node:path";
 import { mkdirSync } from "node:fs";
 import Database from "better-sqlite3";
 import { PoolManager } from "./pools.js";
-import { selectEmbedder, enforceEmbeddingLock, probeEmbedder } from "./boot.js";
+import { selectEmbedder, enforceEmbeddingLock, probeEmbedder, requirePoolRegistry } from "./boot.js";
 import { TokenStore, requireTokenFile } from "./mcp_auth.js";
 import { initQueueSchema } from "./distill/queue.js";
 import { makeLLM, type LLMFnWithModel } from "./distill/llm.js";
@@ -100,6 +100,7 @@ export async function buildRuntime(cfg: RuntimeConfig = {}): Promise<FaldaRuntim
   await probeEmbedder(embed, dim, label);
   enforceEmbeddingLock(root, dim, label);
   requireTokenFile(tokensPath, label);
+  requirePoolRegistry(root, label);
 
   const pools = new PoolManager({ root, embed, dim });
   const tokenStore = new TokenStore(tokensPath);

@@ -44,6 +44,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { MetricsSnapshot } from "./metrics.js";
 import { renderMetricsSnapshot } from "./metrics_render.js";
+import { validateRegistry } from "./pools.js";
 
 // ─── types ──────────────────────────────────────────────────────────────────
 
@@ -167,6 +168,10 @@ function listSelfStores(root: string): StoreRef[] {
 function listPoolStores(root: string): StoreRef[] {
   const regPath = path.join(root, "pools.json");
   let reg: { pools?: Record<string, unknown> };
+  // A missing/corrupt registry just yields no pool stores here (this
+  // function isn't warnings-aware) — the "layout" section's
+  // inspectLayout() is what surfaces a corrupt (as opposed to absent)
+  // pools.json as an operator-facing warning; see finding 12.
   try { reg = JSON.parse(fs.readFileSync(regPath, "utf8")); } catch { return []; }
   const names = Object.keys(reg.pools ?? {});
   return names.map((name) => {
@@ -307,7 +312,20 @@ export function inspectLayout(root: string, warnings: Warning[]): LayoutReport {
   const tokensPath = process.env.FALDA_TOKENS ?? "./falda_tokens.json";
 
   let poolCount = 0;
-  try { poolCount = Object.keys(JSON.parse(fs.readFileSync(poolsJsonPath, "utf8")).pools ?? {}).length; } catch { /* absent/malformed */ }
+  if (fs.existsSync(poolsJsonPath)) {
+    try {
+      const parsed = JSON.parse(fs.readFileSync(poolsJsonPath, "utf8"));
+      validateRegistry(parsed, poolsJsonPath);
+      poolCount = Object.keys(parsed.pools ?? {}).length;
+    } catch (e: any) {
+      // Surfaced as a warning, not silently reported as "zero pools" — a
+      // corrupt-but-present registry is a real operator-actionable
+      // condition (falda serve would refuse to boot on it — see
+      // src/boot.ts requirePoolRegistry). See
+      // docs/future/reliability-hardening.md finding 12.
+      warnings.push({ level: "warn", message: `pools.json exists but is corrupt at ${poolsJsonPath}: ${e?.message ?? e} — falda serve would refuse to start (see src/boot.ts requirePoolRegistry)` });
+    }
+  }
 
   let lock: { model?: string; dim?: number } = {};
   const lockPresent = fs.existsSync(lockPath);

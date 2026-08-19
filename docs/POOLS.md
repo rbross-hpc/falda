@@ -77,6 +77,25 @@ Proven by tests 5d–5f: a shared write is visible to other members **only**
 through the pool, never through any member's private `self` store; private atoms
 never appear in the pool.
 
+**Registry durability:** `pools.json` writes go through a temp-file +
+atomic-rename (`writeFileAtomic`, `src/pools.ts`) — a crash or interrupted
+write mid-save can never leave a truncated/partial file, since POSIX
+`rename(2)` is atomic. A `pools.json` that's present but corrupt (unreadable,
+invalid JSON, or not shaped like a registry) is a fail-loud condition, not
+silently treated as "no pools declared": every registry read
+(`getPool`/`listPools`/`resolve`/...) throws `PoolError("corrupt_registry")`
+instead, so a bad write can never itself be overwritten by a subsequent
+save. `falda serve` also validates the registry at boot
+(`requirePoolRegistry`, `src/boot.ts`) and refuses to start rather than
+silently serving with every declared pool appearing undeclared; `falda
+stats` surfaces the same condition as a warning instead of erroring. Fix a
+corrupt `pools.json` by hand or restore it from a `falda backup` snapshot
+(see `docs/OPERATIONS.md`). This does not add cross-process write locking —
+two admin requests to *different* `falda serve` processes sharing one
+`FALDA_ROOT` can still last-writer-wins on a true race; each individual
+write is all-or-nothing, but not mutually exclusive across processes. See
+`docs/future/reliability-hardening.md` finding 12.
+
 ## Recall scoping
 
 A search/query runs against **exactly one** (tenant, pool) target. There is no

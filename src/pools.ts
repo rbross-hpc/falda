@@ -49,11 +49,76 @@ interface Registry { pools: Record<string, PoolDecl>; }
 /** A pool name must be a safe single path segment. "self" is reserved. */
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 const TENANT_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
+const ACCESS_VALUES = new Set(["none", "read", "readwrite"]);
 
 export class PoolError extends Error {
-  constructor(public code: "bad_name" | "bad_tenant" | "no_such_pool" | "not_a_member" | "read_only" | "reserved" | "exists", msg: string) {
+  constructor(public code: "bad_name" | "bad_tenant" | "no_such_pool" | "not_a_member" | "read_only" | "reserved" | "exists" | "corrupt_registry", msg: string) {
     super(msg);
     this.name = "PoolError";
+  }
+}
+
+/**
+ * Structural validation of a parsed pools.json body. Deliberately stricter
+ * than "is it JSON" — a truncated write can leave syntactically valid JSON
+ * that isn't a registry (e.g. `{}`, `[]`, or a pool entry missing
+ * `members`). Throws PoolError("corrupt_registry") naming what's wrong;
+ * callers should never silently coerce a bad shape into an empty registry
+ * (docs/future/reliability-hardening.md finding 12) — doing so previously
+ * meant the very next admin write would overwrite a recoverable-but-corrupt
+ * file with `{pools:{}}`, permanently losing every declared pool's roster
+ * even though the pools' physical falda.db files were untouched.
+ */
+export function validateRegistry(raw: unknown, sourcePath: string): Registry {
+  const fail = (why: string): never => {
+    throw new PoolError("corrupt_registry", `pool registry ${JSON.stringify(sourcePath)} is corrupt: ${why}`);
+  };
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) fail("top level is not an object");
+  const pools = (raw as any).pools;
+  if (typeof pools !== "object" || pools === null || Array.isArray(pools)) fail(`"pools" is not an object`);
+  for (const [name, decl] of Object.entries(pools as Record<string, unknown>)) {
+    if (typeof decl !== "object" || decl === null || Array.isArray(decl)) fail(`pool ${JSON.stringify(name)} entry is not an object`);
+    const d = decl as any;
+    if (d.name !== name) fail(`pool ${JSON.stringify(name)} entry's "name" field (${JSON.stringify(d.name)}) does not match its key`);
+    if (typeof d.members !== "object" || d.members === null || Array.isArray(d.members)) fail(`pool ${JSON.stringify(name)} "members" is not an object`);
+    for (const [tenant, access] of Object.entries(d.members as Record<string, unknown>)) {
+      if (!ACCESS_VALUES.has(access as string)) fail(`pool ${JSON.stringify(name)} member ${JSON.stringify(tenant)} has invalid access ${JSON.stringify(access)}`);
+    }
+    if (typeof d.created_at !== "string") fail(`pool ${JSON.stringify(name)} "created_at" is not a string`);
+    if (typeof d.updated_at !== "string") fail(`pool ${JSON.stringify(name)} "updated_at" is not a string`);
+  }
+  return raw as Registry;
+}
+
+/**
+ * Write JSON to `filePath` atomically: write to a sibling temp file in the
+ * same directory (so the final rename is same-filesystem, hence atomic),
+ * fsync the temp file's contents, rename over the target (POSIX rename(2)
+ * is atomic — a concurrent reader or a crash mid-write sees either the
+ * complete old file or the complete new one, never a truncated mix), then
+ * best-effort fsync the parent directory so the rename itself is durable.
+ * Cleans up the temp file on any failure. See
+ * docs/future/reliability-hardening.md finding 12.
+ */
+export function writeFileAtomic(filePath: string, contents: string): void {
+  const dir = path.dirname(filePath);
+  const tmpPath = path.join(dir, `.${path.basename(filePath)}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`);
+  let fd: number | undefined;
+  try {
+    fd = fs.openSync(tmpPath, "w");
+    fs.writeSync(fd, contents, 0, "utf8");
+    fs.fsyncSync(fd);
+    fs.closeSync(fd);
+    fd = undefined;
+    fs.renameSync(tmpPath, filePath);
+    try {
+      const dirFd = fs.openSync(dir, "r");
+      try { fs.fsyncSync(dirFd); } finally { fs.closeSync(dirFd); }
+    } catch { /* best-effort; not all platforms support fsync on a directory fd */ }
+  } catch (e) {
+    try { if (fd !== undefined) fs.closeSync(fd); } catch { /* ignore */ }
+    try { fs.unlinkSync(tmpPath); } catch { /* ignore */ }
+    throw e;
   }
 }
 
@@ -75,13 +140,28 @@ export class PoolManager {
   }
 
   // ─── registry persistence ──────────────────────────────────────────────────
+  /**
+   * Load the registry. A missing file is a legitimate first-run state
+   * (returns an empty registry). A present-but-unreadable-or-malformed
+   * file THROWS PoolError("corrupt_registry") rather than silently
+   * returning an empty registry — see validateRegistry's doc comment and
+   * docs/future/reliability-hardening.md finding 12. This matters most on
+   * the mutating path: a corrupt read must never reach saveReg(), or the
+   * next write permanently destroys whatever was recoverable in the
+   * corrupt file.
+   */
   private loadReg(): Registry {
     if (!fs.existsSync(this.regPath)) return { pools: {} };
-    try { return JSON.parse(fs.readFileSync(this.regPath, "utf8")); }
-    catch { return { pools: {} }; }
+    let raw: string;
+    try { raw = fs.readFileSync(this.regPath, "utf8"); }
+    catch (e: any) { throw new PoolError("corrupt_registry", `pool registry ${JSON.stringify(this.regPath)} could not be read: ${e?.message ?? e}`); }
+    let parsed: unknown;
+    try { parsed = JSON.parse(raw); }
+    catch (e: any) { throw new PoolError("corrupt_registry", `pool registry ${JSON.stringify(this.regPath)} is not valid JSON: ${e?.message ?? e}`); }
+    return validateRegistry(parsed, this.regPath);
   }
   private saveReg(r: Registry) {
-    fs.writeFileSync(this.regPath, JSON.stringify(r, null, 2), "utf8");
+    writeFileAtomic(this.regPath, JSON.stringify(r, null, 2));
   }
 
   // ─── validation ─────────────────────────────────────────────────────────────
