@@ -264,7 +264,7 @@ function validateConsolidationDecision(
  * Valid action:"skip" is distinct from a parse failure and remains a
  * successful decision that advances the watermark.
  */
-function parseConsolidation(
+export function parseConsolidation(
   raw: string,
   allowedTargetIds: ReadonlySet<string>,
 ): ConsolidationDecision | undefined {
@@ -292,30 +292,65 @@ function parseConsolidation(
  *  silently discard a whole chunk without any audit trace.
  *
  *  Decisions are correlated by their stated `candidate` index, never by
- *  array position. An out-of-range, non-integer, or repeated index is
- *  dropped rather than applied: a lost decision costs one candidate, but a
- *  misattributed one writes a wrong consolidation into memory with no trace.
+ *  array position. An out-of-range or non-integer index is dropped rather
+ *  than applied: a lost decision costs one candidate, but a misattributed
+ *  one writes a wrong consolidation into memory with no trace.
+ *
+ *  A repeated in-range index is NOT known to occur with real model output
+ *  (no observed incident as of this writing) — this is defensive handling
+ *  for a plausible malformed reply, not a fix for something seen in
+ *  production. The FIRST valid decision for that index is kept; later
+ *  occurrences (valid or not) cannot override it. Failing the whole
+ *  candidate to force an individual retry would be disproportionate for an
+ *  unobserved failure mode, so `onDuplicateIndex` is called instead so the
+ *  caller can emit a non-fatal warning without changing which decision is
+ *  applied. This is reported whenever an in-range candidate index repeats,
+ *  regardless of whether either occurrence's decision is itself valid — a
+ *  batch reply that names candidate 0 twice with two malformed decisions is
+ *  just as much a contract violation as one with two valid-but-conflicting
+ *  decisions, and an operator should see it either way. `onDuplicateIndex`
+ *  is itself non-fatal to parsing: an exception from the callback is
+ *  swallowed rather than propagated, so a misbehaving observer can never
+ *  cause an otherwise-resolvable batch to fail.
  *
  *  Structural/action/cardinality/membership validation is applied by the
  *  shared validateConsolidationDecision helper; batch entries that fail it
  *  are left unresolved (individual retry), not silently converted to skip.
  *
- *  Tries to parse the payload as a JSON array first; if the array contains
- *  no accepted decisions (or is not an array), falls back to line-by-line
- *  scanning for parseable JSON objects. This ensures that a bare single-
- *  decision object with an array field does not mistake the field for the
- *  batch. */
+ *  Tries to parse the payload as a JSON array first. That array is treated
+ *  as the batch payload itself — returned as-is, including reporting any
+ *  duplicate indices, even if every element in it turns out to be invalid —
+ *  as long as at least one element declares an integer, in-range
+ *  `candidate` field. Only when NONE of its elements look candidate-shaped
+ *  (e.g. the "array" actually captured is a bare single-decision object's
+ *  own `target_ids` field, whose elements are plain strings) does parsing
+ *  fall back to line-by-line scanning for parseable JSON objects. This
+ *  distinction matters: without it, a compact batch reply where every
+ *  duplicate entry also happens to be structurally invalid would silently
+ *  fall through to the line scan and lose its duplicate-index signal. */
 export function parseConsolidationBatch(
   raw: string,
   allowedTargetIdsByCandidate: ReadonlyArray<ReadonlySet<string>>,
+  onDuplicateIndex?: (candidateIndex: number, occurrenceCount: number) => void,
 ): Array<ConsolidationDecision | undefined> {
   const n = allowedTargetIdsByCandidate.length;
   const out: Array<ConsolidationDecision | undefined> = new Array(n).fill(undefined);
+  // Counts every syntactically valid, in-range candidate index seen, even
+  // when that particular entry fails strict validation — duplication itself
+  // is what we want visibility into, independent of which occurrence (if
+  // any) turned out to be usable.
+  const seenCount: number[] = new Array(n).fill(0);
+
+  const isInRangeCandidateIndex = (obj: unknown): obj is { candidate: number } => {
+    const idx = (obj as any)?.candidate;
+    return Number.isInteger(idx) && idx >= 0 && idx < n;
+  };
 
   const accept = (obj: any): boolean => {
-    const idx = obj?.candidate;
-    if (!Number.isInteger(idx) || idx < 0 || idx >= n) return false;
-    if (out[idx] !== undefined) return false; // duplicate index: keep the first
+    if (!isInRangeCandidateIndex(obj)) return false;
+    const idx = obj.candidate;
+    seenCount[idx]++;
+    if (out[idx] !== undefined) return false; // duplicate index: keep the first valid decision
     const dec = validateConsolidationDecision(obj, allowedTargetIdsByCandidate[idx]);
     if (!dec) return false;
     out[idx] = dec;
@@ -325,15 +360,40 @@ export function parseConsolidationBatch(
   // Strip markdown code fences, mirroring parseCandidates.
   const stripped = raw.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
 
+  // Non-fatal by design: reporting a duplicate must never itself fail
+  // parsing. A throwing (or otherwise misbehaving) onDuplicateIndex must
+  // not prevent already-resolved decisions from being returned, nor block
+  // reporting of OTHER duplicated indices in the same reply.
+  const reportDuplicates = () => {
+    if (!onDuplicateIndex) return;
+    for (let i = 0; i < n; i++) {
+      if (seenCount[i] > 1) {
+        try { onDuplicateIndex(i, seenCount[i]); } catch { /* non-fatal observer */ }
+      }
+    }
+  };
+
   const arrStart = stripped.indexOf("[");
   const arrEnd = stripped.lastIndexOf("]");
   if (arrStart !== -1 && arrEnd > arrStart) {
     try {
       const arr = JSON.parse(stripped.slice(arrStart, arrEnd + 1));
       if (Array.isArray(arr)) {
-        let accepted = 0;
-        arr.forEach((item) => { if (accept(item)) accepted++; });
-        if (accepted > 0) return out;
+        // An element is "batch-shaped" if it declares an integer, in-range
+        // `candidate` field, independent of whether the rest of it
+        // validates. If ANY element is batch-shaped, this array IS the
+        // batch payload — return it as-is (reporting duplicates) rather
+        // than falling through to the line scan, even when every element
+        // turns out to be invalid. Only when NO element is batch-shaped
+        // (e.g. this "array" is actually a bare single-decision object's
+        // own target_ids field, whose elements are plain strings/numbers)
+        // does the line scan below get a chance to find the real object.
+        let batchShaped = 0;
+        arr.forEach((item) => {
+          if (isInRangeCandidateIndex(item)) batchShaped++;
+          accept(item);
+        });
+        if (batchShaped > 0) { reportDuplicates(); return out; }
       }
     } catch { /* fall through to the line scan */ }
   }
@@ -344,6 +404,7 @@ export function parseConsolidationBatch(
     if (!trimmed.startsWith("{")) continue;
     try { accept(JSON.parse(trimmed)); } catch { /* skip malformed line */ }
   }
+  reportDuplicates();
   return out;
 }
 
@@ -690,7 +751,24 @@ async function distillOncePass(
       let start = 0;
       for (const chunk of chunks) {
         const raw = await llm(consolidationBatchPrompt(chunk));
-        const parsed = parseConsolidationBatch(raw, allowedTargetIds.slice(start, start + chunk.length));
+        const chunkStart = start;
+        const parsed = parseConsolidationBatch(
+          raw,
+          allowedTargetIds.slice(start, start + chunk.length),
+          (localIdx, occurrenceCount) => {
+            // Non-fatal: duplication is not known to occur with real model
+            // output (see parseConsolidationBatch's doc comment). The first
+            // valid decision is retained and the pass continues normally —
+            // this is visibility, not a retryable failure. Always surfaced
+            // via console.warn, independent of --verbose, since it signals
+            // an LLM contract violation an operator may want to know about
+            // even outside verbose runs.
+            console.warn(
+              `[distill] pass ${pid}: candidate ${chunkStart + localIdx} appeared ` +
+                `${occurrenceCount} times in a consolidation batch reply; retained the first valid decision`,
+            );
+          },
+        );
         for (let j = 0; j < chunk.length; j++) {
           const dec = parsed[j];
           if (dec) decisions[start + j] = dec;

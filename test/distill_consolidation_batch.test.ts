@@ -17,7 +17,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { parseConsolidationBatch, distillOnce } from "../src/distill/core.js";
+import { parseConsolidationBatch, parseConsolidation, distillOnce } from "../src/distill/core.js";
 import { consolidationBatchPrompt, consolidationPrompt } from "../src/distill/prompts.js";
 import { Falda } from "../src/falda.js";
 import { makeLocalEmbedder } from "../src/embedder.js";
@@ -71,13 +71,203 @@ describe("parseConsolidationBatch", () => {
     assert.deepEqual(out, [undefined, undefined]);
   });
 
-  test("keeps the first of a duplicated index", () => {
-    const raw = JSON.stringify([
-      { candidate: 0, action: "store", target_ids: [], rationale: "first" },
-      { candidate: 0, action: "store", target_ids: [], rationale: "second" },
-    ]);
-    const out = parseConsolidationBatch(raw, [noTargets()]);
-    assert.equal(out[0]?.rationale, "first");
+  // ─── Duplicate candidate indices ────────────────────────────────────────────
+  //
+  // Not known to occur with real model output (no observed incident as of
+  // this writing) — defensive handling for a plausible malformed reply, not
+  // a fix for a real one. Behavior: keep the first VALID decision, never
+  // trigger individual-retry fallback for the duplicated candidate itself,
+  // and report every duplicated index via the optional onDuplicateIndex
+  // callback so the caller can surface a non-fatal, auditable warning.
+
+  describe("duplicate candidate indices", () => {
+    test("two valid conflicting entries: keeps the first, reports occurrence count 2", () => {
+      const raw = JSON.stringify([
+        { candidate: 0, action: "store", target_ids: [], rationale: "first" },
+        { candidate: 0, action: "store", target_ids: [], rationale: "second" },
+      ]);
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets()], (idx, count) => dups.push([idx, count]));
+      assert.equal(out[0]?.rationale, "first", "first valid decision retained");
+      assert.deepEqual(dups, [[0, 2]]);
+    });
+
+    test("valid first, structurally invalid second: first is retained, duplicate still reported", () => {
+      const raw = JSON.stringify([
+        { candidate: 0, action: "store", target_ids: [], rationale: "first" },
+        { candidate: 0, action: "obliterate", target_ids: [], rationale: "second" },
+      ]);
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets()], (idx, count) => dups.push([idx, count]));
+      assert.equal(out[0]?.rationale, "first");
+      assert.deepEqual(dups, [[0, 2]]);
+    });
+
+    test("structurally invalid first, valid second: the later valid decision is accepted", () => {
+      const raw = JSON.stringify([
+        { candidate: 0, action: "obliterate", target_ids: [], rationale: "first" },
+        { candidate: 0, action: "store", target_ids: [], rationale: "second" },
+      ]);
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets()], (idx, count) => dups.push([idx, count]));
+      assert.equal(out[0]?.action, "store");
+      assert.equal(out[0]?.rationale, "second", "no earlier valid decision existed to keep");
+      assert.deepEqual(dups, [[0, 2]]);
+    });
+
+    test("three occurrences: first valid retained, one warning reports count 3", () => {
+      const raw = JSON.stringify([
+        { candidate: 0, action: "store", target_ids: [], rationale: "first" },
+        { candidate: 0, action: "skip", target_ids: [], rationale: "second" },
+        { candidate: 0, action: "store", target_ids: [], rationale: "third" },
+      ]);
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets()], (idx, count) => dups.push([idx, count]));
+      assert.equal(out[0]?.rationale, "first");
+      assert.deepEqual(dups, [[0, 3]], "exactly one callback invocation per duplicated index");
+    });
+
+    test("duplicate candidate alongside an unrelated uniquely-indexed candidate", () => {
+      const raw = JSON.stringify([
+        { candidate: 0, action: "store", target_ids: [], rationale: "first" },
+        { candidate: 0, action: "store", target_ids: [], rationale: "second" },
+        { candidate: 1, action: "skip", target_ids: [], rationale: "unaffected" },
+      ]);
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets(), noTargets()], (idx, count) => dups.push([idx, count]));
+      assert.equal(out[0]?.rationale, "first");
+      assert.equal(out[1]?.action, "skip", "unrelated candidate is unaffected by the other's duplication");
+      assert.deepEqual(dups, [[0, 2]], "only the duplicated index is reported");
+    });
+
+    test("line-delimited duplicate entries behave like JSON-array duplicates", () => {
+      const raw = [
+        `{"candidate":0,"action":"store","target_ids":[],"rationale":"first"},`,
+        `{"candidate":0,"action":"store","target_ids":[],"rationale":"second"}`,
+      ].join("\n");
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets()], (idx, count) => dups.push([idx, count]));
+      assert.equal(out[0]?.rationale, "first");
+      assert.deepEqual(dups, [[0, 2]]);
+    });
+
+    test("out-of-range or non-integer repeated values do not produce duplicate warnings", () => {
+      const raw = JSON.stringify([
+        { candidate: 7, action: "store", target_ids: [], rationale: "a" },
+        { candidate: 7, action: "store", target_ids: [], rationale: "b" },
+        { candidate: -1, action: "store", target_ids: [], rationale: "c" },
+        { candidate: -1, action: "store", target_ids: [], rationale: "d" },
+      ]);
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets()], (idx, count) => dups.push([idx, count]));
+      assert.deepEqual(out, [undefined]);
+      assert.deepEqual(dups, [], "out-of-range indices are dropped, not counted as duplicates");
+    });
+
+    test("no callback provided: duplicate handling still keeps the first valid decision", () => {
+      const raw = JSON.stringify([
+        { candidate: 0, action: "store", target_ids: [], rationale: "first" },
+        { candidate: 0, action: "store", target_ids: [], rationale: "second" },
+      ]);
+      const out = parseConsolidationBatch(raw, [noTargets()]);
+      assert.equal(out[0]?.rationale, "first", "omitting onDuplicateIndex must not change application behavior");
+    });
+
+    test("two structurally-invalid entries for the same index still report a duplicate (compact array)", () => {
+      // Regression: duplicate reporting must not depend on whether either
+      // occurrence's decision happens to validate. A naive implementation
+      // that only counted array-parse acceptances (or that reset counts
+      // whenever the array yielded zero accepted decisions) would miss this
+      // because JSON.stringify's compact single-line output can't be
+      // "reparsed" by the line scanner (it doesn't start with one `{` per
+      // line), so the duplicate signal would silently disappear.
+      const raw = JSON.stringify([
+        { candidate: 0, action: "obliterate", target_ids: [], rationale: "a" },
+        { candidate: 0, action: "obliterate", target_ids: [], rationale: "b" },
+      ]);
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets()], (idx, count) => dups.push([idx, count]));
+      assert.equal(out[0], undefined, "neither invalid entry resolves");
+      assert.deepEqual(dups, [[0, 2]], "duplication is reported regardless of validity");
+    });
+
+    test("two structurally-invalid entries for the same index still report a duplicate (pretty-printed array)", () => {
+      const raw = JSON.stringify(
+        [
+          { candidate: 0, action: "obliterate", target_ids: [], rationale: "a" },
+          { candidate: 0, action: "obliterate", target_ids: [], rationale: "b" },
+        ],
+        null,
+        2,
+      );
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets()], (idx, count) => dups.push([idx, count]));
+      assert.equal(out[0], undefined);
+      assert.deepEqual(dups, [[0, 2]], "formatting must not change whether duplication is reported");
+    });
+
+    test("all-invalid duplicate entries via line-delimited objects still report a duplicate", () => {
+      const raw = [
+        `{"candidate":0,"action":"obliterate","target_ids":[],"rationale":"a"},`,
+        `{"candidate":0,"action":"obliterate","target_ids":[],"rationale":"b"}`,
+      ].join("\n");
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets()], (idx, count) => dups.push([idx, count]));
+      assert.equal(out[0], undefined);
+      assert.deepEqual(dups, [[0, 2]]);
+    });
+
+    test("all-invalid but uniquely-indexed entries produce no duplicate warning", () => {
+      const raw = JSON.stringify([
+        { candidate: 0, action: "obliterate", target_ids: [], rationale: "a" },
+        { candidate: 1, action: "obliterate", target_ids: [], rationale: "b" },
+      ]);
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets(), noTargets()], (idx, count) => dups.push([idx, count]));
+      assert.deepEqual(out, [undefined, undefined]);
+      assert.deepEqual(dups, [], "no duplication occurred, so nothing should be reported");
+    });
+
+    test("a bare single-decision object's own target_ids array is not mistaken for a batch (no false duplicate report)", () => {
+      // This object's only top-level array is target_ids, whose elements are
+      // plain strings — none of them are candidate-shaped, so the batch-array
+      // path must NOT treat it as the batch payload; it must fall through to
+      // the line scan and parse the object itself.
+      const raw = JSON.stringify({ candidate: 0, action: "merge", target_ids: ["a", "b"], rationale: "x" });
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [withTargets("a", "b")], (idx, count) => dups.push([idx, count]));
+      assert.equal(out[0]?.action, "merge");
+      assert.deepEqual(out[0]?.target_ids, ["a", "b"]);
+      assert.deepEqual(dups, [], "no duplication occurred");
+    });
+
+    test("a throwing onDuplicateIndex does not fail parsing and does not suppress the resolved decision", () => {
+      const raw = JSON.stringify([
+        { candidate: 0, action: "store", target_ids: [], rationale: "first" },
+        { candidate: 0, action: "store", target_ids: [], rationale: "second" },
+      ]);
+      assert.doesNotThrow(() => {
+        const out = parseConsolidationBatch(raw, [noTargets()], () => { throw new Error("observer boom"); });
+        assert.equal(out[0]?.rationale, "first", "the resolved decision must still be returned");
+      });
+    });
+
+    test("a throwing onDuplicateIndex for one index does not prevent reporting a different duplicated index", () => {
+      const raw = JSON.stringify([
+        { candidate: 0, action: "store", target_ids: [], rationale: "first" },
+        { candidate: 0, action: "store", target_ids: [], rationale: "second" },
+        { candidate: 1, action: "skip", target_ids: [], rationale: "a" },
+        { candidate: 1, action: "skip", target_ids: [], rationale: "b" },
+      ]);
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets(), noTargets()], (idx, count) => {
+        if (idx === 0) throw new Error("observer boom for candidate 0");
+        dups.push([idx, count]);
+      });
+      assert.equal(out[0]?.rationale, "first", "candidate 0 still resolves despite its observer throwing");
+      assert.equal(out[1]?.rationale, "a", "candidate 1 still resolves");
+      assert.deepEqual(dups, [[1, 2]], "candidate 1's duplication is still reported");
+    });
   });
 
   test("rejects an unknown action as unresolved", () => {
@@ -202,6 +392,147 @@ describe("parseConsolidationBatch", () => {
   });
 });
 
+// ─── parseConsolidation (single-candidate path) ─────────────────────────────
+//
+// Single and batch consolidation share one validator
+// (validateConsolidationDecision), so this suite deliberately mirrors the
+// cardinality/membership matrix above to prove both entry points enforce an
+// identical strict contract, not just the batch path exercised above.
+
+describe("parseConsolidation", () => {
+  test("store with zero targets is valid", () => {
+    const dec = parseConsolidation(
+      JSON.stringify({ action: "store", target_ids: [], rationale: "new" }),
+      noTargets(),
+    );
+    assert.equal(dec?.action, "store");
+    assert.deepEqual(dec?.target_ids, []);
+  });
+
+  test("skip with zero targets is valid", () => {
+    const dec = parseConsolidation(
+      JSON.stringify({ action: "skip", target_ids: [], rationale: "redundant" }),
+      noTargets(),
+    );
+    assert.equal(dec?.action, "skip");
+  });
+
+  test("update with exactly one allowed target is valid", () => {
+    const dec = parseConsolidation(
+      JSON.stringify({ action: "update", target_ids: ["a"], rationale: "refresh" }),
+      withTargets("a", "b"),
+    );
+    assert.equal(dec?.action, "update");
+    assert.deepEqual(dec?.target_ids, ["a"]);
+  });
+
+  test("merge with two distinct allowed targets is valid", () => {
+    const dec = parseConsolidation(
+      JSON.stringify({ action: "merge", target_ids: ["a", "b"], rationale: "unify" }),
+      withTargets("a", "b"),
+    );
+    assert.equal(dec?.action, "merge");
+    assert.deepEqual(dec?.target_ids, ["a", "b"]);
+  });
+
+  test("missing rationale normalizes to empty string", () => {
+    const dec = parseConsolidation(JSON.stringify({ action: "store", target_ids: [] }), noTargets());
+    assert.equal(dec?.rationale, "");
+  });
+
+  test("non-string rationale normalizes to empty string", () => {
+    const dec = parseConsolidation(
+      JSON.stringify({ action: "store", target_ids: [], rationale: 42 }),
+      noTargets(),
+    );
+    assert.equal(dec?.rationale, "");
+  });
+
+  test("tolerates a fenced JSON object", () => {
+    const raw = "```json\n" + JSON.stringify({ action: "store", target_ids: [], rationale: "n" }) + "\n```";
+    const dec = parseConsolidation(raw, noTargets());
+    assert.equal(dec?.action, "store");
+  });
+
+  test("tolerates a prose-wrapped JSON object", () => {
+    const raw = `Here is my decision: ${JSON.stringify({ action: "skip", target_ids: [], rationale: "r" })} — done.`;
+    const dec = parseConsolidation(raw, noTargets());
+    assert.equal(dec?.action, "skip");
+  });
+
+  test("no JSON object present is invalid", () => {
+    assert.equal(parseConsolidation("I cannot decide.", noTargets()), undefined);
+  });
+
+  test("malformed JSON is invalid", () => {
+    assert.equal(parseConsolidation("{action: store, target_ids: []", noTargets()), undefined);
+  });
+
+  test("non-object JSON is invalid", () => {
+    assert.equal(parseConsolidation(JSON.stringify(["store"]), noTargets()), undefined);
+  });
+
+  test("unknown action is invalid", () => {
+    const raw = JSON.stringify({ action: "obliterate", target_ids: [], rationale: "no" });
+    assert.equal(parseConsolidation(raw, noTargets()), undefined);
+  });
+
+  test("missing target_ids is invalid", () => {
+    const raw = JSON.stringify({ action: "store", rationale: "r" });
+    assert.equal(parseConsolidation(raw, noTargets()), undefined);
+  });
+
+  test("scalar target_ids is invalid", () => {
+    const raw = JSON.stringify({ action: "update", target_ids: "a", rationale: "r" });
+    assert.equal(parseConsolidation(raw, withTargets("a")), undefined);
+  });
+
+  test("non-string target entry is invalid (no coercion)", () => {
+    const raw = JSON.stringify({ action: "update", target_ids: [1], rationale: "r" });
+    assert.equal(parseConsolidation(raw, withTargets("1")), undefined);
+  });
+
+  test("duplicate target ids are invalid", () => {
+    const raw = JSON.stringify({ action: "merge", target_ids: ["a", "a"], rationale: "r" });
+    assert.equal(parseConsolidation(raw, withTargets("a")), undefined);
+  });
+
+  test("target not in the allowed set is invalid", () => {
+    const raw = JSON.stringify({ action: "update", target_ids: ["invented"], rationale: "r" });
+    assert.equal(parseConsolidation(raw, withTargets("a", "b")), undefined);
+  });
+
+  test("store with non-empty target_ids is invalid", () => {
+    const raw = JSON.stringify({ action: "store", target_ids: ["a"], rationale: "r" });
+    assert.equal(parseConsolidation(raw, withTargets("a")), undefined);
+  });
+
+  test("skip with non-empty target_ids is invalid", () => {
+    const raw = JSON.stringify({ action: "skip", target_ids: ["a"], rationale: "r" });
+    assert.equal(parseConsolidation(raw, withTargets("a")), undefined);
+  });
+
+  test("update with zero targets is invalid", () => {
+    const raw = JSON.stringify({ action: "update", target_ids: [], rationale: "r" });
+    assert.equal(parseConsolidation(raw, noTargets()), undefined);
+  });
+
+  test("update with two targets is invalid", () => {
+    const raw = JSON.stringify({ action: "update", target_ids: ["a", "b"], rationale: "r" });
+    assert.equal(parseConsolidation(raw, withTargets("a", "b")), undefined);
+  });
+
+  test("merge with zero targets is invalid", () => {
+    const raw = JSON.stringify({ action: "merge", target_ids: [], rationale: "r" });
+    assert.equal(parseConsolidation(raw, noTargets()), undefined);
+  });
+
+  test("merge with one target is invalid", () => {
+    const raw = JSON.stringify({ action: "merge", target_ids: ["a"], rationale: "r" });
+    assert.equal(parseConsolidation(raw, withTargets("a")), undefined);
+  });
+});
+
 describe("consolidationBatchPrompt", () => {
   const items = [
     {
@@ -321,6 +652,69 @@ describe("distillOnce: batched consolidation", () => {
       assert.ok(!consolidationPrompts[1].includes("Candidate 0"),
         "the retry used the single-candidate prompt");
     } finally { cleanup(s, blobDir); }
+  });
+
+  test("a duplicated candidate index keeps the first valid decision and warns once, without a fallback call", async () => {
+    const { s, blobDir } = makeStore();
+    const originalWarn = console.warn;
+    const warnings: string[] = [];
+    console.warn = (msg: string) => { warnings.push(String(msg)); };
+    try {
+      await s.addStream("sess-1", [{ role: "user", content: "two facts" }]);
+      const { fn, prompts } = makeRecordingLLM([
+        TWO_CANDIDATES,
+        // Candidate 0 appears twice with conflicting decisions; candidate 1
+        // is uniquely indexed. Both entries for candidate 0 are structurally
+        // valid, so the parser must keep the FIRST ("store") and ignore the
+        // second ("skip") rather than treating duplication as unresolved.
+        JSON.stringify([
+          { candidate: 0, action: "store", target_ids: [], rationale: "first" },
+          { candidate: 0, action: "skip", target_ids: [], rationale: "second" },
+          { candidate: 1, action: "store", target_ids: [], rationale: "unaffected" },
+        ]),
+        ...TAIL,
+      ]);
+      const result = await distillOnce(s, fn, { storeKey: "batch-dup:self" });
+
+      assert.equal(result.atoms_stored, 2, "both candidates stored: dup kept its first (store), other unaffected");
+      const consolidationPrompts = prompts.filter((p) =>
+        p.includes("memory consolidation assistant"));
+      assert.equal(consolidationPrompts.length, 1, "no individual fallback call for the duplicated candidate");
+
+      assert.equal(warnings.length, 1, "exactly one duplicate-index warning");
+      assert.match(warnings[0], /candidate 0/, "warning identifies the duplicated candidate's global index");
+      assert.match(warnings[0], /2 times/, "warning reports the occurrence count");
+      assert.ok(
+        !warnings[0].includes("Fact one.") && !warnings[0].includes("Fact two."),
+        "warning does not leak candidate/memory content",
+      );
+    } finally {
+      console.warn = originalWarn;
+      cleanup(s, blobDir);
+    }
+  });
+
+  test("a throwing console.warn does not fail the pass or block the resolved decision", async () => {
+    const { s, blobDir } = makeStore();
+    const originalWarn = console.warn;
+    console.warn = () => { throw new Error("warn sink is broken"); };
+    try {
+      await s.addStream("sess-1", [{ role: "user", content: "two facts" }]);
+      const { fn } = makeRecordingLLM([
+        TWO_CANDIDATES,
+        JSON.stringify([
+          { candidate: 0, action: "store", target_ids: [], rationale: "first" },
+          { candidate: 0, action: "skip", target_ids: [], rationale: "second" },
+          { candidate: 1, action: "store", target_ids: [], rationale: "unaffected" },
+        ]),
+        ...TAIL,
+      ]);
+      const result = await distillOnce(s, fn, { storeKey: "batch-dup-warn-throws:self" });
+      assert.equal(result.atoms_stored, 2, "the pass succeeds despite the warning sink throwing");
+    } finally {
+      console.warn = originalWarn;
+      cleanup(s, blobDir);
+    }
   });
 
   test("FALDA_DISTILL_CONSOLIDATION_BATCH=1 restores one call per candidate", async () => {

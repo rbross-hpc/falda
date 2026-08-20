@@ -1219,12 +1219,13 @@ export class Falda {
     input_turn_count: number;
     model?: string; prompt_version?: string; distiller_version?: string;
   }): void {
-    // INSERT OR REPLACE (upsert on primary key) so that a retry of the same
-    // deterministic pass_id refreshes the row with the latest attempt's
-    // provenance (model, prompt_version, distiller_version, started_at) and
-    // clears stale completion data. Without this, a successful retry run
-    // under a different model or prompt version would still display the
-    // original failed attempt's provenance in `falda distill inspect`.
+    // INSERT ... ON CONFLICT DO UPDATE (upsert on primary key) so that a
+    // retry of the same deterministic pass_id refreshes the row with the
+    // latest attempt's provenance (model, prompt_version, distiller_version,
+    // started_at) and clears stale completion data. Without this, a
+    // successful retry run under a different model or prompt version would
+    // still display the original failed attempt's provenance in
+    // `falda distill inspect`.
     this.db.prepare(
       `INSERT INTO distillation_passes
        (pass_id,store_key,watermark_start,watermark_end,started_at,status,

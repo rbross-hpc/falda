@@ -72,8 +72,8 @@ The model returns a JSON array, each element:
 ### Correlation by explicit index, never by order
 
 Each decision names the candidate index it belongs to. Array position is not
-trusted, and an index that is out of range or repeated is treated as
-unresolved rather than applied.
+trusted, and an out-of-range or non-integer index is treated as unresolved
+rather than applied.
 
 This is the one place in the design that chooses strictness over tolerance.
 Applying candidate 7's decision to candidate 3 instead would *write* the
@@ -81,6 +81,19 @@ wrong consolidation: an atom merged into an unrelated one, or updated with
 content that never belonged to it. That corrupts memory silently and is close
 to untraceable after the fact. A dropped decision is cheap; a misattributed
 one is not.
+
+A **repeated** in-range index is handled differently: the first valid
+decision for that index is kept, later occurrences cannot override it, and
+`onDuplicateIndex` fires once per duplicated index — regardless of whether
+either occurrence's decision is itself valid — surfaced via `console.warn`,
+independent of `--verbose`, so an operator can see the LLM violated the
+"each candidate exactly once" instruction. This is not known to have
+happened with real model output — no incident has been observed — so it is
+treated as a visibility concern rather than a correctness one, and it does
+NOT trigger the individual-retry fallback described below. Reporting is
+itself non-fatal: an exception from `onDuplicateIndex` is swallowed, never
+propagated, so a broken warning sink cannot fail an otherwise-resolvable
+batch.
 
 ### A parser that can say "unresolved"
 
@@ -211,8 +224,11 @@ instruction block. Worth doing on its own merits; it is not a cost measure.
 - the batch prompt contains every candidate in the chunk, each with its own
   retrieved neighbour set
 - decisions are applied by their stated index, not by array position
-- an out-of-range index, a duplicated index, and a missing index each mark
-  that candidate unresolved rather than misapplying a decision
+- an out-of-range index and a missing index each mark that candidate
+  unresolved rather than misapplying a decision
+- a repeated in-range index keeps the first valid decision, does not trigger
+  individual retry, and fires exactly one non-fatal duplicate warning
+  reporting the candidate index and occurrence count
 - unresolved indices trigger exactly one individual retry call each
 - a chunk boundary at exactly `BATCH` and at `BATCH + 1` candidates
 - `FALDA_DISTILL_CONSOLIDATION_BATCH=1` reproduces the current call pattern,
