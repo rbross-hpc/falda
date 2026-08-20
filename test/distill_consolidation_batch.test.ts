@@ -172,6 +172,102 @@ describe("parseConsolidationBatch", () => {
       const out = parseConsolidationBatch(raw, [noTargets()]);
       assert.equal(out[0]?.rationale, "first", "omitting onDuplicateIndex must not change application behavior");
     });
+
+    test("two structurally-invalid entries for the same index still report a duplicate (compact array)", () => {
+      // Regression: duplicate reporting must not depend on whether either
+      // occurrence's decision happens to validate. A naive implementation
+      // that only counted array-parse acceptances (or that reset counts
+      // whenever the array yielded zero accepted decisions) would miss this
+      // because JSON.stringify's compact single-line output can't be
+      // "reparsed" by the line scanner (it doesn't start with one `{` per
+      // line), so the duplicate signal would silently disappear.
+      const raw = JSON.stringify([
+        { candidate: 0, action: "obliterate", target_ids: [], rationale: "a" },
+        { candidate: 0, action: "obliterate", target_ids: [], rationale: "b" },
+      ]);
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets()], (idx, count) => dups.push([idx, count]));
+      assert.equal(out[0], undefined, "neither invalid entry resolves");
+      assert.deepEqual(dups, [[0, 2]], "duplication is reported regardless of validity");
+    });
+
+    test("two structurally-invalid entries for the same index still report a duplicate (pretty-printed array)", () => {
+      const raw = JSON.stringify(
+        [
+          { candidate: 0, action: "obliterate", target_ids: [], rationale: "a" },
+          { candidate: 0, action: "obliterate", target_ids: [], rationale: "b" },
+        ],
+        null,
+        2,
+      );
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets()], (idx, count) => dups.push([idx, count]));
+      assert.equal(out[0], undefined);
+      assert.deepEqual(dups, [[0, 2]], "formatting must not change whether duplication is reported");
+    });
+
+    test("all-invalid duplicate entries via line-delimited objects still report a duplicate", () => {
+      const raw = [
+        `{"candidate":0,"action":"obliterate","target_ids":[],"rationale":"a"},`,
+        `{"candidate":0,"action":"obliterate","target_ids":[],"rationale":"b"}`,
+      ].join("\n");
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets()], (idx, count) => dups.push([idx, count]));
+      assert.equal(out[0], undefined);
+      assert.deepEqual(dups, [[0, 2]]);
+    });
+
+    test("all-invalid but uniquely-indexed entries produce no duplicate warning", () => {
+      const raw = JSON.stringify([
+        { candidate: 0, action: "obliterate", target_ids: [], rationale: "a" },
+        { candidate: 1, action: "obliterate", target_ids: [], rationale: "b" },
+      ]);
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets(), noTargets()], (idx, count) => dups.push([idx, count]));
+      assert.deepEqual(out, [undefined, undefined]);
+      assert.deepEqual(dups, [], "no duplication occurred, so nothing should be reported");
+    });
+
+    test("a bare single-decision object's own target_ids array is not mistaken for a batch (no false duplicate report)", () => {
+      // This object's only top-level array is target_ids, whose elements are
+      // plain strings — none of them are candidate-shaped, so the batch-array
+      // path must NOT treat it as the batch payload; it must fall through to
+      // the line scan and parse the object itself.
+      const raw = JSON.stringify({ candidate: 0, action: "merge", target_ids: ["a", "b"], rationale: "x" });
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [withTargets("a", "b")], (idx, count) => dups.push([idx, count]));
+      assert.equal(out[0]?.action, "merge");
+      assert.deepEqual(out[0]?.target_ids, ["a", "b"]);
+      assert.deepEqual(dups, [], "no duplication occurred");
+    });
+
+    test("a throwing onDuplicateIndex does not fail parsing and does not suppress the resolved decision", () => {
+      const raw = JSON.stringify([
+        { candidate: 0, action: "store", target_ids: [], rationale: "first" },
+        { candidate: 0, action: "store", target_ids: [], rationale: "second" },
+      ]);
+      assert.doesNotThrow(() => {
+        const out = parseConsolidationBatch(raw, [noTargets()], () => { throw new Error("observer boom"); });
+        assert.equal(out[0]?.rationale, "first", "the resolved decision must still be returned");
+      });
+    });
+
+    test("a throwing onDuplicateIndex for one index does not prevent reporting a different duplicated index", () => {
+      const raw = JSON.stringify([
+        { candidate: 0, action: "store", target_ids: [], rationale: "first" },
+        { candidate: 0, action: "store", target_ids: [], rationale: "second" },
+        { candidate: 1, action: "skip", target_ids: [], rationale: "a" },
+        { candidate: 1, action: "skip", target_ids: [], rationale: "b" },
+      ]);
+      const dups: Array<[number, number]> = [];
+      const out = parseConsolidationBatch(raw, [noTargets(), noTargets()], (idx, count) => {
+        if (idx === 0) throw new Error("observer boom for candidate 0");
+        dups.push([idx, count]);
+      });
+      assert.equal(out[0]?.rationale, "first", "candidate 0 still resolves despite its observer throwing");
+      assert.equal(out[1]?.rationale, "a", "candidate 1 still resolves");
+      assert.deepEqual(dups, [[1, 2]], "candidate 1's duplication is still reported");
+    });
   });
 
   test("rejects an unknown action as unresolved", () => {
@@ -592,6 +688,29 @@ describe("distillOnce: batched consolidation", () => {
         !warnings[0].includes("Fact one.") && !warnings[0].includes("Fact two."),
         "warning does not leak candidate/memory content",
       );
+    } finally {
+      console.warn = originalWarn;
+      cleanup(s, blobDir);
+    }
+  });
+
+  test("a throwing console.warn does not fail the pass or block the resolved decision", async () => {
+    const { s, blobDir } = makeStore();
+    const originalWarn = console.warn;
+    console.warn = () => { throw new Error("warn sink is broken"); };
+    try {
+      await s.addStream("sess-1", [{ role: "user", content: "two facts" }]);
+      const { fn } = makeRecordingLLM([
+        TWO_CANDIDATES,
+        JSON.stringify([
+          { candidate: 0, action: "store", target_ids: [], rationale: "first" },
+          { candidate: 0, action: "skip", target_ids: [], rationale: "second" },
+          { candidate: 1, action: "store", target_ids: [], rationale: "unaffected" },
+        ]),
+        ...TAIL,
+      ]);
+      const result = await distillOnce(s, fn, { storeKey: "batch-dup-warn-throws:self" });
+      assert.equal(result.atoms_stored, 2, "the pass succeeds despite the warning sink throwing");
     } finally {
       console.warn = originalWarn;
       cleanup(s, blobDir);

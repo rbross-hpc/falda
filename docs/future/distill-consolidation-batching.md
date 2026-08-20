@@ -84,12 +84,16 @@ one is not.
 
 A **repeated** in-range index is handled differently: the first valid
 decision for that index is kept, later occurrences cannot override it, and
-`onDuplicateIndex` fires a non-fatal warning (surfaced via `console.warn`,
-independent of `--verbose`) so an operator can see the LLM violated the
+`onDuplicateIndex` fires once per duplicated index — regardless of whether
+either occurrence's decision is itself valid — surfaced via `console.warn`,
+independent of `--verbose`, so an operator can see the LLM violated the
 "each candidate exactly once" instruction. This is not known to have
 happened with real model output — no incident has been observed — so it is
 treated as a visibility concern rather than a correctness one, and it does
-NOT trigger the individual-retry fallback described below.
+NOT trigger the individual-retry fallback described below. Reporting is
+itself non-fatal: an exception from `onDuplicateIndex` is swallowed, never
+propagated, so a broken warning sink cannot fail an otherwise-resolvable
+batch.
 
 ### A parser that can say "unresolved"
 

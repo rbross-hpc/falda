@@ -303,18 +303,31 @@ export function parseConsolidation(
  *  occurrences (valid or not) cannot override it. Failing the whole
  *  candidate to force an individual retry would be disproportionate for an
  *  unobserved failure mode, so `onDuplicateIndex` is called instead so the
- *  caller can emit a non-fatal, auditable warning without changing which
- *  decision is applied.
+ *  caller can emit a non-fatal warning without changing which decision is
+ *  applied. This is reported whenever an in-range candidate index repeats,
+ *  regardless of whether either occurrence's decision is itself valid — a
+ *  batch reply that names candidate 0 twice with two malformed decisions is
+ *  just as much a contract violation as one with two valid-but-conflicting
+ *  decisions, and an operator should see it either way. `onDuplicateIndex`
+ *  is itself non-fatal to parsing: an exception from the callback is
+ *  swallowed rather than propagated, so a misbehaving observer can never
+ *  cause an otherwise-resolvable batch to fail.
  *
  *  Structural/action/cardinality/membership validation is applied by the
  *  shared validateConsolidationDecision helper; batch entries that fail it
  *  are left unresolved (individual retry), not silently converted to skip.
  *
- *  Tries to parse the payload as a JSON array first; if the array contains
- *  no accepted decisions (or is not an array), falls back to line-by-line
- *  scanning for parseable JSON objects. This ensures that a bare single-
- *  decision object with an array field does not mistake the field for the
- *  batch. */
+ *  Tries to parse the payload as a JSON array first. That array is treated
+ *  as the batch payload itself — returned as-is, including reporting any
+ *  duplicate indices, even if every element in it turns out to be invalid —
+ *  as long as at least one element declares an integer, in-range
+ *  `candidate` field. Only when NONE of its elements look candidate-shaped
+ *  (e.g. the "array" actually captured is a bare single-decision object's
+ *  own `target_ids` field, whose elements are plain strings) does parsing
+ *  fall back to line-by-line scanning for parseable JSON objects. This
+ *  distinction matters: without it, a compact batch reply where every
+ *  duplicate entry also happens to be structurally invalid would silently
+ *  fall through to the line scan and lose its duplicate-index signal. */
 export function parseConsolidationBatch(
   raw: string,
   allowedTargetIdsByCandidate: ReadonlyArray<ReadonlySet<string>>,
@@ -328,9 +341,14 @@ export function parseConsolidationBatch(
   // any) turned out to be usable.
   const seenCount: number[] = new Array(n).fill(0);
 
+  const isInRangeCandidateIndex = (obj: unknown): obj is { candidate: number } => {
+    const idx = (obj as any)?.candidate;
+    return Number.isInteger(idx) && idx >= 0 && idx < n;
+  };
+
   const accept = (obj: any): boolean => {
-    const idx = obj?.candidate;
-    if (!Number.isInteger(idx) || idx < 0 || idx >= n) return false;
+    if (!isInRangeCandidateIndex(obj)) return false;
+    const idx = obj.candidate;
     seenCount[idx]++;
     if (out[idx] !== undefined) return false; // duplicate index: keep the first valid decision
     const dec = validateConsolidationDecision(obj, allowedTargetIdsByCandidate[idx]);
@@ -342,9 +360,17 @@ export function parseConsolidationBatch(
   // Strip markdown code fences, mirroring parseCandidates.
   const stripped = raw.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
 
+  // Non-fatal by design: reporting a duplicate must never itself fail
+  // parsing. A throwing (or otherwise misbehaving) onDuplicateIndex must
+  // not prevent already-resolved decisions from being returned, nor block
+  // reporting of OTHER duplicated indices in the same reply.
   const reportDuplicates = () => {
     if (!onDuplicateIndex) return;
-    for (let i = 0; i < n; i++) if (seenCount[i] > 1) onDuplicateIndex(i, seenCount[i]);
+    for (let i = 0; i < n; i++) {
+      if (seenCount[i] > 1) {
+        try { onDuplicateIndex(i, seenCount[i]); } catch { /* non-fatal observer */ }
+      }
+    }
   };
 
   const arrStart = stripped.indexOf("[");
@@ -353,15 +379,21 @@ export function parseConsolidationBatch(
     try {
       const arr = JSON.parse(stripped.slice(arrStart, arrEnd + 1));
       if (Array.isArray(arr)) {
-        let accepted = 0;
-        arr.forEach((item) => { if (accept(item)) accepted++; });
-        if (accepted > 0) { reportDuplicates(); return out; }
-        // Nothing usable came from the array parse (every element invalid or
-        // out of range) — fall through to the line scan below. Reset the
-        // duplicate-occurrence counts first: the array attempt's tallies
-        // describe a parse path we're abandoning, and re-scanning the same
-        // text line-by-line must not double-count those same entries.
-        seenCount.fill(0);
+        // An element is "batch-shaped" if it declares an integer, in-range
+        // `candidate` field, independent of whether the rest of it
+        // validates. If ANY element is batch-shaped, this array IS the
+        // batch payload — return it as-is (reporting duplicates) rather
+        // than falling through to the line scan, even when every element
+        // turns out to be invalid. Only when NO element is batch-shaped
+        // (e.g. this "array" is actually a bare single-decision object's
+        // own target_ids field, whose elements are plain strings/numbers)
+        // does the line scan below get a chance to find the real object.
+        let batchShaped = 0;
+        arr.forEach((item) => {
+          if (isInRangeCandidateIndex(item)) batchShaped++;
+          accept(item);
+        });
+        if (batchShaped > 0) { reportDuplicates(); return out; }
       }
     } catch { /* fall through to the line scan */ }
   }
