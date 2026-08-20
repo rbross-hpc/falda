@@ -193,72 +193,130 @@ export interface ConsolidationDecision {
   rationale: string;
 }
 
+const CONSOLIDATION_ACTIONS = ["store", "update", "merge", "skip"] as const;
+
+/**
+ * Shared consolidation-decision validator used by both single and batch
+ * parsers.
+ *
+ * Enforces:
+ *   - action is a known value;
+ *   - target_ids is an array of strings (no coercion — numbers/objects are
+ *     invalid because they indicate a model that did not follow the contract);
+ *   - entries are distinct (duplicate IDs would satisfy merge's nominal "2+"
+ *     count without naming separate memories);
+ *   - every target is present in allowedTargetIds (the IDs shown in the
+ *     candidate's own prompt — prevents cross-candidate ID confusion);
+ *   - action-specific cardinality:
+ *       store / skip → exactly 0 targets
+ *       update       → exactly 1 target
+ *       merge        → at least 2 targets
+ *
+ * Returns a validated ConsolidationDecision or undefined (invalid).
+ * Never synthesizes a "skip" for invalid responses (finding 16).
+ * Rationale is tolerated as missing/non-string → "".
+ */
+function validateConsolidationDecision(
+  obj: unknown,
+  allowedTargetIds: ReadonlySet<string>,
+): ConsolidationDecision | undefined {
+  if (typeof obj !== "object" || obj === null) return undefined;
+  const o = obj as Record<string, unknown>;
+
+  const action = o.action;
+  if (!CONSOLIDATION_ACTIONS.includes(action as any)) return undefined;
+  const act = action as ConsolidationDecision["action"];
+
+  if (!Array.isArray(o.target_ids)) return undefined;
+  const ids: string[] = [];
+  for (const entry of o.target_ids) {
+    if (typeof entry !== "string") return undefined; // no coercion
+    ids.push(entry);
+  }
+
+  // Duplicate check.
+  if (new Set(ids).size !== ids.length) return undefined;
+
+  // Membership check — every target must have been shown for this candidate.
+  if (ids.some((id) => !allowedTargetIds.has(id))) return undefined;
+
+  // Action-specific cardinality.
+  if ((act === "store" || act === "skip") && ids.length !== 0) return undefined;
+  if (act === "update" && ids.length !== 1) return undefined;
+  if (act === "merge" && ids.length < 2) return undefined;
+
+  return {
+    action: act,
+    target_ids: ids,
+    rationale: typeof o.rationale === "string" ? o.rationale : "",
+  };
+}
+
 /**
  * Parse a single consolidation LLM response.
  *
  * Returns a valid ConsolidationDecision, or undefined when the response is
- * malformed. Callers must treat undefined as a retryable failure — they must
- * NOT silently convert it into a skip, which would discard a validly-extracted
- * candidate without any durable record (finding 16).
+ * malformed or fails strict validation. Callers must treat undefined as a
+ * retryable failure — they must NOT silently convert it into a skip, which
+ * would discard a validly-extracted candidate without any durable record
+ * (finding 16).
  *
- * Valid action:"skip" is distinct from a parse failure and remains a successful
- * decision that advances the watermark.
+ * Valid action:"skip" is distinct from a parse failure and remains a
+ * successful decision that advances the watermark.
  */
-function parseConsolidation(raw: string): ConsolidationDecision | undefined {
+function parseConsolidation(
+  raw: string,
+  allowedTargetIds: ReadonlySet<string>,
+): ConsolidationDecision | undefined {
   const trimmed = raw.trim();
   const jsonStart = trimmed.indexOf("{");
   const jsonEnd = trimmed.lastIndexOf("}");
   if (jsonStart === -1 || jsonEnd === -1) return undefined;
   try {
     const obj = JSON.parse(trimmed.slice(jsonStart, jsonEnd + 1));
-    const action = obj.action as string;
-    if (!["store", "update", "merge", "skip"].includes(action)) return undefined;
-    return {
-      action: action as ConsolidationDecision["action"],
-      target_ids: Array.isArray(obj.target_ids) ? obj.target_ids.map(String) : [],
-      rationale: typeof obj.rationale === "string" ? obj.rationale : "",
-    };
+    return validateConsolidationDecision(obj, allowedTargetIds);
   } catch {
     return undefined;
   }
 }
 
-const CONSOLIDATION_ACTIONS = ["store", "update", "merge", "skip"] as const;
-
 /** Parse a batched consolidation reply into one decision per candidate.
  *
- *  Returns a dense array of length `n`; `undefined` means "no usable decision
- *  for this candidate", which the caller retries individually. That gap is
- *  deliberately distinct from a parsed `action: "skip"` — `parseConsolidation`
- *  collapses malformed input into a skip, and reusing it here would make one
- *  bad reply look like N deliberate skips and silently discard a whole chunk.
+ *  Returns a dense array of length equal to allowedTargetIdsByCandidate.
+ *  `undefined` means "no usable decision for this candidate", which the
+ *  caller retries individually via decideIndividually(). That gap is
+ *  deliberately distinct from a parsed `action: "skip"` — an invalid or
+ *  missing batch entry is unresolved and gets one more attempt; only a
+ *  valid explicit skip is a successful decision.
  *
- *  Decisions are correlated by their stated `candidate` index, never by array
- *  position. An out-of-range, non-integer, or repeated index is dropped rather
- *  than applied: a lost decision costs one candidate, but a misattributed one
- *  writes a wrong consolidation into memory with no trace.
+ *  Decisions are correlated by their stated `candidate` index, never by
+ *  array position. An out-of-range, non-integer, or repeated index is
+ *  dropped rather than applied: a lost decision costs one candidate, but a
+ *  misattributed one writes a wrong consolidation into memory with no trace.
  *
- *  Tries to parse the payload as a JSON array first; if the array contains no
- *  accepted decisions (or is not an array), falls back to line-by-line scanning
- *  for parseable JSON objects. This ensures that a bare single-decision object
- *  with an array field does not mistake the field for the batch. */
+ *  Structural/action/cardinality/membership validation is applied by the
+ *  shared validateConsolidationDecision helper; batch entries that fail it
+ *  are left unresolved (individual retry), not silently converted to skip.
+ *
+ *  Tries to parse the payload as a JSON array first; if the array contains
+ *  no accepted decisions (or is not an array), falls back to line-by-line
+ *  scanning for parseable JSON objects. This ensures that a bare single-
+ *  decision object with an array field does not mistake the field for the
+ *  batch. */
 export function parseConsolidationBatch(
   raw: string,
-  n: number,
+  allowedTargetIdsByCandidate: ReadonlyArray<ReadonlySet<string>>,
 ): Array<ConsolidationDecision | undefined> {
+  const n = allowedTargetIdsByCandidate.length;
   const out: Array<ConsolidationDecision | undefined> = new Array(n).fill(undefined);
 
   const accept = (obj: any): boolean => {
     const idx = obj?.candidate;
     if (!Number.isInteger(idx) || idx < 0 || idx >= n) return false;
     if (out[idx] !== undefined) return false; // duplicate index: keep the first
-    const action = obj?.action;
-    if (!CONSOLIDATION_ACTIONS.includes(action)) return false;
-    out[idx] = {
-      action,
-      target_ids: Array.isArray(obj.target_ids) ? obj.target_ids.map(String) : [],
-      rationale: typeof obj.rationale === "string" ? obj.rationale : "",
-    };
+    const dec = validateConsolidationDecision(obj, allowedTargetIdsByCandidate[idx]);
+    if (!dec) return false;
+    out[idx] = dec;
     return true;
   };
 
@@ -563,7 +621,7 @@ async function distillOncePass(
     action: "store" | "update" | "merge" | "skip";
     candidate: CandidateAtom;
     newId: string;
-    validTargetIds: string[];
+    targetIds: string[];
     rationale: string;
     decId: string;
   }
@@ -600,13 +658,19 @@ async function distillOncePass(
     }
 
     // Phase 2: one consolidation decision per candidate, batched where possible.
+    // allowedTargetIds[i] is the set of existing-atom IDs shown to the LLM
+    // for candidate i — used by the strict validator to reject cross-candidate
+    // or invented target references.
     const batchSize = consolidationBatchSize();
     const maxChars = consolidationMaxChars();
     const decisions: ConsolidationDecision[] = new Array(retrieved.length);
+    const allowedTargetIds: ReadonlySet<string>[] = retrieved.map(
+      (r) => new Set(r.existing.map((e) => e.id)),
+    );
 
     const decideIndividually = async (i: number): Promise<void> => {
       const raw = await llm(consolidationPrompt(retrieved[i].candidate, retrieved[i].existing));
-      const dec = parseConsolidation(raw);
+      const dec = parseConsolidation(raw, allowedTargetIds[i]);
       if (dec === undefined) {
         throw new Error(`malformed consolidation response for candidate ${i}`);
       }
@@ -624,7 +688,7 @@ async function distillOncePass(
       let start = 0;
       for (const chunk of chunks) {
         const raw = await llm(consolidationBatchPrompt(chunk));
-        const parsed = parseConsolidationBatch(raw, chunk.length);
+        const parsed = parseConsolidationBatch(raw, allowedTargetIds.slice(start, start + chunk.length));
         for (let j = 0; j < chunk.length; j++) {
           const dec = parsed[j];
           if (dec) decisions[start + j] = dec;
@@ -635,26 +699,16 @@ async function distillOncePass(
     }
 
     // Phase 3: turn decisions into write ops.
+    // Decisions have already passed strict validation (action, target type,
+    // cardinality, and candidate-local membership), so no filtering or action
+    // rewriting is needed here.
     for (let i = 0; i < retrieved.length; i++) {
       const candidate = retrieved[i].candidate;
-      const existing = retrieved[i].existing;
       const dec = decisions[i];
-      // Normalize to stable first-occurrence uniqueness — the LLM can repeat
-      // an id in target_ids, which would otherwise cause duplicate lifecycle
-      // writes below.
-      const validTargetIds = [...new Set(
-        dec.target_ids.filter((id) => existing.some((e) => e.id === id)),
-      )];
       const newId = atomIdFromContent(candidate.type, candidate.content);
       const decId = `${pid}-dec-${i}`;
 
-      const action =
-        (dec.action === "store" || (validTargetIds.length === 0 && dec.action !== "skip")) ? "store"
-        : dec.action === "update" && validTargetIds.length === 1 ? "update"
-        : dec.action === "merge" && validTargetIds.length >= 1 ? "merge"
-        : "skip";
-
-      writeOps.push({ action, candidate, newId, validTargetIds, rationale: dec.rationale, decId });
+      writeOps.push({ action: dec.action, candidate, newId, targetIds: dec.target_ids, rationale: dec.rationale, decId });
     }
   } // end: turns.length > 0 (extraction/consolidation skipped for a dirty-only pass)
 
@@ -724,7 +778,7 @@ async function distillOncePass(
         });
 
       } else if (op.action === "update") {
-        const oldId = op.validTargetIds[0];
+        const oldId = op.targetIds[0];
         if (preparedAtoms.has(op.newId)) {
           // Inherited evidence is read here, inside the transaction, so it
           // reflects the current committed state rather than a snapshot
@@ -748,7 +802,7 @@ async function distillOncePass(
       } else if (op.action === "merge") {
         if (preparedAtoms.has(op.newId)) {
           const inherited = new Set<string>();
-          for (const tid of op.validTargetIds) {
+          for (const tid of op.targetIds) {
             store.evidenceForAtom(tid).forEach((e) => inherited.add(e.stream_id));
           }
           for (const sid of streamIds) inherited.add(sid);
@@ -758,14 +812,14 @@ async function distillOncePass(
           // (e.g. when recall surfaces the deterministic id itself as a
           // candidate target), and mergeAtoms() would otherwise mark that
           // winner 'merged' too.
-          const lifecycleLosers = op.validTargetIds.filter((id) => id !== op.newId);
+          const lifecycleLosers = op.targetIds.filter((id) => id !== op.newId);
           if (lifecycleLosers.length > 0) {
             store.mergeAtoms(lifecycleLosers, op.newId);
             txAtomsMerged++;
           }
         }
         store.recordDecision({
-          id: op.decId, pass_id: pid, action: "merge", atom_id: op.newId, target_ids: op.validTargetIds, rationale: op.rationale,
+          id: op.decId, pass_id: pid, action: "merge", atom_id: op.newId, target_ids: op.targetIds, rationale: op.rationale,
           candidate_type: op.candidate.type, candidate_content: op.candidate.content,
           candidate_confidence: op.candidate.confidence,
         });

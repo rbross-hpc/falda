@@ -17,7 +17,7 @@ export type DistillConfidence = typeof VALID_CONFIDENCE[number];
  * inspect` can attribute a decision to the prompt policy that produced it,
  * independent of the LLM model used.
  */
-export const PROMPT_VERSION = "distill-prompts-v2";
+export const PROMPT_VERSION = "distill-prompts-v3";
 
 /** L1 extraction: extract candidate atoms from a window of turns. */
 export function extractionPrompt(turns: Array<{ role: string; content: string }>): string {
@@ -61,15 +61,15 @@ ${existingList || "  (none)"}
 
 Output exactly one JSON object with:
   action: "store" | "update" | "merge" | "skip"
-  target_ids: array of existing memory ids affected (empty for store/skip)
+  target_ids: array of existing memory ids affected
   rationale: one sentence explaining the decision
 
 Rules:
-- "store": candidate is new knowledge not covered by any existing memory.
-- "update": candidate refreshes or corrects one existing memory (provide that id in target_ids).
-- "merge": candidate unifies 2+ existing memories into one (provide all ids in target_ids).
-- "skip": candidate is redundant, transient, or low-value.
-- Only list ids from the provided existing memories.
+- "store": candidate is new knowledge not covered by any existing memory. target_ids must be exactly [].
+- "update": candidate refreshes or corrects exactly one existing memory. target_ids must contain exactly that one id.
+- "merge": candidate unifies 2 or more existing memories into one. target_ids must contain at least 2 distinct ids.
+- "skip": candidate is redundant, transient, or low-value. target_ids must be exactly [].
+- Only use ids from the provided existing memories above. Do not invent ids.
 
 Output ONLY the JSON object, no other text.`;
 }
@@ -156,15 +156,15 @@ ${blocks}
 Output a JSON array with exactly one object per candidate, each with:
   candidate: the candidate's number as given above
   action: "store" | "update" | "merge" | "skip"
-  target_ids: array of existing memory ids affected (empty for store/skip)
+  target_ids: array of existing memory ids affected
   rationale: one sentence explaining the decision
 
 Rules:
-- "store": candidate is new knowledge not covered by any existing memory.
-- "update": candidate refreshes or corrects one existing memory (provide that id in target_ids).
-- "merge": candidate unifies 2+ existing memories into one (provide all ids in target_ids).
-- "skip": candidate is redundant, transient, or low-value.
-- Only list ids from that candidate's own existing memories.
+- "store": candidate is new knowledge not covered by any existing memory. target_ids must be exactly [].
+- "update": candidate refreshes or corrects exactly one existing memory. target_ids must contain exactly that one id.
+- "merge": candidate unifies 2 or more existing memories into one. target_ids must contain at least 2 distinct ids.
+- "skip": candidate is redundant, transient, or low-value. target_ids must be exactly [].
+- Only use ids from that candidate's own existing memories listed above. Do not invent ids.
 - Decide each candidate independently. Include every candidate exactly once.
 
 Output ONLY the JSON array, no other text.`;
