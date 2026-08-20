@@ -83,17 +83,40 @@ to untraceable after the fact. A dropped decision is cheap; a misattributed
 one is not.
 
 A **repeated** in-range index is handled differently: the first valid
-decision for that index is kept, later occurrences cannot override it, and
-`onDuplicateIndex` fires once per duplicated index — regardless of whether
-either occurrence's decision is itself valid — surfaced via `console.warn`,
-independent of `--verbose`, so an operator can see the LLM violated the
-"each candidate exactly once" instruction. This is not known to have
-happened with real model output — no incident has been observed — so it is
-treated as a visibility concern rather than a correctness one, and it does
-NOT trigger the individual-retry fallback described below. Reporting is
-itself non-fatal: an exception from `onDuplicateIndex` is swallowed, never
-propagated, so a broken warning sink cannot fail an otherwise-resolvable
-batch.
+decision for that index is kept — an earlier invalid occurrence does not
+block a later valid one, but once a valid decision has filled that index,
+no later occurrence (valid or not) can override it — and `onDuplicateIndex`
+fires once per duplicated index — regardless of whether either occurrence's
+decision is itself valid — surfaced via `console.warn`, independent of
+`--verbose`, so an operator can see the LLM violated the "each candidate
+exactly once" instruction. This is not known to have happened with real
+model output — no incident has been observed — so it is treated as a
+visibility concern rather than a correctness one. A duplicate with at least
+one valid occurrence does NOT trigger the individual-retry fallback
+described below; a duplicate where every occurrence is invalid leaves that
+index unresolved and DOES follow the ordinary individual-retry fallback,
+the same as any other unresolved index. Reporting is itself non-fatal: an
+exception from `onDuplicateIndex` is swallowed, never propagated, so a
+broken warning sink cannot fail an otherwise-resolvable batch.
+
+#### Not the same as a shared consolidation target
+
+A duplicate index means multiple result objects claim to decide the *same
+numbered candidate*. It is a different condition from two *different*,
+correctly indexed candidates independently naming the *same existing atom*
+in `target_ids` — e.g. candidate 0 and candidate 1 both deciding to
+`update` the same target. That shape passes parser validation cleanly (each
+result has a unique, in-range index and valid candidate-local membership);
+`parseConsolidationBatch` has no visibility into it and does not warn about
+it. It is instead detected and repaired one layer up, in
+`distillOncePass`, after decisions are assembled and before any winner
+embedding: candidates are walked in order, the earliest candidate to name a
+target keeps it, and a later candidate naming an already-consumed target is
+individually replanned against its own retrieved neighbours with consumed
+targets removed. See docs/MODEL.md §8.2 for the full rationale (in
+particular why this cannot be left to the transaction-time stale-target
+check alone: that check only rolls back and retries, and a deterministic
+model reproduces the same conflicting plan every retry).
 
 ### A parser that can say "unresolved"
 
@@ -229,6 +252,14 @@ instruction block. Worth doing on its own merits; it is not a cost measure.
 - a repeated in-range index keeps the first valid decision, does not trigger
   individual retry, and fires exactly one non-fatal duplicate warning
   reporting the candidate index and occurrence count
+- a repeated in-range index where every occurrence is invalid leaves that
+  candidate unresolved and falls back to individual retry, same as any
+  other unresolved index
+- two different, correctly indexed candidates that independently name the
+  same existing target are reconciled by candidate order — the earlier
+  candidate keeps the target, the later one is individually replanned
+  against its remaining unclaimed targets, and one non-fatal warning is
+  fired naming the reclaimed candidate and target ids (docs/MODEL.md §8.2)
 - unresolved indices trigger exactly one individual retry call each
 - a chunk boundary at exactly `BATCH` and at `BATCH + 1` candidates
 - `FALDA_DISTILL_CONSOLIDATION_BATCH=1` reproduces the current call pattern,

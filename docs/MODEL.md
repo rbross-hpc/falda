@@ -887,15 +887,58 @@ The candidate that was extracted — not only the action taken on it — is
 recorded on that same row (§5.5), so a rejected (`skip`) candidate
 remains inspectable after the pass.
 
-**Prompt-time membership is necessary but not sufficient — application-time
-target eligibility is also required.** Candidate-local membership (above)
-proves only that a target id was shown to the model for this candidate at
-retrieval time. Retrieval, the consolidation LLM call, and winner-embedding
-preparation are all asynchronous and happen before the L1 transaction opens
-(§8.5); a target that was active then can be archived, superseded, merged,
-or hard-deleted by a concurrent request before the transaction actually
-applies the decision — or consumed by an earlier `update`/`merge` operation
-within the same pass, since multiple candidates may name the same target.
+**A batch or individual reply can itself be malformed in ways strict
+per-candidate validation cannot catch, because they only become visible
+across candidates.** Two are handled explicitly:
+
+- **Duplicate batch result index.** A batched consolidation reply may name
+  the same `candidate` index more than once, even though the prompt asks
+  for exactly one result per candidate. The first occurrence that passes
+  full decision validation for that index is kept; an earlier invalid
+  occurrence does not block a later valid one, but once an index has a
+  valid decision, no later occurrence — valid or not — can replace it.
+  Each duplicated index (any repeat, regardless of either occurrence's
+  validity) produces one non-fatal warning naming the pass, the candidate
+  index, and the occurrence count, but never candidate content; a failure
+  in the warning sink itself is swallowed and never affects parsing or the
+  pass's success. Duplication with a valid winner does **not** trigger
+  individual-retry fallback; only an index left with no valid occurrence
+  is unresolved and follows the ordinary individual-retry path (§8.2
+  above). This has not been observed with real model output — it is
+  defensive handling for a plausible malformed reply, not a fix for a
+  production incident (docs/future/distill-consolidation-batching.md).
+
+- **Shared consolidation target across different candidates.** This is a
+  different condition from a duplicate index: two *distinct*, correctly
+  indexed candidates can each independently and validly name the same
+  existing atom in `target_ids` (e.g. candidate 0 and candidate 1 both
+  decide to `update` the same atom). Candidate-local membership validation
+  cannot see this, because it only checks that a target was shown to *that*
+  candidate. Applying both operations naively would make the second
+  operation's target stale mid-pass — and unlike a genuine external race,
+  nothing about the input or the model's tendencies changes between
+  attempts, so a stable model reproduces the identical conflicting plan
+  every retry and the job would eventually dead-letter without ever making
+  progress. FALDA resolves this **before** any winner embedding or L1
+  write: candidates are walked in order, the earliest candidate to name a
+  target keeps it, and any later candidate naming an already-consumed
+  target is individually re-decided — via the same single-candidate
+  consolidation path used for unresolved batch entries — against that
+  candidate's own retrieved neighbours with every already-claimed target
+  removed, so the replanned decision can only land on a target nothing
+  earlier in this pass has claimed. A malformed replanning reply fails the
+  pass retryably, the same as any other malformed decision. Each
+  replanned candidate produces one non-fatal warning naming the pass, the
+  candidate index, and the reclaimed target ids, but never candidate
+  content.
+
+**Prompt-time and pass-local validity are still not sufficient —
+application-time target eligibility is also required.** Retrieval, the
+consolidation LLM call, and winner-embedding preparation are all
+asynchronous and happen before the L1 transaction opens (§8.5); a target
+that was active and unclaimed by the time the plan above was finalized can
+still be archived, superseded, merged, or hard-deleted by a **concurrent
+foreground request** before the transaction actually applies the decision.
 To close this gap, every `update`/`merge` target is revalidated **inside**
 the L1 `BEGIN IMMEDIATE` transaction, immediately before it is applied: the
 target must still exist and still have `status='active'`. A target that is
@@ -906,8 +949,13 @@ decisions — everything, including any earlier operation in the same pass
 that had already applied), and the watermark does not advance. As with any
 other invalid decision, a stale target is never silently downgraded to
 `store`/`skip`, and a `merge` is never partially applied with fewer targets
-than the model named. The next attempt re-runs the identical input window
-against then-current state.
+than the model named. Unlike the shared-target case above, this really is
+retryable: the next attempt re-runs the identical input window against
+then-current state, and the external actor's change (not this pass) is
+what makes that state different. This transaction-time check remains in
+place even after the shared-target reconciliation above — it is the only
+defense against a genuinely external race, and remains a backstop against
+any pass-local plan the reconciliation step failed to fully resolve.
 
 ### 8.3 L2 — organize into scenes
 

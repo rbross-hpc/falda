@@ -636,23 +636,34 @@ describe("Finding: consolidation target eligibility (TOCTOU)", () => {
     } finally { cleanup(s, blobDir); }
   });
 
-  test("two candidates in one pass target the same atom: second operation detects the first made it stale, whole transaction rolls back", async () => {
+  test("two candidates in one pass target the same atom: second candidate is replanned onto a different target, pass succeeds", async () => {
     const emb = makeControllableEmbedder(32);
     const { s, blobDir } = makeStore(emb.embed);
     try {
       const sharedContent = "The sensor calibrates at 4.1K.";
       const sharedId = atomIdFromContent("fact", sharedContent);
       await s.upsertAtom({ id: sharedId, type: "fact", content: sharedContent });
+      const otherContent = "The sensor calibrates at 4.1K, unit B.";
+      const otherId = atomIdFromContent("fact", otherContent);
+      await s.upsertAtom({ id: otherId, type: "fact", content: otherContent });
 
       await s.addStream("sess-1", [{ role: "user", content: "two independent confirmations of the sensor reading" }]);
 
       // Two DIFFERENT extracted candidates both decide to update the SAME
       // existing target — no timing or external mutation needed, this is a
-      // deterministic intra-pass conflict.
+      // deterministic intra-pass conflict, NOT a stale-target race: nothing
+      // external changes between attempts, so a naive retry would reproduce
+      // the identical plan forever. FALDA reconciles it before any write:
+      // candidate 0 keeps sharedId, and candidate 1 is individually
+      // replanned with sharedId excluded from its allowed targets.
       const candidateA = "Sensor calibration confirmed by team A.";
       const candidateB = "Sensor calibration confirmed by team B.";
       const idA = atomIdFromContent("fact", candidateA);
       const idB = atomIdFromContent("fact", candidateB);
+
+      const originalWarn = console.warn;
+      const warnings: string[] = [];
+      console.warn = (msg: string) => { warnings.push(String(msg)); };
 
       const llm = makeMockLLM([
         [
@@ -664,27 +675,494 @@ describe("Finding: consolidation target eligibility (TOCTOU)", () => {
           { candidate: 0, action: "update", target_ids: [sharedId], rationale: "Team A confirms." },
           { candidate: 1, action: "update", target_ids: [sharedId], rationale: "Team B confirms." },
         ]),
+        // Replan call for candidate 1, retried through the single-candidate
+        // path with sharedId excluded — it picks the other active target.
+        `{"action":"update","target_ids":["${otherId}"],"rationale":"Team B confirms unit B."}`,
+        "Sensor session", "Sensor reading reconfirmed.",
+        "Sensor topic", "Sensor calibration facts.",
+        "# Core\n\nSensor calibration confirmed.",
       ]);
 
-      await assert.rejects(
-        () => distillOnce(s, llm, { storeKey: "target-race-intra-pass:self" }),
-        /no longer eligible/,
-      );
+      let result: Awaited<ReturnType<typeof distillOnce>>;
+      try {
+        result = await distillOnce(s, llm, { storeKey: "target-race-intra-pass:self" });
+      } finally {
+        console.warn = originalWarn;
+      }
+
+      assert.equal(result.atoms_updated, 2, "both updates applied, against different targets");
 
       const db = (s as any).db as Database.Database;
       const sharedRow = db.prepare("SELECT status FROM atoms WHERE id=?").get(sharedId) as any;
-      assert.equal(sharedRow.status, "active", "original target remains active — first operation's effect rolled back too");
+      assert.equal(sharedRow.status, "superseded", "first candidate's target is superseded by candidate 0's winner");
+      const otherRow = db.prepare("SELECT status FROM atoms WHERE id=?").get(otherId) as any;
+      assert.equal(otherRow.status, "superseded", "replanned candidate's target is superseded by candidate 1's winner");
 
-      assert.equal(counts(db, idA).atoms, 0, "neither winner survives");
-      assert.equal(counts(db, idB).atoms, 0, "neither winner survives");
+      assert.equal(counts(db, idA).atoms, 1, "candidate 0's winner survives");
+      assert.equal(counts(db, idB).atoms, 1, "candidate 1's winner survives");
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM consolidation_decisions").get() as any).c, 2,
+        "both decisions recorded",
+      );
+      assert.ok(
+        (db.prepare("SELECT COUNT(*) c FROM distill_watermark").get() as any).c > 0,
+        "watermark advanced",
+      );
+
+      assert.equal(warnings.length, 1, "exactly one reconciliation warning");
+      assert.match(warnings[0], /candidate 1/, "warning identifies the replanned candidate");
+      assert.match(warnings[0], new RegExp(sharedId), "warning names the reclaimed target");
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("replanned candidate has no remaining eligible target: falls back to store", async () => {
+    const emb = makeControllableEmbedder(32);
+    const { s, blobDir } = makeStore(emb.embed);
+    try {
+      const sharedContent = "The sensor calibrates at 4.1K.";
+      const sharedId = atomIdFromContent("fact", sharedContent);
+      await s.upsertAtom({ id: sharedId, type: "fact", content: sharedContent });
+
+      await s.addStream("sess-1", [{ role: "user", content: "two independent confirmations of the sensor reading" }]);
+
+      const candidateA = "Sensor calibration confirmed by team A.";
+      const candidateB = "Sensor calibration confirmed by team B.";
+      const idA = atomIdFromContent("fact", candidateA);
+      const idB = atomIdFromContent("fact", candidateB);
+
+      const llm = makeMockLLM([
+        [
+          `{"type":"fact","content":"${candidateA}","confidence":"high"}`,
+          `{"type":"fact","content":"${candidateB}","confidence":"high"}`,
+        ].join("\n"),
+        JSON.stringify([
+          { candidate: 0, action: "update", target_ids: [sharedId], rationale: "Team A confirms." },
+          { candidate: 1, action: "update", target_ids: [sharedId], rationale: "Team B confirms." },
+        ]),
+        // Only eligible target was sharedId, now excluded; the LLM correctly
+        // falls back to "store" for the replanned candidate.
+        `{"action":"store","target_ids":[],"rationale":"No eligible target remains."}`,
+        "Sensor session", "Sensor reading reconfirmed.",
+        "Sensor topic", "Sensor calibration facts.",
+        "# Core\n\nSensor calibration confirmed.",
+      ]);
+
+      const result = await distillOnce(s, llm, { storeKey: "target-race-replan-store:self" });
+
+      assert.equal(result.atoms_updated, 1, "candidate 0's update applied");
+      assert.equal(result.atoms_stored, 1, "replanned candidate stored instead");
+
+      const db = (s as any).db as Database.Database;
+      assert.equal(counts(db, idA).atoms, 1, "candidate 0's winner survives");
+      assert.equal(counts(db, idB).atoms, 1, "candidate 1's winner (stored) survives");
+      assert.ok(
+        (db.prepare("SELECT COUNT(*) c FROM distill_watermark").get() as any).c > 0,
+        "watermark advanced",
+      );
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("update then overlapping merge on the same target: merge is replanned to exclude the consumed target", async () => {
+    const emb = makeControllableEmbedder(32);
+    const { s, blobDir } = makeStore(emb.embed);
+    try {
+      const sharedContent = "Fact shared by update and merge.";
+      const sharedId = atomIdFromContent("fact", sharedContent);
+      await s.upsertAtom({ id: sharedId, type: "fact", content: sharedContent });
+      const otherContent = "Another fact for the merge.";
+      const otherId = atomIdFromContent("fact", otherContent);
+      await s.upsertAtom({ id: otherId, type: "fact", content: otherContent });
+
+      await s.addStream("sess-1", [{ role: "user", content: "update and merge both reference the shared fact" }]);
+
+      const candidateA = "Refreshed shared fact.";
+      const candidateB = "Unified fact from shared and other.";
+      const idA = atomIdFromContent("fact", candidateA);
+      const idB = atomIdFromContent("fact", candidateB);
+
+      const llm = makeMockLLM([
+        [
+          `{"type":"fact","content":"${candidateA}","confidence":"high"}`,
+          `{"type":"fact","content":"${candidateB}","confidence":"high"}`,
+        ].join("\n"),
+        JSON.stringify([
+          { candidate: 0, action: "update", target_ids: [sharedId], rationale: "Refresh shared fact." },
+          { candidate: 1, action: "merge", target_ids: [sharedId, otherId], rationale: "Unify shared and other." },
+        ]),
+        // Replanned merge: sharedId excluded, only otherId remains — but
+        // merge requires 2+ targets, so the model must fall back to update.
+        `{"action":"update","target_ids":["${otherId}"],"rationale":"Only one eligible target remains."}`,
+        "Session", "Summary.", "Topic", "Topic summary.", "# Core\n\nFacts unified.",
+      ]);
+
+      const result = await distillOnce(s, llm, { storeKey: "target-race-update-merge:self" });
+
+      assert.equal(result.atoms_updated, 2, "candidate 0's update and candidate 1's replanned update both applied");
+
+      const db = (s as any).db as Database.Database;
+      const sharedRow = db.prepare("SELECT status FROM atoms WHERE id=?").get(sharedId) as any;
+      assert.equal(sharedRow.status, "superseded", "shared target superseded by candidate 0 only");
+      const otherRow = db.prepare("SELECT status FROM atoms WHERE id=?").get(otherId) as any;
+      assert.equal(otherRow.status, "superseded", "other target superseded by candidate 1's replanned update");
+
+      assert.equal(counts(db, idA).atoms, 1, "candidate 0's winner survives");
+      assert.equal(counts(db, idB).atoms, 1, "candidate 1's winner survives");
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("two merges overlapping on one target: second merge is replanned without the consumed target", async () => {
+    const emb = makeControllableEmbedder(32);
+    const { s, blobDir } = makeStore(emb.embed);
+    try {
+      const sharedContent = "Shared fact for both merges.";
+      const sharedId = atomIdFromContent("fact", sharedContent);
+      await s.upsertAtom({ id: sharedId, type: "fact", content: sharedContent });
+      const otherContentX = "Other fact X.";
+      const otherIdX = atomIdFromContent("fact", otherContentX);
+      await s.upsertAtom({ id: otherIdX, type: "fact", content: otherContentX });
+      const otherContentY = "Other fact Y.";
+      const otherIdY = atomIdFromContent("fact", otherContentY);
+      await s.upsertAtom({ id: otherIdY, type: "fact", content: otherContentY });
+
+      await s.addStream("sess-1", [{ role: "user", content: "two merges both reference the shared fact" }]);
+
+      const candidateA = "Merge of shared and X.";
+      const candidateB = "Merge of shared and Y.";
+      const idA = atomIdFromContent("fact", candidateA);
+      const idB = atomIdFromContent("fact", candidateB);
+
+      const llm = makeMockLLM([
+        [
+          `{"type":"fact","content":"${candidateA}","confidence":"high"}`,
+          `{"type":"fact","content":"${candidateB}","confidence":"high"}`,
+        ].join("\n"),
+        JSON.stringify([
+          { candidate: 0, action: "merge", target_ids: [sharedId, otherIdX], rationale: "Merge shared+X." },
+          { candidate: 1, action: "merge", target_ids: [sharedId, otherIdY], rationale: "Merge shared+Y." },
+        ]),
+        // Replanned merge for candidate 1: sharedId excluded, otherIdY still
+        // eligible but that alone is only 1 target, so the model updates
+        // instead (matching the update/merge cardinality rule).
+        `{"action":"update","target_ids":["${otherIdY}"],"rationale":"Only one eligible target remains."}`,
+        "Session", "Summary.", "Topic", "Topic summary.", "# Core\n\nFacts merged.",
+      ]);
+
+      const result = await distillOnce(s, llm, { storeKey: "target-race-merge-merge:self" });
+
+      const db = (s as any).db as Database.Database;
+      const sharedRow = db.prepare("SELECT status FROM atoms WHERE id=?").get(sharedId) as any;
+      assert.equal(sharedRow.status, "merged", "shared target merged by candidate 0 only");
+      const rowX = db.prepare("SELECT status FROM atoms WHERE id=?").get(otherIdX) as any;
+      assert.equal(rowX.status, "merged", "X merged by candidate 0");
+      const rowY = db.prepare("SELECT status FROM atoms WHERE id=?").get(otherIdY) as any;
+      assert.equal(rowY.status, "superseded", "Y superseded by candidate 1's replanned update, not left active");
+
+      assert.equal(counts(db, idA).atoms, 1, "candidate 0's winner survives");
+      assert.equal(counts(db, idB).atoms, 1, "candidate 1's winner survives");
+      assert.equal(result.atoms_merged, 1, "one merge applied");
+      assert.equal(result.atoms_updated, 1, "one update applied (the replanned candidate)");
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("update-to-self does not reserve its own target for a later candidate", async () => {
+    const emb = makeControllableEmbedder(32);
+    const { s, blobDir } = makeStore(emb.embed);
+    try {
+      const content = "The sensor calibrates at 4.2K.";
+      const id = atomIdFromContent("fact", content);
+      await s.upsertAtom({ id, type: "fact", content });
+      const otherContent = "A different fact.";
+      const otherId = atomIdFromContent("fact", otherContent);
+      await s.upsertAtom({ id: otherId, type: "fact", content: otherContent });
+
+      await s.addStream("sess-1", [{ role: "user", content: "reconfirm sensor and reference the other fact" }]);
+
+      // Candidate 0 is an "update-to-self" (newId === targetId, no lifecycle
+      // change) — it must NOT be treated as consuming `id`, since nothing
+      // about `id`'s eligibility actually changes.
+      const candidateB = "Reference to the other fact plus sensor.";
+      const idB = atomIdFromContent("fact", candidateB);
+
+      const llm = makeMockLLM([
+        [
+          `{"type":"fact","content":"${content}","confidence":"high"}`,
+          `{"type":"fact","content":"${candidateB}","confidence":"high"}`,
+        ].join("\n"),
+        JSON.stringify([
+          { candidate: 0, action: "update", target_ids: [id], rationale: "Reconfirms existing fact (update-to-self)." },
+          { candidate: 1, action: "update", target_ids: [otherId], rationale: "Refresh other fact." },
+        ]),
+        "Session", "Summary.", "Topic", "Topic summary.", "# Core\n\nFacts confirmed.",
+      ]);
+
+      const result = await distillOnce(s, llm, { storeKey: "target-race-update-self-noconflict:self" });
+
+      // No replan call was queued for candidate 1 — if update-to-self wrongly
+      // reserved `id`, this would be irrelevant anyway since candidate 1
+      // names otherId, not id. This test's real subject is the negative:
+      // no reconciliation warning fires, proving `id` was never treated as
+      // consumed by candidate 0.
+      assert.equal(result.atoms_updated, 1, "candidate 1's update to otherId applied");
+      const db = (s as any).db as Database.Database;
+      assert.equal(
+        (db.prepare("SELECT status FROM atoms WHERE id=?").get(id) as any).status, "active",
+        "update-to-self target remains active, not superseded",
+      );
+      assert.equal(counts(db, idB).atoms, 1, "candidate 1's winner survives");
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("merge winner named among its own targets is not treated as consumed", async () => {
+    const emb = makeControllableEmbedder(32);
+    const { s, blobDir } = makeStore(emb.embed);
+    try {
+      const winnerContent = "Facts A and B describe the same durable configuration.";
+      const winnerId = atomIdFromContent("fact", winnerContent);
+      // Pre-create the winner under its own deterministic id — recall must
+      // be able to surface it as a candidate target for the LLM to name it
+      // in target_ids (mirroring merge-self exclusion above), and it must
+      // remain a valid "unclaimed" candidate for the second candidate too.
+      await s.upsertAtom({ id: winnerId, type: "fact", content: winnerContent });
+      const loserContent = "Fact to be absorbed.";
+      const loserId = atomIdFromContent("fact", loserContent);
+      await s.upsertAtom({ id: loserId, type: "fact", content: loserContent });
+
+      await s.addStream("sess-1", [{ role: "user", content: "merge candidate and reference winner id again" }]);
+
+      const secondContent = "A second candidate that also wants the winner id.";
+      const secondId = atomIdFromContent("fact", secondContent);
+
+      const llm = makeMockLLM([
+        [
+          `{"type":"fact","content":"${winnerContent}","confidence":"high"}`,
+          `{"type":"fact","content":"${secondContent}","confidence":"high"}`,
+        ].join("\n"),
+        JSON.stringify([
+          // Candidate 0's merge names its own newId (winnerId) among its
+          // targets, alongside loserId — a real, if unusual, model output
+          // shape noted in the Phase B merge comment (core.ts). winnerId
+          // must not be treated as "consumed" by this operation, since the
+          // lifecycle write excludes the winner from its own losers list.
+          { candidate: 0, action: "merge", target_ids: [loserId, winnerId], rationale: "Unify, naming the winner too." },
+          // Candidate 1 independently also names winnerId as an update
+          // target. Since candidate 0's merge does NOT consume winnerId
+          // (it stays active — it's the merge winner), this must succeed
+          // without any replan.
+          { candidate: 1, action: "update", target_ids: [winnerId], rationale: "Also refresh the winner." },
+        ]),
+        "Session", "Summary.", "Topic", "Topic summary.", "# Core\n\nFacts unified.",
+      ]);
+
+      const originalWarn = console.warn;
+      const warnings: string[] = [];
+      console.warn = (msg: string) => { warnings.push(String(msg)); };
+      let result: Awaited<ReturnType<typeof distillOnce>>;
+      try {
+        result = await distillOnce(s, llm, { storeKey: "target-race-merge-winner-excl:self" });
+      } finally {
+        console.warn = originalWarn;
+      }
+
+      assert.equal(warnings.length, 0, "no reconciliation warning — winnerId was never consumed");
+      assert.equal(result.atoms_merged, 1, "candidate 0's merge applied");
+      assert.equal(result.atoms_updated, 1, "candidate 1's update to winnerId applied, no replan needed");
+
+      const db = (s as any).db as Database.Database;
+      assert.equal(
+        (db.prepare("SELECT status FROM atoms WHERE id=?").get(loserId) as any).status, "merged",
+        "loser merged into winner",
+      );
+      assert.equal(counts(db, secondId).atoms, 1, "candidate 1's winner survives");
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("malformed replan response fails the pass retryably before any L1 write", async () => {
+    const emb = makeControllableEmbedder(32);
+    const { s, blobDir } = makeStore(emb.embed);
+    try {
+      const sharedContent = "The sensor calibrates at 4.1K.";
+      const sharedId = atomIdFromContent("fact", sharedContent);
+      await s.upsertAtom({ id: sharedId, type: "fact", content: sharedContent });
+
+      await s.addStream("sess-1", [{ role: "user", content: "two independent confirmations of the sensor reading" }]);
+
+      const candidateA = "Sensor calibration confirmed by team A.";
+      const candidateB = "Sensor calibration confirmed by team B.";
+      const idA = atomIdFromContent("fact", candidateA);
+      const idB = atomIdFromContent("fact", candidateB);
+
+      const llm = makeMockLLM([
+        [
+          `{"type":"fact","content":"${candidateA}","confidence":"high"}`,
+          `{"type":"fact","content":"${candidateB}","confidence":"high"}`,
+        ].join("\n"),
+        JSON.stringify([
+          { candidate: 0, action: "update", target_ids: [sharedId], rationale: "Team A confirms." },
+          { candidate: 1, action: "update", target_ids: [sharedId], rationale: "Team B confirms." },
+        ]),
+        // Replan response for candidate 1 is malformed: still names the
+        // now-excluded sharedId, which fails candidate-local membership
+        // against the filtered allowed set.
+        `{"action":"update","target_ids":["${sharedId}"],"rationale":"Still wants the excluded target."}`,
+      ]);
+
+      await assert.rejects(
+        () => distillOnce(s, llm, { storeKey: "target-race-replan-malformed:self" }),
+        /malformed consolidation replan response for candidate 1/,
+      );
+
+      const db = (s as any).db as Database.Database;
+      assert.equal(counts(db, idA).atoms, 0, "no winner survives — replan failure fails the whole pass before any L1 write");
+      assert.equal(counts(db, idB).atoms, 0, "no winner survives");
       assert.equal(
         (db.prepare("SELECT COUNT(*) c FROM consolidation_decisions").get() as any).c, 0,
-        "neither decision survives",
+        "no decision row survives",
       );
       assert.equal(
         (db.prepare("SELECT COUNT(*) c FROM distill_watermark").get() as any).c, 0,
         "watermark not advanced",
       );
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("combined regression: a duplicated batch index and a shared consolidation target both resolve in one pass", async () => {
+    // Exercises both fixes together: candidate 0's batch result is
+    // duplicated (first valid decision wins, one duplicate-index warning),
+    // AND candidate 0's retained decision and candidate 2's decision name
+    // the same existing target (candidate 2 is replanned, one
+    // reconciliation warning). Neither mechanism should interfere with the
+    // other, and the pass must reach transaction-time revalidation and
+    // succeed with both winners persisted.
+    const emb = makeControllableEmbedder(32);
+    const { s, blobDir } = makeStore(emb.embed);
+    try {
+      const sharedContent = "The sensor calibrates at 4.1K.";
+      const sharedId = atomIdFromContent("fact", sharedContent);
+      await s.upsertAtom({ id: sharedId, type: "fact", content: sharedContent });
+      const otherContent = "The sensor calibrates at 4.1K, unit B.";
+      const otherId = atomIdFromContent("fact", otherContent);
+      await s.upsertAtom({ id: otherId, type: "fact", content: otherContent });
+
+      await s.addStream("sess-1", [{ role: "user", content: "three confirmations of the sensor reading" }]);
+
+      const candidateA = "Sensor calibration confirmed by team A.";
+      const candidateOther = "Unrelated candidate, unaffected by the conflict.";
+      const candidateC = "Sensor calibration confirmed by team C.";
+      const idA = atomIdFromContent("fact", candidateA);
+      const idOther = atomIdFromContent("fact", candidateOther);
+      const idC = atomIdFromContent("fact", candidateC);
+
+      const llm = makeMockLLM([
+        [
+          `{"type":"fact","content":"${candidateA}","confidence":"high"}`,
+          `{"type":"fact","content":"${candidateOther}","confidence":"high"}`,
+          `{"type":"fact","content":"${candidateC}","confidence":"high"}`,
+        ].join("\n"),
+        // Batched reply: candidate 0 appears twice (duplicate index — first
+        // valid, "update" targeting sharedId, wins); candidate 1 is a
+        // uniquely indexed, unrelated "store"; candidate 2 also targets
+        // sharedId, which candidate 0's retained decision already consumes.
+        JSON.stringify([
+          { candidate: 0, action: "update", target_ids: [sharedId], rationale: "Team A confirms (first)." },
+          { candidate: 0, action: "skip", target_ids: [], rationale: "Team A confirms (duplicate, ignored)." },
+          { candidate: 1, action: "store", target_ids: [], rationale: "Unrelated new fact." },
+          { candidate: 2, action: "update", target_ids: [sharedId], rationale: "Team C confirms." },
+        ]),
+        // Replan call for candidate 2, sharedId now excluded — picks otherId.
+        `{"action":"update","target_ids":["${otherId}"],"rationale":"Team C confirms unit B."}`,
+        "Session", "Summary.", "Topic", "Topic summary.", "# Core\n\nSensor calibration confirmed.",
+      ]);
+
+      const originalWarn = console.warn;
+      const warnings: string[] = [];
+      console.warn = (msg: string) => { warnings.push(String(msg)); };
+      let result: Awaited<ReturnType<typeof distillOnce>>;
+      try {
+        result = await distillOnce(s, llm, { storeKey: "target-race-combined:self" });
+      } finally {
+        console.warn = originalWarn;
+      }
+
+      assert.equal(result.atoms_updated, 2, "candidate 0's update and candidate 2's replanned update both applied");
+      assert.equal(result.atoms_stored, 1, "candidate 1 stored, unaffected by either conflict");
+
+      const db = (s as any).db as Database.Database;
+      assert.equal(counts(db, idA).atoms, 1, "candidate 0's winner (duplicate-index-resolved) survives");
+      assert.equal(counts(db, idOther).atoms, 1, "candidate 1's winner survives");
+      assert.equal(counts(db, idC).atoms, 1, "candidate 2's winner (replanned) survives");
+      assert.equal(
+        (db.prepare("SELECT status FROM atoms WHERE id=?").get(sharedId) as any).status, "superseded",
+        "sharedId superseded by candidate 0 only",
+      );
+      assert.equal(
+        (db.prepare("SELECT status FROM atoms WHERE id=?").get(otherId) as any).status, "superseded",
+        "otherId superseded by candidate 2's replanned update",
+      );
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM consolidation_decisions").get() as any).c, 3,
+        "all three decisions recorded",
+      );
+      assert.ok(
+        (db.prepare("SELECT COUNT(*) c FROM distill_watermark").get() as any).c > 0,
+        "watermark advanced",
+      );
+
+      assert.equal(warnings.length, 2, "one duplicate-index warning plus one reconciliation warning");
+      assert.ok(
+        warnings.some((w) => /candidate 0/.test(w) && /2 times/.test(w)),
+        "duplicate-index warning identifies candidate 0 and the occurrence count",
+      );
+      assert.ok(
+        warnings.some((w) => /candidate 2/.test(w) && w.includes(sharedId)),
+        "reconciliation warning identifies candidate 2 and the reclaimed target",
+      );
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("a throwing console.warn does not block reconciliation or fail the pass", async () => {
+    const emb = makeControllableEmbedder(32);
+    const { s, blobDir } = makeStore(emb.embed);
+    try {
+      const sharedContent = "The sensor calibrates at 4.1K.";
+      const sharedId = atomIdFromContent("fact", sharedContent);
+      await s.upsertAtom({ id: sharedId, type: "fact", content: sharedContent });
+      const otherContent = "The sensor calibrates at 4.1K, unit B.";
+      const otherId = atomIdFromContent("fact", otherContent);
+      await s.upsertAtom({ id: otherId, type: "fact", content: otherContent });
+
+      await s.addStream("sess-1", [{ role: "user", content: "two independent confirmations of the sensor reading" }]);
+
+      const candidateA = "Sensor calibration confirmed by team A.";
+      const candidateB = "Sensor calibration confirmed by team B.";
+      const idA = atomIdFromContent("fact", candidateA);
+      const idB = atomIdFromContent("fact", candidateB);
+
+      const llm = makeMockLLM([
+        [
+          `{"type":"fact","content":"${candidateA}","confidence":"high"}`,
+          `{"type":"fact","content":"${candidateB}","confidence":"high"}`,
+        ].join("\n"),
+        JSON.stringify([
+          { candidate: 0, action: "update", target_ids: [sharedId], rationale: "Team A confirms." },
+          { candidate: 1, action: "update", target_ids: [sharedId], rationale: "Team B confirms." },
+        ]),
+        `{"action":"update","target_ids":["${otherId}"],"rationale":"Team B confirms unit B."}`,
+        "Session", "Summary.", "Topic", "Topic summary.", "# Core\n\nSensor calibration confirmed.",
+      ]);
+
+      const originalWarn = console.warn;
+      console.warn = () => { throw new Error("warn sink is broken"); };
+      let result: Awaited<ReturnType<typeof distillOnce>>;
+      try {
+        result = await distillOnce(s, llm, { storeKey: "target-race-warn-throws:self" });
+      } finally {
+        console.warn = originalWarn;
+      }
+
+      assert.equal(result.atoms_updated, 2, "the pass succeeds despite the warning sink throwing");
+      const db = (s as any).db as Database.Database;
+      assert.equal(counts(db, idA).atoms, 1, "candidate 0's winner survives");
+      assert.equal(counts(db, idB).atoms, 1, "candidate 1's replanned winner survives");
     } finally { cleanup(s, blobDir); }
   });
 

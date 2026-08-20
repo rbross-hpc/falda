@@ -840,6 +840,63 @@ async function distillOncePass(
       }
     }
 
+    // Phase 2.5: reconcile update/merge decisions that name a target already
+    // consumed (made inactive) by an earlier candidate's decision in THIS
+    // pass. Two candidates independently naming the same existing atom is a
+    // structurally valid batch/individual reply — candidate-local membership
+    // validation cannot see across candidates — but applying both would make
+    // the second operation's target stale by the time it runs. Left
+    // unhandled, this is NOT a transient race: retrieval, the model, and the
+    // targeted atom are all unchanged between attempts, so a stable model
+    // reproduces the identical conflicting plan every time, and the job
+    // would retry until it dead-letters without ever making progress
+    // (docs/MODEL.md §8.2). Detecting and repairing it here — before any
+    // winner embedding or L1 write — lets the pass complete on this same
+    // attempt. Candidate order decides priority: the earliest candidate to
+    // name a target keeps it; any later candidate naming an
+    // already-consumed target is individually re-decided against that
+    // candidate's own retrieved neighbours with consumed ids removed, so it
+    // can only land on a target nothing earlier in this pass has claimed.
+    // The transaction-time checks (assertTargetsActive: Phase 0 and the
+    // per-operation recheck) are unchanged and still catch a genuine
+    // external race — a target changed by a concurrent foreground request —
+    // which this reconciliation cannot see, since it reasons only about
+    // this pass's own in-memory plan.
+    const newIds = retrieved.map((r) => atomIdFromContent(r.candidate.type, r.candidate.content));
+    const consumedByDecision = (dec: ConsolidationDecision, newId: string): string[] => {
+      if (dec.action === "update") return dec.target_ids[0] !== newId ? [dec.target_ids[0]] : [];
+      if (dec.action === "merge") return dec.target_ids.filter((id) => id !== newId);
+      return [];
+    };
+    const consumedTargets = new Set<string>();
+    for (let i = 0; i < retrieved.length; i++) {
+      let dec = decisions[i];
+      if ((dec.action === "update" || dec.action === "merge") &&
+          dec.target_ids.some((id) => consumedTargets.has(id))) {
+        const conflicting = dec.target_ids.filter((id) => consumedTargets.has(id));
+        try {
+          // Non-fatal, like onDuplicateIndex above: a broken warning sink
+          // must never block reconciliation or fail an otherwise-resolvable
+          // pass.
+          console.warn(
+            `[distill] pass ${pid}: candidate ${i} named target(s) ${conflicting.join(", ")} ` +
+              `already claimed by an earlier candidate in this pass; replanning candidate ${i} ` +
+              `against its remaining unclaimed targets`,
+          );
+        } catch { /* non-fatal observer */ }
+        const filteredExisting = retrieved[i].existing.filter((e) => !consumedTargets.has(e.id));
+        const filteredAllowed = new Set(filteredExisting.map((e) => e.id));
+        const raw = await llm(consolidationPrompt(retrieved[i].candidate, filteredExisting));
+        const replanned = parseConsolidation(raw, filteredAllowed);
+        if (replanned === undefined) {
+          throw new Error(`malformed consolidation replan response for candidate ${i}`);
+        }
+        dec = replanned;
+        decisions[i] = dec;
+      }
+      for (const id of consumedByDecision(dec, newIds[i])) consumedTargets.add(id);
+    }
+
     // Phase 3: turn decisions into write ops.
     // Decisions have already passed strict validation (action, target type,
     // cardinality, and candidate-local membership), so no filtering or action
@@ -847,7 +904,7 @@ async function distillOncePass(
     for (let i = 0; i < retrieved.length; i++) {
       const candidate = retrieved[i].candidate;
       const dec = decisions[i];
-      const newId = atomIdFromContent(candidate.type, candidate.content);
+      const newId = newIds[i];
       const decId = `${pid}-dec-${i}`;
 
       writeOps.push({ action: dec.action, candidate, newId, targetIds: dec.target_ids, rationale: dec.rationale, decId });

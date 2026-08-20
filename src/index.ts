@@ -23,7 +23,7 @@ export { DEFAULT_TOOLS, ADVANCED_TOOLS, FULL_TOOLS, toolsFor, resolveToolset } f
 export type { ToolDef, ToolsetName } from "./mcp/registry.js";
 export { TokenStore, AuthError, parseBearer } from "./mcp_auth.js";
 export type { Principal } from "./mcp_auth.js";
-export { distillOnce } from "./distill/core.js";
+export { distillOnce, ConsolidationTargetConflictError } from "./distill/core.js";
 export type { LLMFn, DistillOptions, DistillResult } from "./distill/core.js";
 export { assembleContext } from "./distill/context.js";
 export type {
