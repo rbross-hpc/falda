@@ -129,13 +129,12 @@ describe("assembleContext: skip-and-continue admission (does not stop at first n
 
       const admittedSceneIds = ctx.items.filter((i) => i.tier === "T2").map((i) => i.id);
       assert.ok(!admittedSceneIds.includes("scene-big"), "oversized scene excluded");
-      // Only assert the small scene is present if it was actually ranked by
-      // the search (best-effort — hybrid ranking is not being controlled
-      // here beyond content relevance), but at minimum the tier must not
-      // have been abandoned outright just because the first candidate missed.
-      if (admittedSceneIds.length > 0) {
-        assert.ok(admittedSceneIds.includes("scene-small"), "small scene admitted instead of tier going empty");
-      }
+      // Both candidates are deterministically ranked (local embedder, no
+      // network/randomness) — assert unconditionally that the small scene
+      // is admitted, so a regression that abandons the tier entirely after
+      // skipping the first candidate is actually caught rather than
+      // vacuously passing on an empty result.
+      assert.ok(admittedSceneIds.includes("scene-small"), "small scene admitted instead of tier going empty");
     } finally { cleanup(s, blobDir); }
   });
 });

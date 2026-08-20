@@ -15,13 +15,16 @@
  *   4. A `pool` body field outside the token's `pools` allow-list is denied.
  *   5. Pool-admin routes (/pools/*) require a fully-trusted (["*"]) principal;
  *      any other principal is denied even for a tenant it owns.
- *   6. GET /healthz requires no authentication (proven against a real socket,
- *      since it's wired ahead of any auth in src/server.ts's HTTP listener,
- *      before handleRequest is ever called — see startHealthzServer below).
+ *
+ * GET /healthz's no-auth-required behavior is proven against the real
+ * src/server.ts HTTP listener in test/server_runtime.test.ts ("HTTP and MCP
+ * each answer /healthz on their own port"), not here — gateway.ts itself
+ * only exports the pure handleRequest and never opens a socket, so a
+ * same-guarantee test here would need its own stand-in listener rather than
+ * exercising the actual production code path.
  */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
-import { createServer, type Server } from "node:http";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -35,31 +38,6 @@ function hdrs(token?: string, tenant?: string) {
   if (token) h.authorization = `Bearer ${token}`;
   if (tenant) h["x-falda-tenant"] = tenant;
   return h;
-}
-
-/**
- * Minimal stand-in for src/server.ts's startHttpApi() listener (the only
- * place an HTTP socket for this API is actually opened — gateway.ts itself
- * only exports the pure handleRequest), to prove /healthz is reachable over
- * a real socket with zero Authorization header. startHttpApi's actual
- * healthz branch is checked-before-auth identically; this avoids
- * re-booting the full server for one liveness-probe assertion.
- */
-function startHealthzServer(): Promise<{ server: Server; port: number }> {
-  return new Promise((resolve) => {
-    const server = createServer((req, res) => {
-      if (req.method === "GET" && req.url === "/healthz") {
-        res.writeHead(200, { "content-type": "application/json" });
-        return res.end(JSON.stringify({ ok: true, tiers: ["stream", "atoms", "scenes", "core"], pools: true }));
-      }
-      res.writeHead(404); res.end();
-    });
-    server.listen(0, "127.0.0.1", () => {
-      const addr = server.address();
-      const port = typeof addr === "object" && addr ? addr.port : 0;
-      resolve({ server, port });
-    });
-  });
 }
 
 let root: string;
@@ -135,14 +113,3 @@ test("5. pool-admin requires a fully-trusted principal", async () => {
   assert.equal(adminOk.status, 200, "wildcard token may use pool admin (200)");
 });
 
-test("6. /healthz needs no auth", async () => {
-  const { server, port } = await startHealthzServer();
-  try {
-    const res = await fetch(`http://127.0.0.1:${port}/healthz`);
-    assert.equal(res.status, 200, "GET /healthz returns 200 with no Authorization header");
-    const body = await res.json() as { ok: boolean };
-    assert.equal(body.ok, true, "/healthz body reports ok");
-  } finally {
-    server.close();
-  }
-});

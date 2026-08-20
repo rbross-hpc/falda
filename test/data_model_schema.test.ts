@@ -1,21 +1,25 @@
 /**
- * Branch A — data model schema tests.
+ * Core data-model invariants for the T0/T1/T2 store layer (src/falda.ts).
  *
- * Covers all new Branch A guarantees:
+ * Covers:
  *   1. T0 dual turn-idempotency invariants + conflict cases
  *   2. Deterministic (session_id, turn_index) ordering vs ts fallback
  *   3. Atom content/type immutability rejection
  *   4. New type enum rejection (old values)
  *   5. Confidence enum rejection
  *   6. Recall: status='active' filtering
- *   7. Recall: pinned-first pass
- *   8. Recall: character budgets (per-hit + total)
- *   9. Scene CRUD + searchScenes
- *  10. Evidence union: addEvidence, evidenceForAtom, atomsFromStream, atomsFromSession
- *  11. Migration + backfill idempotency (schema run twice)
- *  12. Atom lifecycle: supersedeAtom, mergeAtoms, archiveAtom
- *  13. scene_atoms many-to-many: one atom in episode + topic simultaneously
- *  14. computeSceneHash / computeCoreHash exclude confidence
+ *   7. Scene CRUD + searchScenes
+ *   8. Evidence union: addEvidence, evidenceForAtom, atomsFromStream, atomsFromSession
+ *   9. Stream deletion + index-orphan repair; migration/reopen idempotency
+ *  10. Atom lifecycle: supersedeAtom, mergeAtoms, archiveAtom
+ *  11. scene_atoms many-to-many: one atom in episode + topic simultaneously
+ *  12. computeSceneHash / computeCoreHash exclude confidence
+ *  13. render_hash gating for scene re-embedding
+ *
+ * Pinned-first ordering and per-hit character budgets are NOT covered here —
+ * those were guarantees of the retired T1-only Falda.recallAtoms() path.
+ * The live equivalents (assembleContext's cross-tier pinned/budget behavior)
+ * are covered in test/distill_core.test.ts and test/context_tier_caps.test.ts.
  */
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
@@ -112,7 +116,7 @@ test("T0: turn_index ordering beats ts ordering", async () => {
   } finally { cleanup(s, blobDir); }
 });
 
-test("T0: ts fallback ordering when turn_index absent", async () => {
+test("T0: ts fallback ordering when turn_index absent (queryStream defaults to newest-first, matching its pagination contract — docs/API.md's /stream/query)", async () => {
   const { s, blobDir } = makeStore();
   try {
     const t1 = new Date(Date.now() - 2000).toISOString();
@@ -123,7 +127,11 @@ test("T0: ts fallback ordering when turn_index absent", async () => {
     ]);
     const { messages } = s.queryStream({ session_id: "s1" });
     const contents = (messages as any[]).map((m) => m.content);
-    assert.ok(contents.indexOf("older") < contents.indexOf("newer") || contents.includes("older"), "ts ordering");
+    // queryStream's SQL is `ORDER BY session_id, COALESCE(turn_index,
+    // 999999999), ts DESC` (src/falda.ts) — this is the original, unchanged
+    // pagination default from the very first commit (a298649's ts DESC),
+    // not a defect: with no turn_index, results come back newest-first.
+    assert.deepEqual(contents, ["newer", "older"], "ts fallback orders newest-first");
   } finally { cleanup(s, blobDir); }
 });
 
@@ -228,35 +236,10 @@ test("T1: superseded/archived atoms excluded from search and query", async () =>
   } finally { cleanup(s, blobDir); }
 });
 
-// ─── 7. Pinned-first recall ─────────────────────────────────────────────────────
-
-test("T1: pinned atoms appear first in recallAtoms regardless of query", async () => {
-  const { s, blobDir } = makeStore();
-  try {
-    const unpinned = await s.upsertAtom({ type: "fact", content: "very relevant specific fact about query term" });
-    const pinned = await s.upsertAtom({ type: "instruction", content: "never modify production database", pinned: true });
-
-    const results = await s.recallAtoms("very relevant specific fact", 10);
-    assert.ok(results.length > 0, "results returned");
-    assert.equal(results[0].id, pinned.id, "pinned atom is first");
-    assert.equal(results[0].score, Infinity, "pinned atom has Infinity score");
-  } finally { cleanup(s, blobDir); }
-});
-
-// ─── 8. Character budgets ───────────────────────────────────────────────────────
-
-test("T1: per-hit content truncated at 2000 chars", async () => {
-  const { s, blobDir } = makeStore();
-  try {
-    const longContent = "A".repeat(3000);
-    await s.upsertAtom({ type: "fact", content: longContent });
-    const hits = await s.recallAtoms("AAAAAA", 5);
-    assert.ok(hits.length > 0, "hit returned");
-    const hit = hits.find((h) => h.content.endsWith("..."));
-    assert.ok(hit, "long content truncated with ellipsis");
-    assert.ok(hit!.content.length <= 2000, "truncated to ≤ 2000 chars");
-  } finally { cleanup(s, blobDir); }
-});
+// Pinned-first recall and per-hit character budgets are covered against the
+// live cross-tier recall surface (assembleContext), not the retired T1-only
+// Falda.recallAtoms() path — see test/distill_core.test.ts's pinned-atom
+// tests and test/context_tier_caps.test.ts for the current equivalents.
 
 // ─── 9. Scene CRUD + search ────────────────────────────────────────────────────
 

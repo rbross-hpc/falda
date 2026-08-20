@@ -1,21 +1,23 @@
 /**
- * Branch B — distillation core tests.
+ * Distillation core tests.
  *
  * Covers:
  *   1. Queue: enqueue, coalesce, claimNext, complete, fail + backoff, dead-letter
  *   2. Watermark: init, get/set, passId determinism
  *   3. distillOnce: end-to-end with a mock LLM
- *      - store/update/merge/skip actions with evidence union
- *      - consolidation_decisions idempotency via pass id
+ *      - store/skip actions with evidence
+ *      - consolidation_decisions durability under a repeated deterministic id
  *      - watermark advances atomically with atoms
- *      - type/confidence rejection in extraction
- *      - episode membership from multi-session evidence
+ *      - retry provenance (model/prompt/distiller version) on a re-run pass
  *      - topic derivation + hysteresis
  *      - provisional title usable before LLM summary pass
- *      - hash-gate skip (unchanged scene skips re-embed)
- *      - confidence-only change does NOT dirty scene hash
+ *      - end-to-end hash-gate skip (unchanged scene structure skips L3)
  *   4. assembleContext: budget trimming and tier-priority ordering
- *   5. MCP falda_distill / falda_distill_status tool registration
+ *
+ * update/merge consolidation actions, malformed-extraction rejection, and
+ * MCP tool registration/behavior now have more focused coverage elsewhere:
+ * see test/distill_l1_atomic.test.ts, test/distill_malformed_output.test.ts,
+ * and test/mcp_compact.test.ts respectively.
  */
 import { test, describe } from "node:test";
 import assert from "node:assert/strict";
@@ -25,9 +27,6 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { Falda } from "../src/falda.js";
 import { makeLocalEmbedder } from "../src/embedder.js";
-import { PoolManager } from "../src/pools.js";
-import { TokenStore } from "../src/mcp_auth.js";
-import { makeFaldaMcpServer } from "../src/mcp.js";
 import { initQueueSchema, enqueue, claimNext, completeJob, failJob, getJob, listJobs } from "../src/distill/queue.js";
 import { initWatermarkSchema, getWatermark, setWatermark, passId } from "../src/distill/watermark.js";
 import { distillOnce } from "../src/distill/core.js";
@@ -369,24 +368,29 @@ describe("distillOnce", () => {
     } finally { cleanup(s, blobDir); }
   });
 
-  test("consolidation_decisions are recorded idempotently under pass id", async () => {
+  test("consolidation_decisions are recorded idempotently under a deterministic decision id", async () => {
+    // Decision ids are deterministic (`${pass_id}-dec-${candidateIndex}`, see
+    // src/distill/core.ts), and recordDecision() writes with INSERT OR
+    // IGNORE specifically so that re-recording the identical decision id —
+    // e.g. a retried pass re-deriving the same pass_id/candidate-index pair
+    // — cannot duplicate or silently overwrite the original audit row. This
+    // calls recordDecision() directly with the same id twice to prove that
+    // contract, rather than relying on a real replay (which the watermark
+    // would make a no-op before recordDecision is ever reached again).
     const { s, blobDir } = makeStore();
     try {
-      await s.addStream("sess-1", [{ role: "user", content: "deploy in bin/release" }]);
-      const llmFactory = () => makeMockLLM([
-        `{"type":"fact","content":"Deploy in bin/release.","confidence":"high"}`,
-        `{"action":"store","target_ids":[],"rationale":"New."}`,
-        "Session", "Discussed deploy.",
-        "Deploy", "Deploy facts.",
-        "# Core\n\nDeploy in bin/release.",
-      ]);
-      await distillOnce(s, llmFactory(), { storeKey: "replay-test:self" });
+      s.recordDecision({
+        id: "pass-x-dec-0", pass_id: "pass-x", action: "store",
+        atom_id: "atom-1", rationale: "first write",
+      });
+      s.recordDecision({
+        id: "pass-x-dec-0", pass_id: "pass-x", action: "store",
+        atom_id: "atom-1", rationale: "second write with the same id",
+      });
       const db = (s as any).db as Database.Database;
-      const rows1 = db.prepare("SELECT * FROM consolidation_decisions").all() as Array<{ pass_id: string }>;
-
-      // Note: second pass would be a no-op due to watermark; so just check rows exist.
-      assert.ok(rows1.length > 0, "decisions recorded");
-      assert.ok(rows1[0].pass_id, "pass_id set");
+      const rows = db.prepare("SELECT * FROM consolidation_decisions WHERE id=?").all("pass-x-dec-0") as any[];
+      assert.equal(rows.length, 1, "exactly one row survives for the repeated id");
+      assert.equal(rows[0].rationale, "first write", "the original row is kept, not overwritten");
     } finally { cleanup(s, blobDir); }
   });
 
@@ -437,27 +441,12 @@ describe("distillOnce", () => {
     } finally { cleanup(s, blobDir); }
   });
 
-  test("hash-gate: confidence-only change does NOT dirty scene hash (§3.3 regression)", async () => {
-    const { s, blobDir } = makeStore();
-    try {
-      const a = await s.upsertAtom({ type: "fact", content: "stable proposition", confidence: "high" });
-      const hash1 = s.computeSceneHash("topic", [a.id]);
-      s.updateConfidence(a.id, "low");
-      const hash2 = s.computeSceneHash("topic", [a.id]);
-      assert.equal(hash1, hash2, "confidence change does not alter scene hash");
-    } finally { cleanup(s, blobDir); }
-  });
-
-  test("hash-gate: content change dirties scene hash", async () => {
-    const { s, blobDir } = makeStore();
-    try {
-      const a = await s.upsertAtom({ id: "atom-A", type: "fact", content: "original" });
-      const hash1 = s.computeSceneHash("topic", [a.id]);
-      const b = await s.upsertAtom({ id: "atom-B", type: "fact", content: "different" });
-      const hash2 = s.computeSceneHash("topic", [b.id]);
-      assert.notEqual(hash1, hash2);
-    } finally { cleanup(s, blobDir); }
-  });
+  // Direct computeSceneHash() confidence/content-sensitivity coverage lives
+  // in test/data_model_schema.test.ts ("computeSceneHash: ..."). Those calls
+  // don't exercise distillOnce, so they don't belong here; this file's own
+  // end-to-end hash-gate coverage (unchanged structure skips L3 on a second
+  // pass) is below at "core hash-gate: unchanged scene structure skips L3
+  // on second pass".
 
   test("episode identity: scene_id is stable even after LLM renames the title", async () => {
     const { s, blobDir } = makeStore();
@@ -762,13 +751,28 @@ describe("assembleContext", () => {
       for (let i = 0; i < 10; i++) {
         await s.upsertAtom({ type: "fact", content: `System fact ${i} about the neutron source energy.` });
       }
-      s.writeCore("# Core\n\nThis is the core document with important system context.");
-      // Give core 60% of the budget.
+      // Long enough that core's DEFAULT 15% allocation of a 2000-char budget
+      // (~300 chars) truncates it, while a 60% allocation (~1200 chars)
+      // admits substantially more — making the two allocations
+      // distinguishable by result, not just by both being "some positive
+      // number of chars" (which passes regardless of whether tierBudgets is
+      // honored at all).
+      const longCore = "# Core\n\n" + "Important system context about the neutron source. ".repeat(40);
+      s.writeCore(longCore);
       const budget = 2000;
-      const ctx = await assembleContext(s, "neutron energy", budget, { pinned: 0.05, atoms: 0.15, scenes: 0.20, core: 0.60 });
-      const coreMax = budget * 0.62; // 60% + possible spillover from other tiers
-      assert.ok(ctx.per_tier_chars.core > 0, "core has chars with high core fraction");
-      assert.ok(ctx.total_chars <= budget, "total within budget");
+
+      const defaultCtx = await assembleContext(s, "neutron energy", budget);
+      const customCtx = await assembleContext(
+        s, "neutron energy", budget, { pinned: 0.05, atoms: 0.15, scenes: 0.20, core: 0.60 },
+      );
+
+      assert.ok(defaultCtx.truncated, "default 15% core allocation truncates this long a core document");
+      assert.ok(
+        customCtx.per_tier_chars.core > defaultCtx.per_tier_chars.core,
+        `custom 60% core allocation (${customCtx.per_tier_chars.core} chars) must admit more core content ` +
+          `than the default 15% allocation (${defaultCtx.per_tier_chars.core} chars)`,
+      );
+      assert.ok(customCtx.total_chars <= budget, "total within budget");
     } finally { cleanup(s, blobDir); }
   });
 
@@ -787,27 +791,7 @@ describe("assembleContext", () => {
   });
 });
 
-// ─── 5. MCP distill tool registration ─────────────────────────────────────────
-
-describe("MCP falda_distill tools", () => {
-  test("falda_distill and falda_distill_status are registered", async () => {
-    const root = fs.mkdtempSync(path.join(os.tmpdir(), "falda-mcp-distill-"));
-    const tokPath = path.join(root, "tokens.json");
-    fs.writeFileSync(tokPath, JSON.stringify({ tokens: { "t": { tenants: ["a"], pools: [] } } }));
-    const pools = new PoolManager({ root, embed: makeLocalEmbedder(32), dim: 32 });
-    const tokenStore = new TokenStore(tokPath);
-    const queueDb = makeQueueDb();
-
-    const server = makeFaldaMcpServer(pools, tokenStore, queueDb);
-    // Introspect registered tool names via the server's listTools handler.
-    // We call _registeredTools private field as there's no public listTools() on McpServer directly.
-    const tools = (server as any)._registeredTools ?? (server as any).registeredTools ?? {};
-    const names = Object.keys(tools);
-    assert.ok(names.includes("falda_distill"), "falda_distill registered");
-    assert.ok(names.includes("falda_distill_status"), "falda_distill_status registered");
-
-    queueDb.close();
-    pools.closeAll();
-    fs.rmSync(root, { recursive: true, force: true });
-  });
-});
+// MCP falda_distill/falda_distill_status tool registration is covered more
+// strongly in test/mcp_compact.test.ts, which calls the public
+// listTools()/callTool() protocol against a real server rather than
+// introspecting the MCP SDK's private tool-registry field.
