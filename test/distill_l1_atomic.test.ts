@@ -18,7 +18,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { Falda } from "../src/falda.js";
-import { distillOnce } from "../src/distill/core.js";
+import { distillOnce, ConsolidationTargetConflictError } from "../src/distill/core.js";
 
 function makeStore(embed: (text: string) => Promise<number[]>, dim = 32) {
   const blobDir = fs.mkdtempSync(path.join(os.tmpdir(), "falda-l1-atomic-"));
@@ -510,7 +510,13 @@ describe("Finding: consolidation target eligibility (TOCTOU)", () => {
 
       await assert.rejects(
         () => distillOnce(s, llm, { storeKey: "target-race-update:self" }),
-        /no longer eligible/,
+        (err: unknown) => {
+          assert.ok(err instanceof ConsolidationTargetConflictError, "rejects with the typed conflict error");
+          assert.equal((err as ConsolidationTargetConflictError).action, "update");
+          assert.equal((err as ConsolidationTargetConflictError).targetId, oldId);
+          assert.equal((err as ConsolidationTargetConflictError).reason, "inactive");
+          return true;
+        },
       );
 
       const db = (s as any).db as Database.Database;
@@ -732,6 +738,65 @@ describe("Finding: consolidation target eligibility (TOCTOU)", () => {
       assert.ok(
         (db.prepare("SELECT COUNT(*) c FROM distill_watermark").get() as any).c > 0,
         "watermark advanced after successful retry",
+      );
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("update-to-self target hard-deleted mid-flight: Phase 0 must see it missing BEFORE Phase A can recreate it", async () => {
+    // Distinguishing regression for the Phase-0-before-Phase-A ordering
+    // (src/distill/core.ts: target revalidation runs before any winner is
+    // written). The earlier hard-delete test used a DIFFERENT id for the
+    // deleted target and the prepared winner, so it could not detect an
+    // accidental reordering: Phase A never touches that target's id in that
+    // scenario either way. Here oldId === newId (an "update-to-self"
+    // decision, content unchanged), so if target revalidation ran AFTER
+    // Phase A instead of before it, Phase A's upsertDistilledAtomSync()
+    // would silently RECREATE the just-hard-deleted row under the same
+    // deterministic id — and the revalidation check would then wrongly see
+    // it as active, letting a stale plan through undetected.
+    const emb = makeControllableEmbedder(32);
+    const { s, blobDir } = makeStore(emb.embed);
+    try {
+      const content = "The sensor calibrates at 4.2K.";
+      const id = atomIdFromContent("fact", content);
+      await s.upsertAtom({ id, type: "fact", content });
+
+      await s.addStream("sess-1", [{ role: "user", content: "confirmed: sensor calibrates at 4.2K" }]);
+
+      const originalPrepare = s.prepareAtomEmbedding.bind(s);
+      (s as any).prepareAtomEmbedding = async (embContent: string) => {
+        // Fires for the winner's own content — which is the SAME id as the
+        // update target, since this is an update-to-self decision.
+        if (embContent === content) s.hardDeleteAtomsUnsafe([id]);
+        return originalPrepare(embContent);
+      };
+
+      const llm = makeMockLLM([
+        `{"type":"fact","content":"${content}","confidence":"high"}`,
+        `{"action":"update","target_ids":["${id}"],"rationale":"Reconfirms existing fact."}`,
+      ]);
+
+      await assert.rejects(
+        () => distillOnce(s, llm, { storeKey: "target-race-update-self-delete:self" }),
+        /no longer eligible/,
+      );
+
+      const db = (s as any).db as Database.Database;
+      const c = counts(db, id);
+      assert.equal(c.atoms, 0, "the hard-deleted id was NOT recreated by Phase A");
+      assert.equal(c.fts, 0, "no fts row was created for it");
+      assert.equal(c.vec, 0, "no vec row was created for it");
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM atom_evidence WHERE atom_id=?").get(id) as any).c, 0,
+        "no evidence attached",
+      );
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM consolidation_decisions").get() as any).c, 0,
+        "no decision row survives",
+      );
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM distill_watermark").get() as any).c, 0,
+        "watermark not advanced",
       );
     } finally { cleanup(s, blobDir); }
   });
