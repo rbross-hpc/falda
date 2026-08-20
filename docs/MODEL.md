@@ -887,6 +887,28 @@ The candidate that was extracted — not only the action taken on it — is
 recorded on that same row (§5.5), so a rejected (`skip`) candidate
 remains inspectable after the pass.
 
+**Prompt-time membership is necessary but not sufficient — application-time
+target eligibility is also required.** Candidate-local membership (above)
+proves only that a target id was shown to the model for this candidate at
+retrieval time. Retrieval, the consolidation LLM call, and winner-embedding
+preparation are all asynchronous and happen before the L1 transaction opens
+(§8.5); a target that was active then can be archived, superseded, merged,
+or hard-deleted by a concurrent request before the transaction actually
+applies the decision — or consumed by an earlier `update`/`merge` operation
+within the same pass, since multiple candidates may name the same target.
+To close this gap, every `update`/`merge` target is revalidated **inside**
+the L1 `BEGIN IMMEDIATE` transaction, immediately before it is applied: the
+target must still exist and still have `status='active'`. A target that is
+missing or already in a terminal status (`superseded`/`merged`/`archived`)
+is a **stale-target conflict**: the pass fails retryably, the entire L1
+transaction rolls back (winner atoms/indexes, evidence, lifecycle changes,
+decisions — everything, including any earlier operation in the same pass
+that had already applied), and the watermark does not advance. As with any
+other invalid decision, a stale target is never silently downgraded to
+`store`/`skip`, and a `merge` is never partially applied with fewer targets
+than the model named. The next attempt re-runs the identical input window
+against then-current state.
+
 ### 8.3 L2 — organize into scenes
 
 Per §6.2–§6.3: for **episodes**, membership is recomputed directly from
