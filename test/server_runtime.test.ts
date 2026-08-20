@@ -18,6 +18,7 @@ import * as path from "node:path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { buildRuntime, type FaldaRuntime } from "../src/runtime.js";
+import type { LLMFnWithModel } from "../src/distill/llm.js";
 import { handleRequest } from "../src/gateway.js";
 import { serve, startHttpApi, startMcp, type ServeHandle } from "../src/server.js";
 import { getJob } from "../src/distill/queue.js";
@@ -220,7 +221,10 @@ describe("HTTP and MCP share one runtime", () => {
     // to keep this test offline/deterministic, stub the LLM to fail fast;
     // the goal here is only to prove the *job transitions off pending*,
     // not to prove distillOnce's LLM-dependent internals (covered elsewhere).
-    const stubLlm = async () => { throw new Error("no LLM in this test — distillOnce may fail, that's fine"); };
+    const stubLlm: LLMFnWithModel = Object.assign(
+      async () => { throw new Error("no LLM in this test — distillOnce may fail, that's fine"); },
+      { model: "test-stub" },
+    );
     const distiller = startDistiller(runtime.queueDb, runtime.pools, stubLlm, {
       drainIntervalMs: 20, sweepIntervalMs: 20,
     });

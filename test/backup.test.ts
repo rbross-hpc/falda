@@ -69,7 +69,7 @@ async function buildPopulatedRoot(): Promise<string> {
       budgets: { pinned: 500, atoms: 2000, scenes: 2000, core: 1500 },
       recency_half_life_days: 30, version: "v1",
     },
-    items: [{ tier: "T1", id: "a1", kind: "atom", source: "fts", score: 1, chars: 100 }],
+        items: [{ tier: "T1", id: "a1", kind: "atom", source: "ranked", score: 1, chars: 100 }],
   });
   traceDb.close();
 

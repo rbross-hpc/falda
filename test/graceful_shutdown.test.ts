@@ -57,7 +57,7 @@ describe("ServeHandle.close(): in-flight HTTP requests", () => {
       const closePromise = handle.close();
       const resp = await reqPromise;
       assert.equal(resp.status, 200, "in-flight request must still complete successfully");
-      const json = await resp.json();
+      const json = await resp.json() as { id?: string };
       assert.ok(json.id, "response body was fully delivered");
 
       await closePromise; // close() itself must also resolve
