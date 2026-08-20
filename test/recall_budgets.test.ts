@@ -9,13 +9,11 @@ import assert from "node:assert/strict";
 import {
   DEFAULT_ATOM_ITEM_CAP,
   DEFAULT_AUTO_RECALL_BUDGET,
-  DEFAULT_LEGACY_ATOM_BUDGET,
   DEFAULT_MAX_RECALL_BUDGET,
   DEFAULT_RECALL_BUDGET,
   DEFAULT_SCENE_ITEM_CAP,
   resolveAtomItemCap,
   resolveAutoRecallBudget,
-  resolveLegacyAtomBudget,
   resolveMaxRecallBudget,
   resolveRecallBudget,
   resolveSceneItemCap,
@@ -41,15 +39,10 @@ test("resolveMaxRecallBudget: defaults to DEFAULT_MAX_RECALL_BUDGET, and exceeds
   assert.ok(DEFAULT_MAX_RECALL_BUDGET > DEFAULT_AUTO_RECALL_BUDGET);
 });
 
-test("resolveLegacyAtomBudget: defaults to DEFAULT_LEGACY_ATOM_BUDGET when unset", () => {
-  assert.equal(resolveLegacyAtomBudget(undefined), DEFAULT_LEGACY_ATOM_BUDGET);
-});
-
 test("env override: a valid positive integer string is honored", () => {
   assert.equal(resolveRecallBudget("9000"), 9000);
   assert.equal(resolveAutoRecallBudget("1234"), 1234);
   assert.equal(resolveMaxRecallBudget("50000"), 50000);
-  assert.equal(resolveLegacyAtomBudget("7777"), 7777);
 });
 
 test("env override: non-integer values are floored", () => {
