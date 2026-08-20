@@ -655,6 +655,341 @@ describe("startDistiller: sweep gate (only enqueue stores with undistilled turns
   });
 });
 
+// docs/future/reliability-hardening.md finding 15: worker serialization.
+//
+// The timed drain had no busy guard, and the wake path had its own
+// independent re-entrancy guard that did not exclude a concurrent timed drain.
+// Both paths wrote into the single `inFlight` slot, so an earlier job could
+// be overwritten and become untracked by stop().
+//
+// Each test below asserts that at most ONE runJob() executes at any instant,
+// regardless of which path (timer or wake) triggered it.
+describe("startDistiller: worker serialization (finding 15)", () => {
+  test("timer-vs-timer: a second drain tick does not start a new job while the first is still running", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      const storeA = pools.resolve("proj-a", undefined, true);
+      const storeB = pools.resolve("proj-b", undefined, true);
+      await storeA.addStream("sess", [{ role: "user", content: "turn a" }]);
+      await storeB.addStream("sess", [{ role: "user", content: "turn b" }]);
+
+      let concurrentCalls = 0;
+      let maxConcurrent = 0;
+      let resolveFst: (() => void) | undefined;
+      let firstStarted = false;
+
+      const blockingLlm: LLMFnWithModel = Object.assign(
+        async () => {
+          concurrentCalls++;
+          maxConcurrent = Math.max(maxConcurrent, concurrentCalls);
+          if (!firstStarted) {
+            firstStarted = true;
+            // Block the first job until we release it.
+            await new Promise<void>((r) => { resolveFst = r; });
+          }
+          concurrentCalls--;
+          throw new Error("stub LLM");
+        },
+        { model: "stub" },
+      );
+
+      // Very short drain interval so a second tick fires while the first job
+      // is still blocked.
+      const jobA = enqueue(queueDb, "proj-a:self");
+      const jobB = enqueue(queueDb, "proj-b:self");
+      const distiller = startDistiller(queueDb, pools, blockingLlm, {
+        drainIntervalMs: 25,
+        sweepIntervalMs: 60_000,
+      });
+      try {
+        // Wait for the first job to start.
+        await waitFor(() => firstStarted, 2000);
+        // Let several drain ticks fire while the first job is still blocked.
+        await new Promise((r) => setTimeout(r, 120));
+        // The second job must not have been started concurrently.
+        assert.ok(
+          maxConcurrent <= 1,
+          `max concurrent LLM calls was ${maxConcurrent}; expected ≤ 1`,
+        );
+        assert.equal(
+          getJob(queueDb, jobB)?.attempts ?? 0, 0,
+          "second job must not be claimed while first is still running",
+        );
+      } finally {
+        resolveFst?.();
+        await distiller.stop();
+      }
+    } finally { cleanup(root); }
+  });
+
+  test("timer-vs-wake: a wake() while a timed drain is active waits, then runs the explicit job immediately after", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      const storeA = pools.resolve("proj-a", undefined, true);
+      const storeB = pools.resolve("proj-b", undefined, true);
+      await storeA.addStream("sess", [{ role: "user", content: "passive work" }]);
+      await storeB.addStream("sess", [{ role: "user", content: "explicit work" }]);
+
+      let concurrentCalls = 0;
+      let maxConcurrent = 0;
+      let resolvePassive: (() => void) | undefined;
+      let passiveStarted = false;
+
+      const blockingLlm: LLMFnWithModel = Object.assign(
+        async () => {
+          concurrentCalls++;
+          maxConcurrent = Math.max(maxConcurrent, concurrentCalls);
+          if (!passiveStarted) {
+            passiveStarted = true;
+            await new Promise<void>((r) => { resolvePassive = r; });
+          }
+          concurrentCalls--;
+          throw new Error("stub LLM");
+        },
+        { model: "stub" },
+      );
+
+      const passiveJob = enqueue(queueDb, "proj-a:self"); // passive priority
+      const distiller = startDistiller(queueDb, pools, blockingLlm, {
+        drainIntervalMs: 20,
+        sweepIntervalMs: 60_000,
+      });
+      try {
+        // Wait for passive job to be claimed and blocked.
+        await waitFor(() => passiveStarted, 2000);
+        assert.equal(getJob(queueDb, passiveJob)?.status, "running");
+
+        // Enqueue explicit job and wake() while passive is still running.
+        const explicitJob = enqueue(queueDb, "proj-b:self", {
+          priority: PRIORITY_EXPLICIT, origin: "mcp",
+        });
+        distiller.wake();
+
+        // Let some time pass — the explicit job must not run concurrently.
+        await new Promise((r) => setTimeout(r, 80));
+        assert.ok(
+          maxConcurrent <= 1,
+          `max concurrent LLM calls was ${maxConcurrent}; expected ≤ 1`,
+        );
+        assert.equal(
+          getJob(queueDb, explicitJob)?.attempts ?? 0, 0,
+          "explicit job must not be claimed while passive job is still running",
+        );
+
+        // Release the passive job and confirm the explicit job now runs
+        // promptly — without waiting for another timed drain tick.
+        resolvePassive?.();
+        const explicitRan = await waitFor(
+          () => (getJob(queueDb, explicitJob)?.attempts ?? 0) > 0,
+          2000,
+        );
+        assert.ok(explicitRan, "explicit job ran immediately after passive job finished (no extra timer wait)");
+        assert.ok(maxConcurrent <= 1, "still no concurrent overlap after release");
+      } finally {
+        resolvePassive?.();
+        await distiller.stop();
+      }
+    } finally { cleanup(root); }
+  });
+
+  test("wake-vs-timer: active wake drain does not let a timed tick claim a passive job concurrently", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      const storeA = pools.resolve("proj-a", undefined, true);
+      const storeB = pools.resolve("proj-b", undefined, true);
+      await storeA.addStream("sess", [{ role: "user", content: "explicit work" }]);
+      await storeB.addStream("sess", [{ role: "user", content: "passive work" }]);
+
+      let concurrentCalls = 0;
+      let maxConcurrent = 0;
+      let resolveExplicit: (() => void) | undefined;
+      let explicitStarted = false;
+
+      const blockingLlm: LLMFnWithModel = Object.assign(
+        async () => {
+          concurrentCalls++;
+          maxConcurrent = Math.max(maxConcurrent, concurrentCalls);
+          if (!explicitStarted) {
+            explicitStarted = true;
+            await new Promise<void>((r) => { resolveExplicit = r; });
+          }
+          concurrentCalls--;
+          throw new Error("stub LLM");
+        },
+        { model: "stub" },
+      );
+
+      // Enqueue explicit job, wake it, and simultaneously let a short drain
+      // interval fire — it must not claim the passive job while explicit runs.
+      const explicitJob = enqueue(queueDb, "proj-a:self", {
+        priority: PRIORITY_EXPLICIT, origin: "mcp",
+      });
+      const passiveJob = enqueue(queueDb, "proj-b:self");
+      const distiller = startDistiller(queueDb, pools, blockingLlm, {
+        drainIntervalMs: 20, // short so timed ticks fire during the wake drain
+        sweepIntervalMs: 60_000,
+      });
+      distiller.wake();
+      try {
+        await waitFor(() => explicitStarted, 2000);
+        // Let several timed ticks fire while the explicit wake drain is running.
+        await new Promise((r) => setTimeout(r, 100));
+        assert.ok(
+          maxConcurrent <= 1,
+          `max concurrent LLM calls was ${maxConcurrent}; expected ≤ 1`,
+        );
+        assert.equal(
+          getJob(queueDb, passiveJob)?.attempts ?? 0, 0,
+          "passive job must not be claimed while explicit wake drain runs",
+        );
+      } finally {
+        resolveExplicit?.();
+        await distiller.stop();
+      }
+    } finally { cleanup(root); }
+  });
+
+  test("shutdown with a deferred wake: stop() awaits active work; latched explicit job stays pending", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      const storeA = pools.resolve("proj-a", undefined, true);
+      const storeB = pools.resolve("proj-b", undefined, true);
+      await storeA.addStream("sess", [{ role: "user", content: "active work" }]);
+      await storeB.addStream("sess", [{ role: "user", content: "deferred work" }]);
+
+      let resolveActive: (() => void) | undefined;
+      let activeStarted = false;
+
+      const blockingLlm: LLMFnWithModel = Object.assign(
+        async () => {
+          if (!activeStarted) {
+            activeStarted = true;
+            await new Promise<void>((r) => { resolveActive = r; });
+          }
+          throw new Error("stub LLM");
+        },
+        { model: "stub" },
+      );
+
+      const activeJob = enqueue(queueDb, "proj-a:self");
+      const distiller = startDistiller(queueDb, pools, blockingLlm, {
+        drainIntervalMs: 20,
+        sweepIntervalMs: 60_000,
+        shutdownGraceMs: 500,
+      });
+      try {
+        // Wait for the active job to be claimed and blocked.
+        await waitFor(() => activeStarted, 2000);
+
+        // Enqueue an explicit job and wake() — the wake must be latched
+        // (not run concurrently), and stop() must suppress it.
+        const deferredJob = enqueue(queueDb, "proj-b:self", {
+          priority: PRIORITY_EXPLICIT, origin: "mcp",
+        });
+        distiller.wake();
+
+        let stopDone = false;
+        const stopPromise = distiller.stop().then(() => { stopDone = true; });
+
+        // stop() must not resolve while the active job is still blocked.
+        await new Promise((r) => setTimeout(r, 30));
+        assert.equal(stopDone, false, "stop() must wait for in-flight work");
+
+        // Release the active job and let stop() finish.
+        resolveActive?.();
+        await stopPromise;
+        assert.equal(stopDone, true);
+
+        // The deferred explicit job must still be pending: shutdown must have
+        // suppressed the latched wake rather than starting a new run after stop.
+        assert.equal(
+          getJob(queueDb, deferredJob)?.attempts ?? 0, 0,
+          "deferred explicit job must remain unclaimed after shutdown",
+        );
+        assert.equal(
+          getJob(queueDb, deferredJob)?.status, "pending",
+        );
+      } finally {
+        resolveActive?.();
+        await distiller.stop().catch(() => {});
+      }
+    } finally { cleanup(root); }
+  });
+
+  test("same-store follow-up: a second enqueue for a running store stays pending until the first finishes", async () => {
+    const root = makeTempRoot();
+    try {
+      const pools = makePool(root);
+      const queueDb = new Database(":memory:");
+      initQueueSchema(queueDb);
+      const store = pools.resolve("proj-x", undefined, true);
+      await store.addStream("sess", [{ role: "user", content: "first batch" }]);
+
+      let resolveFirst: (() => void) | undefined;
+      let firstStarted = false;
+      let callCount = 0;
+
+      const blockingLlm: LLMFnWithModel = Object.assign(
+        async () => {
+          callCount++;
+          if (callCount === 1) {
+            firstStarted = true;
+            await new Promise<void>((r) => { resolveFirst = r; });
+          }
+          throw new Error("stub LLM");
+        },
+        { model: "stub" },
+      );
+
+      const firstJob = enqueue(queueDb, "proj-x:self");
+      const distiller = startDistiller(queueDb, pools, blockingLlm, {
+        drainIntervalMs: 20,
+        sweepIntervalMs: 60_000,
+      });
+      try {
+        await waitFor(() => firstStarted, 2000);
+        assert.equal(getJob(queueDb, firstJob)?.status, "running");
+
+        // Enqueue a second job for the same store while the first is running.
+        const followUp = enqueue(queueDb, "proj-x:self", {
+          priority: PRIORITY_EXPLICIT, origin: "mcp",
+        });
+        distiller.wake();
+
+        // While the first is running, the follow-up must not be claimed.
+        await new Promise((r) => setTimeout(r, 80));
+        assert.equal(
+          getJob(queueDb, followUp)?.attempts ?? 0, 0,
+          "follow-up job must not be claimed while the first is still running",
+        );
+
+        // Release the first and confirm the follow-up eventually runs.
+        resolveFirst?.();
+        const followUpRan = await waitFor(
+          () => (getJob(queueDb, followUp)?.attempts ?? 0) > 0,
+          2000,
+        );
+        assert.ok(followUpRan, "follow-up job ran after the first finished");
+      } finally {
+        resolveFirst?.();
+        await distiller.stop();
+      }
+    } finally { cleanup(root); }
+  });
+});
+
 // docs/future/reliability-hardening.md finding 2: an L2/L3 failure inside
 // distillOnce() must propagate as a thrown error so runJob's catch calls
 // failJob() (existing backoff/dead-letter), not completeJob() — a silently

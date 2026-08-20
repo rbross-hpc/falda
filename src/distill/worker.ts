@@ -194,11 +194,28 @@ export function startDistiller(
   // (falda distill inspect / stats), not used for ownership enforcement.
   const workerId = randomUUID();
 
-  // Graceful-shutdown bookkeeping: once stopping is true, drain()/wake() no
-  // longer claim new work; inFlight tracks the currently-running runJob()
-  // promise (if any) so stop() can await it before returning.
+  // Graceful-shutdown bookkeeping.
+  //
+  // `stopping`: set by stop() before timer teardown; prevents any new job
+  //   claim from either path from that point forward.
+  //
+  // `inFlight`: the single authoritative exclusive-lane promise. Both timed
+  //   drain and wake drain share this one slot. Only one runJob() executes at
+  //   any time — a new claim may not be made unless inFlight is null. The
+  //   assignment and the null-check are synchronous (no await between them),
+  //   so no second path can slip a claim in between.
+  //
+  // `wakeRequested`: set by wake() when a wake signal arrives while the lane
+  //   is busy. The lane's finally-block checks this flag on completion and, if
+  //   still set and not stopping, immediately starts an explicit-priority drain
+  //   rather than waiting for the next timed tick. Multiple concurrent wakes
+  //   while the lane is busy coalesce into one deferred pass (the flag is a
+  //   boolean, not a counter — queue rows are the durable source of work).
+  //
+  // docs/future/reliability-hardening.md finding 15.
   let stopping = false;
   let inFlight: Promise<void> | null = null;
+  let wakeRequested = false;
 
   // Recover jobs orphaned by a previous crash (stuck 'running' past their
   // lease) before the first sweep/drain tick — see the module doc comment.
@@ -238,48 +255,54 @@ export function startDistiller(
     }
   };
 
+  // Exclusive execution lane — the shared entry point for both timed drain
+  // and wake drain. Synchronously checks and acquires `inFlight` so no second
+  // caller can slip a claim in between the check and the assignment.
+  //
+  // `work` is called while the lane is held. When it resolves or rejects, the
+  // lane is released and — if a wake arrived while the lane was busy — an
+  // explicit-priority drain pass is started immediately rather than waiting
+  // for the next timed tick.
+  const acquireAndRun = (work: () => Promise<void>): boolean => {
+    if (stopping || inFlight !== null) return false;
+    const p = (async () => {
+      try {
+        await work();
+      } finally {
+        inFlight = null;
+        // Service a latched wake immediately, unless shutdown has started.
+        if (wakeRequested && !stopping) {
+          wakeRequested = false;
+          acquireAndRun(runWakePass);
+        }
+      }
+    })();
+    inFlight = p;
+    return true;
+  };
+
   // Timed drain: claim and run exactly one ready job per tick, highest
   // priority first. This is the passive-backlog throughput ceiling — a
   // multi-tenant sweep backlog drains at one tenant per drainIntervalMs.
-  // Once stopping, no new job is claimed (but a job already in flight from
-  // a prior tick is left to finish — see inFlight/stop()).
-  const drain = async () => {
-    if (stopping) return;
-    const job = claimNext(queueDb, { leaseMs, workerId });
-    if (!job) return;
-    const p = runJob(job);
-    inFlight = p;
-    try {
-      await p;
-    } finally {
-      if (inFlight === p) inFlight = null;
-    }
+  // If the lane is busy (inFlight !== null), this tick is simply skipped;
+  // missed ticks do not accumulate into catch-up work.
+  const drain = () => {
+    acquireAndRun(async () => {
+      const job = claimNext(queueDb, { leaseMs, workerId });
+      if (!job) return;
+      await runJob(job);
+    });
   };
 
-  // Wake: drain every currently-ready EXPLICIT-priority job immediately,
-  // bounded and re-entrancy-guarded so overlapping wake() calls (e.g. two
-  // falda_distill calls landing close together) collapse into one loop
-  // rather than running concurrently against the same queue. Once stopping,
-  // wake() is a no-op (see the returned handle's wake()).
-  let waking = false;
-  const drainHighPriority = async () => {
-    if (waking || stopping) return;
-    waking = true;
-    try {
-      for (let i = 0; i < MAX_WAKE_DRAIN_PER_CALL; i++) {
-        if (stopping) break;
-        const job = claimNext(queueDb, { minPriority: PRIORITY_EXPLICIT, leaseMs, workerId });
-        if (!job) break;
-        const p = runJob(job);
-        inFlight = p;
-        try {
-          await p;
-        } finally {
-          if (inFlight === p) inFlight = null;
-        }
-      }
-    } finally {
-      waking = false;
+  // Wake drain pass: claim all currently-ready EXPLICIT-priority jobs in a
+  // bounded loop. Called either directly when the lane is idle, or deferred
+  // via the wakeRequested latch when the lane is busy.
+  const runWakePass = async () => {
+    for (let i = 0; i < MAX_WAKE_DRAIN_PER_CALL; i++) {
+      if (stopping) break;
+      const job = claimNext(queueDb, { minPriority: PRIORITY_EXPLICIT, leaseMs, workerId });
+      if (!job) break;
+      await runJob(job);
     }
   };
 
@@ -351,13 +374,15 @@ export function startDistiller(
   // Enqueue immediately on startup, then on every sweep interval.
   enqueueAll();
   const enqueueTimer = setInterval(enqueueAll, sweepIntervalMs);
-  // Drain on every drain interval.
-  const drainTimer = setInterval(() => { drain().catch(console.error); }, drainIntervalMs);
+  // Drain on every drain interval (skips silently if the lane is busy).
+  const drainTimer = setInterval(drain, drainIntervalMs);
   // Prune on every sweep interval.
   const pruneTimer = setInterval(prune, sweepIntervalMs);
 
   return {
     async stop() {
+      // Set stopping FIRST — prevents acquireAndRun from starting anything new
+      // and suppresses any deferred wake that fires after the active job ends.
       stopping = true;
       clearInterval(enqueueTimer);
       clearInterval(drainTimer);
@@ -380,7 +405,13 @@ export function startDistiller(
       }
     },
     wake() {
-      drainHighPriority().catch((e) => console.error("[falda-worker] wake drain failed:", e));
+      if (stopping) return;
+      // If the lane is idle, start a wake pass immediately.
+      // If it is busy, latch the request; the lane's finally-block will
+      // service it as soon as the current job finishes.
+      if (!acquireAndRun(runWakePass)) {
+        wakeRequested = true;
+      }
     },
   };
 }

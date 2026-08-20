@@ -838,6 +838,41 @@ place. Existing tests cover wake-vs-wake overlap only
 (`test/distill_worker.test.ts`); add timer-vs-timer and timer-vs-wake
 overlap cases once fixed.
 
+*Implementation plan:*
+
+1. Replace the separate timed-drain and wake coordination with one exclusive
+   execution lane represented by the authoritative `inFlight` promise. Both
+   paths must synchronously acquire that lane before calling `claimNext()`, so
+   at most one `runJob()` executes in the worker process.
+2. Add a `wakeRequested` latch. A wake received while a timed or wake-triggered
+   job is active must not overlap it, but must start an explicit-priority drain
+   immediately after the active job finishes. Busy timer ticks are skipped
+   rather than accumulated.
+3. Preserve the existing scheduling contracts: timed drains claim at most one
+   ready job per tick; wake drains claim only `PRIORITY_EXPLICIT` jobs and
+   remain bounded by `MAX_WAKE_DRAIN_PER_CALL`; wake signals may coalesce, but
+   queue rows remain the durable source of work.
+4. Do not coalesce queue rows against a running job. A follow-up row can
+   represent turns added after the active pass captured its input window and
+   must remain pending until the exclusive lane is free.
+5. Make shutdown set `stopping` before clearing timers and awaiting `inFlight`.
+   Completion of the active lane must not launch a latched wake after shutdown
+   starts, and no active promise may be overwritten or dropped from shutdown
+   tracking.
+6. Add regressions in `test/distill_worker.test.ts` for timer-vs-timer,
+   timer-vs-wake, wake-vs-timer, wake-vs-wake, shutdown with a deferred wake,
+   and a same-store follow-up job. Each overlap test must assert a maximum
+   concurrency of one; the timer-vs-wake case must also prove the deferred
+   explicit job starts without waiting for another timer tick.
+7. Verify queue priority/lease behavior, worker metrics balance, and graceful
+   shutdown alongside the full TypeScript typecheck, build, and test suite.
+
+*Operational mitigation:* until this fix is deployed, configure
+`FALDA_SHUTDOWN_GRACE_MS=600000` (10 minutes), above the observed 395.2-second
+production tail, and ensure the deployment platform's termination timeout is
+longer than the Falda grace period. Reassess this value only after phase timing
+provides a representative service-time percentile.
+
 **16. [High] Malformed LLM output during distillation is silently
 discarded, and the pass still reports success.** Extraction output is parsed
 line-by-line/as-a-JSON-array; any line or array element that fails
