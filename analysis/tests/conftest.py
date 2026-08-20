@@ -4,6 +4,52 @@ from pathlib import Path
 import pytest
 
 
+def _seed_recall_traces(tmp_path: Path) -> None:
+    """Create recall_traces.db at the Falda root with one trace for acme:self."""
+    db = sqlite3.connect(tmp_path / "recall_traces.db")
+    db.executescript(
+        """
+        CREATE TABLE recall_traces (
+          recall_id TEXT PRIMARY KEY, store_key TEXT NOT NULL, tenant TEXT NOT NULL,
+          pool TEXT, query TEXT NOT NULL, requested_budget INTEGER, used_budget INTEGER,
+          mode TEXT NOT NULL DEFAULT 'explicit', policy_snapshot TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE TABLE recall_trace_items (
+          recall_id TEXT NOT NULL, ordinal INTEGER NOT NULL, tier TEXT NOT NULL,
+          item_id TEXT NOT NULL, source TEXT NOT NULL, score REAL, chars INTEGER,
+          usage TEXT NOT NULL DEFAULT 'unknown',
+          PRIMARY KEY (recall_id, ordinal)
+        );
+        """
+    )
+    db.execute(
+        "INSERT INTO recall_traces VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (
+            "recall-1",
+            "acme:self",
+            "acme",
+            None,
+            "what do we know about the project?",
+            6000,
+            4200,
+            "explicit",
+            "{}",
+            "2025-01-03T00:02:00Z",
+        ),
+    )
+    db.executemany(
+        "INSERT INTO recall_trace_items VALUES(?,?,?,?,?,?,?,?)",
+        [
+            ("recall-1", 0, "T1", "a2", "ranked", 0.92, 120, "used"),
+            ("recall-1", 1, "T2", "episode-1", "scene", 0.75, 400, "used"),
+            ("recall-1", 2, "T3", "core", "core", None, 18, "used"),
+        ],
+    )
+    db.commit()
+    db.close()
+
+
 @pytest.fixture
 def falda_root(tmp_path: Path) -> Path:
     store = tmp_path / "tenants" / "acme" / "self"
@@ -21,7 +67,8 @@ def falda_root(tmp_path: Path) -> Path:
           pinned INTEGER DEFAULT 0, created_at TEXT
         );
         CREATE TABLE scenes (
-          scene_id TEXT PRIMARY KEY, scene_kind TEXT, status TEXT
+          scene_id TEXT PRIMARY KEY, scene_kind TEXT, status TEXT,
+          title TEXT, summary TEXT
         );
         CREATE TABLE distillation_passes (
           pass_id TEXT PRIMARY KEY, store_key TEXT, watermark_start INTEGER,
@@ -61,8 +108,11 @@ def falda_root(tmp_path: Path) -> Path:
         ],
     )
     db.executemany(
-        "INSERT INTO scenes VALUES(?,?,?)",
-        [("episode-1", "episode", "active"), ("topic-1", "topic", "retired")],
+        "INSERT INTO scenes VALUES(?,?,?,?,?)",
+        [
+            ("episode-1", "episode", "active", "First Episode", "A summary of episode one."),
+            ("topic-1", "topic", "retired", "Stable Topic", "A summary of the stable topic."),
+        ],
     )
     db.executemany(
         "INSERT INTO distillation_passes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -168,4 +218,5 @@ def falda_root(tmp_path: Path) -> Path:
     )
     db.commit()
     db.close()
+    _seed_recall_traces(tmp_path)
     return tmp_path

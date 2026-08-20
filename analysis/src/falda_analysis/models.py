@@ -118,3 +118,33 @@ class Pass:
     @property
     def likely_reconciliation(self) -> bool:
         return self.input_turn_count == 0
+
+
+@dataclass(frozen=True)
+class RecallItem:
+    ordinal: int
+    tier: str
+    item_id: str
+    source: str
+    score: float | None
+    chars: int | None
+    usage: str
+    content: str | None
+
+
+@dataclass(frozen=True)
+class LiveRecall:
+    recall_id: str
+    query: str
+    mode: str
+    created_at: str
+    requested_budget: int | None
+    used_budget: int | None
+    items: tuple[RecallItem, ...]
+
+
+@dataclass(frozen=True)
+class LiveState:
+    summary: StoreSummary
+    latest_pass: Pass | None
+    last_recall: LiveRecall | None

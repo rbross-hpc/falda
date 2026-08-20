@@ -5,7 +5,7 @@ from pathlib import Path
 import pytest
 from textual.widgets import Collapsible, DataTable, Label, ListView, Select, Static
 
-from falda_analysis.app import HistoryApp, SceneZoom
+from falda_analysis.app import HistoryApp, LiveScreen, SceneZoom
 from falda_analysis.store import store_paths
 
 pytestmark = pytest.mark.asyncio
@@ -271,3 +271,168 @@ async def test_refresh_reloads_and_resets_to_all_first_pass(falda_root: Path) ->
         assert app.selected_pass is not None
         assert app.selected_pass.pass_id == "pass-1"
         assert len(app.all_passes) == 3
+
+
+# ─── LiveScreen tests ─────────────────────────────────────────────────────────
+
+
+async def test_l_key_pushes_live_screen(falda_root: Path) -> None:
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        await pilot.press("l")
+        await pilot.pause()
+        assert isinstance(app.screen, LiveScreen)
+
+
+async def test_live_escape_pops_back_to_history(falda_root: Path) -> None:
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        await pilot.press("l")
+        await pilot.pause()
+        assert isinstance(app.screen, LiveScreen)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, LiveScreen)
+
+
+async def test_live_screen_shows_latest_pass(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause()
+        await pilot.pause()
+        heading = screen.query_one("#live-pass-heading", Static)
+        rendered = str(heading.render())
+        assert "pass-3" in rendered
+
+
+async def test_live_screen_shows_recall(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause()
+        await pilot.pause()
+        heading = screen.query_one("#live-recall-heading", Static)
+        rendered = str(heading.render())
+        assert "recall" in rendered.lower() or "what do we know" in rendered
+
+
+async def test_live_screen_no_recall_db_shows_no_telemetry(falda_root: Path) -> None:
+    (falda_root / "recall_traces.db").unlink()
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause()
+        await pilot.pause()
+        heading = screen.query_one("#live-recall-heading", Static)
+        rendered = str(heading.render())
+        assert "no telemetry" in rendered.lower()
+
+
+async def test_live_pause_toggles(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause()
+        assert not screen.paused
+        await pilot.press("p")
+        await pilot.pause()
+        assert screen.paused
+        await pilot.press("p")
+        await pilot.pause()
+        assert not screen.paused
+
+
+async def test_live_force_poll_while_paused_reflects_changes(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause()
+        await pilot.pause()
+
+        await pilot.press("p")
+        await pilot.pause()
+        assert screen.paused
+
+        db_path, _ = store_paths(falda_root, "acme")
+        db = sqlite3.connect(db_path)
+        try:
+            db.execute(
+                "INSERT INTO distillation_passes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "pass-live",
+                    "acme:self",
+                    3,
+                    None,
+                    "2025-01-04T00:00:00Z",
+                    None,
+                    "running",
+                    None,
+                    None,
+                    None,
+                    "model",
+                    "v1",
+                    "0.1.0",
+                ),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        await pilot.press("r")
+        await pilot.pause(delay=0.5)
+
+        assert screen._state is not None
+        assert screen._state.latest_pass is not None
+        assert screen._state.latest_pass.pass_id == "pass-live"
+        assert screen._state.latest_pass.status == "running"
+
+
+async def test_live_delta_marker_set_on_change(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause()
+        await pilot.pause()
+
+        await pilot.press("p")
+        await pilot.pause()
+
+        db_path, _ = store_paths(falda_root, "acme")
+        db = sqlite3.connect(db_path)
+        try:
+            db.execute(
+                "INSERT INTO distillation_passes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "pass-new",
+                    "acme:self",
+                    3,
+                    4,
+                    "2025-01-05T00:00:00Z",
+                    "2025-01-05T00:01:00Z",
+                    "done",
+                    1,
+                    1,
+                    None,
+                    "model",
+                    "v1",
+                    "0.1.0",
+                ),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        await pilot.press("r")
+        await pilot.pause(delay=0.5)
+
+        heading = screen.query_one("#live-pass-heading", Static)
+        rendered = str(heading.render())
+        assert "pass-new" in rendered
+        assert "Δ" in rendered
