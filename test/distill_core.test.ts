@@ -317,6 +317,58 @@ describe("distillOnce", () => {
     } finally { cleanup(s, blobDir); }
   });
 
+  test("retry of a failed pass updates provenance to the new model/prompt/distiller version", async () => {
+    const { s, blobDir } = makeStore();
+    try {
+      await s.addStream("sess-1", [{ role: "user", content: "deploy in bin/release" }]);
+
+      // First attempt: malformed extraction fails the pass.
+      const failLlm = makeMockLLM(["prose — this is malformed"]);
+      await assert.rejects(
+        () => distillOnce(s, failLlm, {
+          storeKey: "retry-prov:self",
+          model: "model-v1", promptVersion: "pv1", distillerVersion: "dv1",
+        }),
+        /malformed/,
+      );
+      const db = (s as any).db as Database.Database;
+      const passId = db.prepare(
+        "SELECT pass_id FROM distillation_passes ORDER BY started_at DESC LIMIT 1"
+      ).get() as { pass_id: string };
+      assert.ok(passId?.pass_id, "failed pass row written");
+      const rowAfterFail = db.prepare("SELECT * FROM distillation_passes WHERE pass_id=?").get(passId.pass_id) as any;
+      assert.equal(rowAfterFail.status, "failed");
+      assert.equal(rowAfterFail.model, "model-v1");
+      assert.equal(rowAfterFail.prompt_version, "pv1");
+
+      // Second attempt: same watermark window, different provenance, succeeds.
+      const goodLlm = makeMockLLM([
+        `{"type":"fact","content":"Deploy in bin/release.","confidence":"high"}`,
+        `{"action":"store","target_ids":[],"rationale":"New."}`,
+        "Deploy session", "Deploy discussed.",
+        "Deploy topic", "Deploy facts.",
+        "# Core\n\nDeploy in bin/release.",
+      ]);
+      await distillOnce(s, goodLlm, {
+        storeKey: "retry-prov:self",
+        model: "model-v2", promptVersion: "pv2", distillerVersion: "dv2",
+      });
+
+      // Same deterministic pass_id must produce exactly one row.
+      const allRows = db.prepare("SELECT * FROM distillation_passes").all() as any[];
+      assert.equal(allRows.length, 1, "exactly one distillation_passes row for this window");
+      const rowAfterRetry = allRows[0];
+      assert.equal(rowAfterRetry.pass_id, passId.pass_id, "same deterministic pass_id");
+      assert.equal(rowAfterRetry.status, "done");
+      assert.equal(rowAfterRetry.error, null, "error cleared on success");
+      assert.ok(rowAfterRetry.completed_at, "completion time set");
+      assert.equal(rowAfterRetry.model, "model-v2", "model reflects retry attempt");
+      assert.equal(rowAfterRetry.prompt_version, "pv2", "prompt_version reflects retry attempt");
+      assert.equal(rowAfterRetry.distiller_version, "dv2", "distiller_version reflects retry attempt");
+      assert.equal(rowAfterRetry.candidate_count, 1);
+    } finally { cleanup(s, blobDir); }
+  });
+
   test("consolidation_decisions are recorded idempotently under pass id", async () => {
     const { s, blobDir } = makeStore();
     try {
