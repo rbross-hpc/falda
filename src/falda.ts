@@ -1219,11 +1219,30 @@ export class Falda {
     input_turn_count: number;
     model?: string; prompt_version?: string; distiller_version?: string;
   }): void {
+    // INSERT OR REPLACE (upsert on primary key) so that a retry of the same
+    // deterministic pass_id refreshes the row with the latest attempt's
+    // provenance (model, prompt_version, distiller_version, started_at) and
+    // clears stale completion data. Without this, a successful retry run
+    // under a different model or prompt version would still display the
+    // original failed attempt's provenance in `falda distill inspect`.
     this.db.prepare(
-      `INSERT OR IGNORE INTO distillation_passes
+      `INSERT INTO distillation_passes
        (pass_id,store_key,watermark_start,watermark_end,started_at,status,
-        input_turn_count,model,prompt_version,distiller_version)
-       VALUES(?,?,?,?,?,'running',?,?,?,?)`
+        input_turn_count,candidate_count,error,model,prompt_version,distiller_version)
+       VALUES(?,?,?,?,?,'running',?,NULL,NULL,?,?,?)
+       ON CONFLICT(pass_id) DO UPDATE SET
+         store_key=excluded.store_key,
+         watermark_start=excluded.watermark_start,
+         watermark_end=excluded.watermark_end,
+         started_at=excluded.started_at,
+         completed_at=NULL,
+         status='running',
+         input_turn_count=excluded.input_turn_count,
+         candidate_count=NULL,
+         error=NULL,
+         model=excluded.model,
+         prompt_version=excluded.prompt_version,
+         distiller_version=excluded.distiller_version`
     ).run(
       p.pass_id, p.store_key, p.watermark_start, p.watermark_end,
       new Date().toISOString(), p.input_turn_count,
