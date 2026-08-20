@@ -76,44 +76,41 @@ trusted, and an index that is out of range or repeated is treated as
 unresolved rather than applied.
 
 This is the one place in the design that chooses strictness over tolerance.
-Every other malformed-input path in distillation degrades to a skip, which
-loses a candidate — recoverable, and visible in the pass record. Applying
-candidate 7's decision to candidate 3 instead would *write* the wrong
-consolidation: an atom merged into an unrelated one, or updated with content
-that never belonged to it. That corrupts memory silently and is close to
-untraceable after the fact. A dropped decision is cheap; a misattributed one
-is not.
+Applying candidate 7's decision to candidate 3 instead would *write* the
+wrong consolidation: an atom merged into an unrelated one, or updated with
+content that never belonged to it. That corrupts memory silently and is close
+to untraceable after the fact. A dropped decision is cheap; a misattributed
+one is not.
 
 ### A parser that can say "unresolved"
 
-`parseConsolidationBatch(raw, n)` returns `Array<ConsolidationDecision | undefined>`,
-where `undefined` means *no usable decision for this candidate*.
+`parseConsolidationBatch(raw, allowedTargetIdsByCandidate)` returns
+`Array<ConsolidationDecision | undefined>`, where `undefined` means
+*no usable decision for this candidate*.
 
-That distinction does not exist today. The current `parseConsolidation`
-returns `{ action: "skip", rationale: "malformed LLM response" }` for a
-response with no JSON object, and `{ action: "skip", rationale: "parse error" }`
-when `JSON.parse` throws — so a garbled reply is indistinguishable from the
-model deliberately skipping a redundant candidate, and the candidate is
-dropped either way. Reusing that helper for the batch would make a single bad
-response look like N deliberate skips, silently discarding an entire chunk.
+`undefined` is distinct from a parsed `action: "skip"`. An explicit skip is
+a successful, auditable decision; `undefined` means the batch entry is
+absent or fails structural/action/cardinality/membership validation. The
+shared `validateConsolidationDecision` helper enforces: known action,
+`target_ids` is an array of distinct strings, every target was shown to the
+model for that specific candidate (candidate-local membership), and
+action-specific cardinality (store/skip → 0, update → 1, merge → 2+).
 
-The parser mirrors the robustness `parseCandidates` already has: try the
-whole payload as a JSON array first, then fall back to scanning line by line
-for parseable objects.
+The parser tries the whole payload as a JSON array first, then falls back
+to scanning line by line for parseable objects.
 
 ### Fallback: retry unresolved individually
 
-Indices still unresolved after parsing are re-issued through today's exact
-path — `llm(consolidationPrompt(candidate, existing))` parsed with the
-existing `parseConsolidation`.
+Indices still unresolved after parsing are re-issued through the single-
+candidate path — `llm(consolidationPrompt(candidate, existing))` parsed with
+`parseConsolidation`, which applies the same strict validation.
 
 The worst case is therefore one call more than today's behaviour — the
 wasted batched call plus the N individual retries it falls back to — reached
-only when the batch misbehaves. No candidate is dropped by the batching itself.
-Note this makes the batched path strictly more robust than the per-candidate
-path it replaces, which still silently skips on a parse failure; that
-pre-existing behaviour is left alone here rather than changed as a side
-effect.
+only when the batch misbehaves. No candidate is dropped by the batching
+itself. If an individual fallback also fails validation, the whole pass fails
+retryably before any L1 write: the watermark does not advance and the queue
+backoff mechanism engages (finding 16).
 
 ### Chunking is not optional
 
