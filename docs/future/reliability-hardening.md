@@ -914,6 +914,42 @@ candidate rather than silently skipping (`src/distill/core.ts:494-503`) —
 extend that same "never silently drop a candidate" discipline to the
 all-malformed-extraction and single-consolidation-parse-failure cases.
 
+*Implementation plan:*
+
+1. Update the extraction prompt to require `[]` for an intentional zero-candidate
+   result. This removes the ambiguity between "nothing to extract" and
+   "malformed/truncated response". Bump `PROMPT_VERSION`.
+2. Make `parseCandidates` return a discriminated result (`ok/candidates` vs
+   `error/reason`) instead of silently dropping bad output. Rules:
+   - Strip one markdown fence as before.
+   - `[]` → success with zero candidates (intentional empty extraction).
+   - Blank/whitespace-only → failure.
+   - Array starting with `[` but failing to parse → failure.
+   - Valid array containing any invalid candidate object → failure (whole-response
+     atomicity; no silent partial extraction).
+   - JSON-lines: any object-looking line with invalid JSON or bad fields →
+     failure. Surrounding non-object prose is tolerated if at least one valid
+     object exists; fully prose-only is a failure.
+3. Throw a `MalformedLLMOutputError` immediately after parsing if extraction
+   failed, before any candidate retrieval, consolidation, embedding, or the L1
+   transaction. The watermark is left unchanged; the worker's existing
+   `failJob()` path engages retry/backoff.
+4. Make `parseConsolidation` return `ConsolidationDecision | undefined`:
+   - Valid `action: "skip"` remains a successful decision.
+   - Missing JSON object, bad JSON, or unknown action → `undefined` (never
+     synthesize a `skip`).
+5. In `decideIndividually`, throw `MalformedLLMOutputError` when
+   `parseConsolidation` returns `undefined`. This applies to both the
+   historical single-candidate path and individual fallbacks after a batch.
+6. No watermark, atom, evidence, decision, or dirty-flag write is made on any
+   malformed path. Pass telemetry records failure via the existing
+   `failJob`/`recordPassStart` path.
+7. Preserve all existing tolerances: fenced JSON, JSON arrays, JSON-lines, and
+   explicit `skip` decisions remain fully supported.
+8. Add `test/distill_malformed_output.test.ts` with regressions for each
+   failure mode, plus a worker-level retry integration test.
+9. Verify `npm run typecheck`, `npm run build`, and all tests pass.
+
 **17. [High] `falda restore` trusts manifest paths and leaves stale state
 behind on in-place restore.** `readManifest()` only checks that `stores`/`top_level`
 are arrays (`src/restore.ts:56-66`); nothing validates that any entry's
