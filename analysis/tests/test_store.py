@@ -7,10 +7,12 @@ import pytest
 
 from falda_analysis.store import (
     StoreError,
+    load_core_full_text,
     load_last_recall,
     load_latest_pass,
     load_live_state,
     load_passes,
+    load_scene_full_text,
     load_summary,
     open_store,
     reconstruct_scene_membership,
@@ -344,3 +346,39 @@ def test_load_live_state_bundles_all_three(falda_root: Path) -> None:
     assert state.latest_pass.pass_id == "pass-3"
     assert state.last_recall is not None
     assert state.last_recall.recall_id == "recall-1"
+
+
+def test_load_scene_full_text_returns_untruncated(falda_root: Path) -> None:
+    result = load_scene_full_text(falda_root, "acme", "episode-1")
+    assert result is not None
+    title, summary = result
+    assert title == "First Episode"
+    assert summary is not None
+    assert len(summary) == 400
+    assert summary == "A" * 400
+
+
+def test_load_scene_full_text_unknown_scene(falda_root: Path) -> None:
+    assert load_scene_full_text(falda_root, "acme", "no-such-scene") is None
+
+
+def test_load_core_full_text_returns_full_content(falda_root: Path) -> None:
+    text = load_core_full_text(falda_root, "acme")
+    assert text is not None
+    assert "Core" in text
+    assert "Current state" in text
+
+
+def test_load_core_full_text_absent(falda_root: Path) -> None:
+    _, blob_dir = store_paths(falda_root, "acme")
+    (blob_dir / "core.md").unlink()
+    assert load_core_full_text(falda_root, "acme") is None
+
+
+def test_load_last_recall_t2_snippet_is_truncated(falda_root: Path) -> None:
+    recall = load_last_recall(falda_root, "acme")
+    assert recall is not None
+    t2 = next(item for item in recall.items if item.tier == "T2")
+    assert t2.content is not None
+    assert len(t2.content) <= 301  # 300 chars + possible "…"
+    assert t2.content.endswith("…")

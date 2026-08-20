@@ -565,3 +565,34 @@ def load_live_state(root: Path, tenant: str) -> LiveState:
     latest_pass = load_latest_pass(root, tenant)
     last_recall = load_last_recall(root, tenant)
     return LiveState(summary=summary, latest_pass=latest_pass, last_recall=last_recall)
+
+
+def load_scene_full_text(
+    root: Path, tenant: str, scene_id: str
+) -> tuple[str | None, str | None] | None:
+    """Return (title, summary) for scene_id with no truncation, or None if unavailable.
+
+    Returns None when the scene is not found, the scenes table lacks title/summary
+    columns (old schema), or any read error occurs.
+    """
+    try:
+        with open_store(root, tenant) as db:
+            row = db.execute(
+                "SELECT title, summary FROM scenes WHERE scene_id=?", (scene_id,)
+            ).fetchone()
+        if row is None:
+            return None
+        title = str(row["title"]) if row["title"] is not None else None
+        summary = str(row["summary"]) if row["summary"] is not None else None
+        return (title, summary)
+    except (sqlite3.OperationalError, StoreError):
+        return None
+
+
+def load_core_full_text(root: Path, tenant: str) -> str | None:
+    """Return the full untruncated text of core.md, or None if absent."""
+    _, blob_dir = store_paths(root, tenant)
+    core_path = blob_dir / "core.md"
+    if not core_path.is_file():
+        return None
+    return core_path.read_text(encoding="utf-8")

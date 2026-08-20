@@ -2,13 +2,10 @@ import sqlite3
 from datetime import UTC, datetime
 from pathlib import Path
 
-import pytest
 from textual.widgets import Collapsible, DataTable, Label, ListView, Select, Static
 
-from falda_analysis.app import HistoryApp, LiveScreen, SceneZoom
+from falda_analysis.app import HistoryApp, LiveScreen, RecallZoom, SceneZoom
 from falda_analysis.store import store_paths
-
-pytestmark = pytest.mark.asyncio
 
 
 def _set_pass_started_at(falda_root: Path, pass_id: str, started_at: str) -> None:
@@ -436,3 +433,175 @@ async def test_live_delta_marker_set_on_change(falda_root: Path) -> None:
         rendered = str(heading.render())
         assert "pass-new" in rendered
         assert "Δ" in rendered
+
+
+# ─── Recall zoom tests ────────────────────────────────────────────────────────
+
+
+async def test_recall_t2_row_opens_zoom_modal(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause(delay=0.5)
+
+        table = screen.query_one("#live-recall", DataTable)
+        table.focus()
+        t2_row = next(
+            row_idx
+            for row_idx, row_key in enumerate(table.rows)
+            if str(row_key.value) != "__empty__"
+            and table.get_row(row_key)[1] == "T2"
+        )
+        table.move_cursor(row=t2_row)
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, RecallZoom)
+        assert "T2" in app.screen._header or "episode-1" in app.screen._header
+
+
+async def test_recall_t2_zoom_shows_full_untruncated_text(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test(size=(220, 50)) as pilot:
+        app.push_screen(screen)
+        await pilot.pause(delay=0.5)
+
+        table = screen.query_one("#live-recall", DataTable)
+        table.focus()
+        t2_row = next(
+            row_idx
+            for row_idx, row_key in enumerate(table.rows)
+            if str(row_key.value) != "__empty__"
+            and table.get_row(row_key)[1] == "T2"
+        )
+        table.move_cursor(row=t2_row)
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, RecallZoom)
+        assert app.screen._body == "A" * 400
+
+
+async def test_recall_t3_row_opens_zoom_with_core_text(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause(delay=0.5)
+
+        table = screen.query_one("#live-recall", DataTable)
+        table.focus()
+        t3_row = next(
+            row_idx
+            for row_idx, row_key in enumerate(table.rows)
+            if str(row_key.value) != "__empty__"
+            and table.get_row(row_key)[1] == "T3"
+        )
+        table.move_cursor(row=t3_row)
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert isinstance(app.screen, RecallZoom)
+        assert "Core" in app.screen._body
+
+
+async def test_recall_t1_row_does_not_open_zoom(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause(delay=0.5)
+
+        table = screen.query_one("#live-recall", DataTable)
+        table.focus()
+        t1_row = next(
+            row_idx
+            for row_idx, row_key in enumerate(table.rows)
+            if str(row_key.value) != "__empty__"
+            and table.get_row(row_key)[1] == "T1"
+        )
+        table.move_cursor(row=t1_row)
+        await pilot.press("enter")
+        await pilot.pause()
+
+        assert not isinstance(app.screen, RecallZoom)
+
+
+async def test_recall_zoom_closes_with_escape(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause(delay=0.5)
+
+        table = screen.query_one("#live-recall", DataTable)
+        table.focus()
+        t3_row = next(
+            row_idx
+            for row_idx, row_key in enumerate(table.rows)
+            if str(row_key.value) != "__empty__"
+            and table.get_row(row_key)[1] == "T3"
+        )
+        table.move_cursor(row=t3_row)
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, RecallZoom)
+
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, RecallZoom)
+        assert isinstance(app.screen, LiveScreen)
+
+
+# ─── T2 changed-first sort tests ─────────────────────────────────────────────
+
+
+def test_scene_changed_predicate() -> None:
+    from falda_analysis.app import _scene_changed
+    from falda_analysis.models import SceneEffect
+
+    changed = SceneEffect("s1", "episode", "T", "updated", 1, 1, (), (), False, False)
+    unchanged = SceneEffect("s2", "episode", "T", "unchanged", 1, 1, (), (), False, False)
+    regen = SceneEffect("s3", "episode", "T", "unchanged", 1, 1, (), (), True, False)
+
+    assert _scene_changed(changed) is True
+    assert _scene_changed(unchanged) is False
+    assert _scene_changed(regen) is True
+
+
+def test_scene_changed_sort_puts_changed_first() -> None:
+    from falda_analysis.app import _scene_changed
+    from falda_analysis.models import SceneEffect
+
+    scenes = [
+        SceneEffect("s1", "episode", "T", "unchanged", 1, 1, (), (), False, False),
+        SceneEffect("s2", "episode", "T", "updated", 1, 1, (), (), False, False),
+        SceneEffect("s3", "topic", "T", "unchanged", 1, 1, (), (), True, False),
+        SceneEffect("s4", "topic", "T", "unchanged", 1, 1, (), (), False, False),
+    ]
+    sorted_scenes = sorted(scenes, key=lambda sc: not _scene_changed(sc))
+    assert _scene_changed(sorted_scenes[0]) is True
+    assert _scene_changed(sorted_scenes[1]) is True
+    assert _scene_changed(sorted_scenes[2]) is False
+    assert _scene_changed(sorted_scenes[3]) is False
+
+
+async def test_live_t2_detail_renders_with_scenes(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause(delay=0.5)
+        assert screen._state is not None
+        assert screen._state.latest_pass is not None
+        scenes = screen._state.latest_pass.scenes
+        changed = [s for s in scenes if s.effect != "unchanged"]
+        unchanged = [s for s in scenes if s.effect == "unchanged"]
+        assert len(changed) > 0
+        assert len(unchanged) > 0
+        sorted_scenes = sorted(scenes, key=lambda sc: not (
+            sc.effect != "unchanged" or sc.summary_regenerated or sc.embedding_regenerated
+        ))
+        assert sorted_scenes[0].effect != "unchanged"
