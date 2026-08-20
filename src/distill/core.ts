@@ -229,9 +229,11 @@ const CONSOLIDATION_ACTIONS = ["store", "update", "merge", "skip"] as const;
  *
  *  Returns a dense array of length `n`; `undefined` means "no usable decision
  *  for this candidate", which the caller retries individually. That gap is
- *  deliberately distinct from a parsed `action: "skip"` — `parseConsolidation`
- *  collapses malformed input into a skip, and reusing it here would make one
- *  bad reply look like N deliberate skips and silently discard a whole chunk.
+ *  deliberately distinct from a parsed `action: "skip"` — a valid explicit
+ *  skip is a successful decision; `undefined` means the batch entry is absent
+ *  or fails structural/action/cardinality/membership validation. Reusing a
+ *  skip sentinel would make a bad reply look like N deliberate skips and
+ *  silently discard a whole chunk without any audit trace.
  *
  *  Decisions are correlated by their stated `candidate` index, never by array
  *  position. An out-of-range, non-integer, or repeated index is dropped rather

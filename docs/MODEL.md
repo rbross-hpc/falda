@@ -479,6 +479,14 @@ alongside the authoritative state, not a second source of truth for it.
 Only passes run after this instrumentation existed have rows in
 `distillation_passes`; there is no retroactive backfill.
 
+A `distillation_passes` row is identified by a deterministic `pass_id`
+derived from the store key and watermark window (§8.5). When a pass fails
+before advancing the watermark and is retried over the same window, the
+retry refreshes the same row: `started_at`, `model`, `prompt_version`,
+`distiller_version`, `status`, `error`, `candidate_count`, and
+`completed_at` all describe the **latest attempt**. Full per-attempt
+history is not retained.
+
 ### 5.6 Provenance is also what defines episode membership
 
 `atom_evidence`, joined through `stream_id` to `stream.session_id`, is not
@@ -866,14 +874,18 @@ The consolidation decision, per candidate atom:
 | **merge** | Several existing atoms collapse into one → same mechanism as update, every target merged into the winner, evidence unioned across all absorbed atoms. |
 | **skip** | Redundant, transient, or low-value → drop it; no evidence recorded. |
 
-The pass records what it **applied**, not what was requested: a merge
-naming targets that no longer exist degrades to a store; one whose only
-target is its own prior copy degrades to a skip. Every applied action is
-recorded in `consolidation_decisions` (§5.5) with a deterministic key
-derived from the pass id (§8.5), so a re-fired pass does not duplicate
-audit rows. The candidate that was extracted — not only the action taken
-on it — is recorded on that same row (§5.5), so a rejected (`skip`)
-candidate remains inspectable after the pass.
+Decisions are validated before any L1 write: action-specific target
+cardinality must match (`store`/`skip` → exactly zero targets; `update`
+→ exactly one; `merge` → at least two), every target id must have been
+presented to the model for that candidate (candidate-local membership),
+and ids must be distinct strings. An invalid or malformed decision fails
+the pass retryably without advancing the watermark — it is not silently
+converted into a skip. Every applied action is recorded in
+`consolidation_decisions` (§5.5) with a deterministic key derived from
+the pass id (§8.5), so a re-fired pass does not duplicate audit rows.
+The candidate that was extracted — not only the action taken on it — is
+recorded on that same row (§5.5), so a rejected (`skip`) candidate
+remains inspectable after the pass.
 
 ### 8.3 L2 — organize into scenes
 
