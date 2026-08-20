@@ -168,6 +168,21 @@ def falda_root(tmp_path: Path) -> Path:
                 "v1",
                 "0.1.0",
             ),
+            (
+                "pass-4",
+                "acme:self",
+                3,
+                4,
+                "2025-01-04T00:00:00Z",
+                "2025-01-04T00:01:00Z",
+                "failed",
+                1,
+                1,
+                "L2/L3 reconciliation incomplete: 2 scene narration failure(s)",
+                "model",
+                "v1",
+                "0.1.0",
+            ),
         ],
     )
     db.executemany(
@@ -208,6 +223,8 @@ def falda_root(tmp_path: Path) -> Path:
             ("pass-2", "topic-1", "topic", "Stable", "unchanged", 1, 1, "[]", "[]", 0, 0),
             ("pass-3", "episode-1", "episode", "First", "updated", 1, 1, '["a2"]', '["a1"]', 1, 1),
             ("pass-3", "topic-1", "topic", "Stable", "unchanged", 1, 1, "[]", "[]", 0, 0),
+            ("pass-4", "episode-1", "episode", "First", "unchanged", 1, 1, "[]", "[]", 0, 0),
+            ("pass-4", "topic-1", "topic", "Stable", "unchanged", 1, 1, "[]", "[]", 0, 0),
         ],
     )
     db.executemany(
@@ -216,6 +233,7 @@ def falda_root(tmp_path: Path) -> Path:
             ("pass-1", "regenerated", None, "hash1", 0, 10),
             ("pass-2", "failed", "hash1", "hash1", 10, 10),
             ("pass-3", "regenerated", "hash1", "hash3", 10, 20),
+            ("pass-4", "unchanged", "hash3", "hash3", 20, 20),
         ],
     )
     db.execute(
