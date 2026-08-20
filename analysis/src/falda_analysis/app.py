@@ -92,7 +92,10 @@ class HistoryApp(App[None]):
             with VerticalScroll(id="detail-scroll"):
                 yield Static(id="comparison")
                 yield Collapsible(
-                    Static(id="t0-detail"), title="T0 evidence (hidden by default)", collapsed=True
+                    Static(id="t0-detail"),
+                    title="T0 evidence (hidden by default)",
+                    collapsed=True,
+                    id="t0-evidence-section",
                 )
                 yield Static(id="t1-detail")
                 yield Static(id="t2-heading")

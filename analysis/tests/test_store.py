@@ -137,3 +137,128 @@ def test_older_schema_reports_missing_tables(tmp_path: Path) -> None:
 
 def test_recent_filter_can_return_no_passes(falda_root: Path) -> None:
     assert load_passes(falda_root, "acme", timedelta(days=1)) == []
+
+
+def test_partial_decision_rows_are_reported(falda_root: Path) -> None:
+    db_path, _ = store_paths(falda_root, "acme")
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute("UPDATE distillation_passes SET candidate_count=2 WHERE pass_id='pass-3'")
+        db.commit()
+    finally:
+        db.close()
+
+    passes = load_passes(falda_root, "acme")
+    pass_three = passes[2]
+    assert pass_three.candidate_count == 2
+    assert len(pass_three.decisions) == 1
+    gap_messages = {(gap.tier, gap.message) for gap in pass_three.gaps}
+    assert (
+        "T1",
+        "Only 1 of 2 decision audit rows are available.",
+    ) in gap_messages
+
+
+def test_null_watermark_end_has_no_evidence(falda_root: Path) -> None:
+    db_path, _ = store_paths(falda_root, "acme")
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute("UPDATE distillation_passes SET watermark_end=NULL WHERE pass_id='pass-3'")
+        db.commit()
+    finally:
+        db.close()
+
+    passes = load_passes(falda_root, "acme")
+    pass_three = passes[2]
+    assert pass_three.watermark_end is None
+    assert pass_three.evidence == ()
+
+
+def test_deleted_atom_remains_identified_but_content_is_unavailable(falda_root: Path) -> None:
+    db_path, _ = store_paths(falda_root, "acme")
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute("DELETE FROM atoms WHERE id='a2'")
+        db.commit()
+    finally:
+        db.close()
+
+    passes = load_passes(falda_root, "acme")
+    scene = next(item for item in passes[2].scenes if item.scene_id == "episode-1")
+    membership = reconstruct_scene_membership(falda_root, "acme", passes, passes[2], scene)
+    after_ids = [atom.atom_id for atom in membership.after]
+    assert "a2" in after_ids
+    deleted = next(atom for atom in membership.after if atom.atom_id == "a2")
+    assert deleted.atom_type is None
+    assert deleted.content is None
+    assert deleted.current_status is None
+
+
+def test_scene_membership_invalid_removed_atom_is_partial(falda_root: Path) -> None:
+    passes = load_passes(falda_root, "acme")
+    pass_three = passes[2]
+    original_scene = next(item for item in pass_three.scenes if item.scene_id == "episode-1")
+    bad_scene = replace(original_scene, removed=("nonexistent-atom",), members_after=2)
+    modified_pass_three = replace(
+        pass_three,
+        scenes=tuple(bad_scene if s.scene_id == "episode-1" else s for s in pass_three.scenes),
+    )
+    history = [passes[0], passes[1], modified_pass_three]
+    membership = reconstruct_scene_membership(
+        falda_root, "acme", history, modified_pass_three, bad_scene
+    )
+    assert membership.quality == "partial"
+    assert "delta does not match" in membership.message
+
+
+def test_scene_membership_duplicate_added_atom_is_partial(falda_root: Path) -> None:
+    passes = load_passes(falda_root, "acme")
+    pass_two = passes[1]
+    original_scene = next(item for item in pass_two.scenes if item.scene_id == "episode-1")
+    bad_scene = replace(
+        original_scene,
+        effect="updated",
+        added=("a1",),
+        removed=(),
+        members_before=1,
+        members_after=1,
+    )
+    modified_pass_two = replace(
+        pass_two,
+        scenes=tuple(bad_scene if s.scene_id == "episode-1" else s for s in pass_two.scenes),
+    )
+    history = [passes[0], modified_pass_two, passes[2]]
+    scene_in_three = next(item for item in passes[2].scenes if item.scene_id == "episode-1")
+    membership = reconstruct_scene_membership(
+        falda_root, "acme", history, history[2], scene_in_three
+    )
+    assert membership.quality == "partial"
+    assert "delta does not match" in membership.message
+
+
+def test_scene_membership_after_count_mismatch_is_partial(falda_root: Path) -> None:
+    passes = load_passes(falda_root, "acme")
+    pass_three = passes[2]
+    original_scene = next(item for item in pass_three.scenes if item.scene_id == "episode-1")
+    bad_scene = replace(original_scene, members_after=99)
+    modified_pass_three = replace(
+        pass_three,
+        scenes=tuple(bad_scene if s.scene_id == "episode-1" else s for s in pass_three.scenes),
+    )
+    history = [passes[0], passes[1], modified_pass_three]
+    membership = reconstruct_scene_membership(
+        falda_root, "acme", history, modified_pass_three, bad_scene
+    )
+    assert membership.quality == "partial"
+    assert "member count" in membership.message
+
+
+def test_topic_scene_membership_reconstructs(falda_root: Path) -> None:
+    passes = load_passes(falda_root, "acme")
+    scene = next(item for item in passes[2].scenes if item.scene_id == "topic-1")
+    membership = reconstruct_scene_membership(falda_root, "acme", passes, passes[2], scene)
+    assert membership.quality == "complete"
+    before_ids = [atom.atom_id for atom in membership.before]
+    after_ids = [atom.atom_id for atom in membership.after]
+    assert before_ids == after_ids
+    assert "a1" in before_ids
