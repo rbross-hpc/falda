@@ -596,3 +596,17 @@ def load_core_full_text(root: Path, tenant: str) -> str | None:
     if not core_path.is_file():
         return None
     return core_path.read_text(encoding="utf-8")
+
+
+def load_atom_full_text(root: Path, tenant: str, atom_id: str) -> str | None:
+    """Return the full untruncated content of a T1 atom, or None if not found."""
+    try:
+        with open_store(root, tenant) as db:
+            row = db.execute(
+                "SELECT content FROM atoms WHERE id=?", (atom_id,)
+            ).fetchone()
+        if row is None or row["content"] is None:
+            return None
+        return str(row["content"])
+    except (sqlite3.OperationalError, StoreError):
+        return None

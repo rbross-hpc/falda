@@ -3,6 +3,7 @@ from pathlib import Path
 
 from rich.console import Group
 from rich.markup import escape
+from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
@@ -21,9 +22,19 @@ from textual.widgets import (
 )
 from textual.worker import Worker
 
-from .models import AtomView, LiveState, Pass, SceneEffect, SceneMembership, StoreSummary
+from .models import (
+    AtomView,
+    LiveRecall,
+    LiveState,
+    Pass,
+    RecallItem,
+    SceneEffect,
+    SceneMembership,
+    StoreSummary,
+)
 from .store import (
     StoreError,
+    load_atom_full_text,
     load_core_full_text,
     load_live_state,
     load_passes,
@@ -33,52 +44,56 @@ from .store import (
 )
 
 
-class SceneZoom(ModalScreen[None]):
+class ZoomModal(ModalScreen[None]):
+    """Shared modal chrome for all pop-out detail views."""
     CSS = """
-    SceneZoom { align: center middle; }
-    #scene-zoom {
+    ZoomModal { align: center middle; }
+    #zoom-box {
         width: 90%; height: 90%; padding: 1 2;
         border: thick $accent; background: $surface;
     }
+    #zoom-title { color: $accent; text-style: bold; padding: 0 0 1 0; }
+    #zoom-hint { color: $text-muted; text-style: dim; padding: 1 0 0 0; }
     """
     BINDINGS = [("escape", "close", "Close"), ("q", "close", "Close")]
 
-    def __init__(self, membership: SceneMembership) -> None:
+    def __init__(self, title: str) -> None:
         super().__init__()
+        self._title = title
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="zoom-box"):
+            yield Static(self._title, id="zoom-title")
+            yield from self.zoom_body()
+            yield Static("esc / q  to close", id="zoom-hint")
+        yield Footer()
+
+    def zoom_body(self) -> ComposeResult:
+        return
+        yield  # make it a generator
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+
+class SceneZoom(ZoomModal):
+    def __init__(self, membership: SceneMembership) -> None:
+        label = membership.scene.title or membership.scene.scene_id
+        super().__init__(f"{membership.scene.scene_kind} scene — {label}")
         self.membership = membership
 
-    def compose(self) -> ComposeResult:
-        with VerticalScroll(id="scene-zoom"):
-            yield Static(_scene_zoom(self.membership))
-        yield Footer()
-
-    def action_close(self) -> None:
-        self.dismiss()
+    def zoom_body(self) -> ComposeResult:
+        yield Static(_scene_zoom(self.membership))
 
 
-class RecallZoom(ModalScreen[None]):
-    CSS = """
-    RecallZoom { align: center middle; }
-    #recall-zoom {
-        width: 90%; height: 90%; padding: 1 2;
-        border: thick $accent; background: $surface;
-    }
-    """
-    BINDINGS = [("escape", "close", "Close"), ("q", "close", "Close")]
+class RecallZoom(ZoomModal):
+    def __init__(self, title: str, item: "RecallItem", full_text: str | None) -> None:
+        super().__init__(title)
+        self._item = item
+        self._full_text = full_text
 
-    def __init__(self, header: str, body: str) -> None:
-        super().__init__()
-        self._header = header
-        self._body = body
-
-    def compose(self) -> ComposeResult:
-        with VerticalScroll(id="recall-zoom"):
-            yield Static(Text(self._header, style="bold cyan"))
-            yield Static(escape(self._body))
-        yield Footer()
-
-    def action_close(self) -> None:
-        self.dismiss()
+    def zoom_body(self) -> ComposeResult:
+        yield Static(_recall_zoom_body(self._item, self._full_text))
 
 
 def _scene_changed(scene: SceneEffect) -> bool:
@@ -119,6 +134,9 @@ class LiveScreen(Screen[None]):
     #live-summary { padding: 0 1; margin: 1 0; border-bottom: dashed $accent; }
     #live-pass-heading { padding: 0 1; color: $text-muted; }
     #live-pass-detail { padding: 0 1; }
+    #live-t2-heading { padding: 0 1; color: $text-muted; }
+    #live-t2-changed { height: auto; max-height: 16; margin: 0 1 1 1; }
+    #live-t2-unchanged { height: auto; max-height: 12; }
     #live-recall-heading { padding: 0 1; color: $text-muted; }
     #live-recall { height: auto; max-height: 20; margin: 0 1; }
     .flash { background: $warning 30%; }
@@ -152,6 +170,14 @@ class LiveScreen(Screen[None]):
             yield Static(id="live-summary")
             yield Static(id="live-pass-heading")
             yield Static(id="live-pass-detail")
+            yield Static(id="live-t2-heading")
+            yield DataTable(id="live-t2-changed", cursor_type="row")
+            yield Collapsible(
+                DataTable(id="live-t2-unchanged", cursor_type="row"),
+                title="Unchanged scenes (0)",
+                collapsed=True,
+                id="live-t2-unchanged-section",
+            )
             yield Static(id="live-recall-heading")
             yield DataTable(id="live-recall", cursor_type="row")
         yield Footer()
@@ -234,9 +260,12 @@ class LiveScreen(Screen[None]):
         pass_detail = self.query_one("#live-pass-detail", Static)
         pass_heading.update(_live_pass_heading(state.latest_pass, pass_changed))
         pass_detail.update(_live_pass_detail(state.latest_pass))
+        self._update_live_t2(state.latest_pass)
         if pass_changed:
             self._flash(pass_heading)
             self._flash(pass_detail)
+            self._flash(self.query_one("#live-t2-heading", Static))
+            self._flash(self.query_one("#live-t2-changed", DataTable))
 
         recall_heading = self.query_one("#live-recall-heading", Static)
         recall_table = self.query_one("#live-recall", DataTable)
@@ -246,37 +275,86 @@ class LiveScreen(Screen[None]):
             self._flash(recall_heading)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.data_table.id != "live-recall" or self._state is None:
+        table_id = event.data_table.id
+        row_key = event.row_key.value
+        if row_key is None or str(row_key) == "__empty__":
+            return
+
+        if table_id == "live-recall":
+            self._on_recall_row_selected(str(row_key))
+        elif table_id in {"live-t2-changed", "live-t2-unchanged"}:
+            self._on_live_t2_row_selected(str(row_key))
+
+    def _on_recall_row_selected(self, ordinal_str: str) -> None:
+        if self._state is None:
             return
         recall = self._state.last_recall
         if recall is None:
             return
-        ordinal_key = event.row_key.value
-        if ordinal_key is None:
+        item = next((i for i in recall.items if str(i.ordinal) == ordinal_str), None)
+        if item is None:
             return
-        item = next(
-            (i for i in recall.items if i.ordinal == int(ordinal_key)), None
-        )
-        if item is None or item.tier not in {"T2", "T3"}:
-            return
-        if item.tier == "T2":
+        if item.tier == "T1":
+            full_text = load_atom_full_text(self.root, self.tenant, item.item_id)
+            zoom_title = f"T1 atom  {item.item_id}"
+        elif item.tier == "T2":
             result = load_scene_full_text(self.root, self.tenant, item.item_id)
-            if result is None:
-                header = f"{item.tier}  {item.item_id}"
-                body = "(content unavailable)"
-            else:
+            full_text = None
+            if result is not None:
                 title, summary = result
-                header = f"T2 scene  {item.item_id}"
-                if title:
-                    header += f"  —  {title}"
-                body = summary or "(no summary stored)"
+                full_text = "\n\n".join(p for p in (title, summary) if p) or None
+            zoom_title = f"T2 scene  {item.item_id}"
         else:
-            text = load_core_full_text(self.root, self.tenant)
-            header = "T3 core  (current stored text)"
-            body = text or "(core.md not found)"
-        self.app.push_screen(RecallZoom(header, body))
+            full_text = load_core_full_text(self.root, self.tenant)
+            zoom_title = "T3 core  (current stored text)"
+        self.app.push_screen(RecallZoom(zoom_title, item, full_text))
 
-    def _flash(self, widget: Static) -> None:
+    def _on_live_t2_row_selected(self, scene_id: str) -> None:
+        if self._state is None or self._state.latest_pass is None:
+            return
+        latest = self._state.latest_pass
+        scene = next((s for s in latest.scenes if s.scene_id == scene_id), None)
+        if scene is None:
+            return
+        try:
+            all_passes = load_passes(self.root, self.tenant)
+        except StoreError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        matched = next((p for p in all_passes if p.pass_id == latest.pass_id), None)
+        if matched is None:
+            self.notify("Could not locate pass for scene reconstruction.", severity="warning")
+            return
+        membership = reconstruct_scene_membership(
+            self.root, self.tenant, all_passes, matched, scene
+        )
+        self.app.push_screen(SceneZoom(membership))
+
+    def _update_live_t2(self, p: Pass | None) -> None:
+        heading = self.query_one("#live-t2-heading", Static)
+        changed_table = self.query_one("#live-t2-changed", DataTable)
+        unchanged_table = self.query_one("#live-t2-unchanged", DataTable)
+        section = self.query_one("#live-t2-unchanged-section", Collapsible)
+        if p is None:
+            heading.update("")
+            _populate_scene_table(changed_table, [], "No pass loaded")
+            _populate_scene_table(unchanged_table, [], "")
+            section.title = "Unchanged scenes (0)"
+            return
+        changed = [s for s in p.scenes if _scene_changed(s)]
+        unchanged = [s for s in p.scenes if not _scene_changed(s)]
+        heading.update(
+            Text(
+                f"T2 scene effects — {len(changed)} changed, {len(unchanged)} unchanged. "
+                "Select a row and press Enter to zoom."
+            )
+        )
+        _populate_scene_table(changed_table, changed, "No changed scenes")
+        _populate_scene_table(unchanged_table, unchanged, "No unchanged scenes")
+        section.title = f"Unchanged scenes ({len(unchanged)})"
+        section.collapsed = True
+
+    def _flash(self, widget: Static | DataTable[object]) -> None:
         widget.add_class("flash")
         self.set_timer(_FLASH_DURATION, lambda: widget.remove_class("flash"))
 
@@ -351,23 +429,6 @@ def _live_pass_detail(p: Pass | None) -> Group:
         t1_table.add_row("—", "No decision rows", "—", "—")
     lines.append(t1_table)
 
-    if p.scenes:
-        t2_table = Table(title="T2 scene effects", expand=True)
-        t2_table.add_column("Kind", width=8)
-        t2_table.add_column("Effect", width=10)
-        t2_table.add_column("Title")
-        t2_table.add_column("Members")
-        t2_table.add_column("Delta")
-        for s in sorted(p.scenes, key=lambda sc: not _scene_changed(sc)):
-            t2_table.add_row(
-                s.scene_kind,
-                s.effect,
-                escape(s.title or "—"),
-                f"{s.members_before} → {s.members_after}",
-                f"+{len(s.added)} / -{len(s.removed)}",
-            )
-        lines.append(t2_table)
-
     if p.core:
         core_text = (
             f"T3 core: {p.core.effect}  "
@@ -378,36 +439,30 @@ def _live_pass_detail(p: Pass | None) -> Group:
     return Group(*lines)
 
 
-def _live_recall_heading(recall: object, changed: bool) -> Text:
-    from .models import LiveRecall as _LR
-
+def _live_recall_heading(recall: LiveRecall | None, changed: bool) -> Text:
     delta = " [bold yellow]Δ[/bold yellow]" if changed else ""
-    if recall is None or not isinstance(recall, _LR):
+    if recall is None:
         return Text.from_markup(f"[bold]Last recall[/bold]{delta}  —  no telemetry available")
-    r: _LR = recall
     budget = (
-        f"budget {r.used_budget}/{r.requested_budget}"
-        if r.requested_budget is not None
+        f"budget {recall.used_budget}/{recall.requested_budget}"
+        if recall.requested_budget is not None
         else "budget unknown"
     )
     return Text.from_markup(
-        f"[bold]Last recall[/bold]{delta}  {escape(r.created_at[:19])}  "
-        f"mode={escape(r.mode)}  {budget}  {len(r.items)} items  "
-        f"[dim]select T2/T3 row + Enter to view full text[/dim]\n"
-        f"[italic]{escape(r.query[:120])}{'…' if len(r.query) > 120 else ''}[/italic]"
+        f"[bold]Last recall[/bold]{delta}  {escape(recall.created_at[:19])}  "
+        f"mode={escape(recall.mode)}  {budget}  {len(recall.items)} items  "
+        f"[dim]select any row + Enter to view full text[/dim]\n"
+        f"[italic]{escape(recall.query[:120])}{'…' if len(recall.query) > 120 else ''}[/italic]"
     )
 
 
-def _populate_recall_table(table: DataTable[object], recall: object) -> None:
-    from .models import LiveRecall as _LR
-
+def _populate_recall_table(table: DataTable[object], recall: LiveRecall | None) -> None:
     table.clear(columns=True)
     table.add_columns("Ord", "Tier", "Source", "Score", "Chars", "Usage", "Content")
-    if recall is None or not isinstance(recall, _LR):
+    if recall is None:
         table.add_row("—", "—", "—", "—", "—", "—", "No recall telemetry", key="__empty__")
         return
-    r: _LR = recall
-    for item in r.items:
+    for item in recall.items:
         score_str = f"{item.score:.3f}" if item.score is not None else "—"
         chars_str = str(item.chars) if item.chars is not None else "—"
         content_str = item.content or f"({item.item_id})"
@@ -421,6 +476,29 @@ def _populate_recall_table(table: DataTable[object], recall: object) -> None:
             content_str,
             key=str(item.ordinal),
         )
+
+
+def _recall_zoom_body(item: RecallItem, full_text: str | None) -> Group:
+    """Rich-rendered body for the RecallZoom modal."""
+    meta = Table.grid(padding=(0, 2))
+    meta.add_column(style="bold")
+    meta.add_column()
+    meta.add_row("Tier", item.tier)
+    meta.add_row("Item ID", item.item_id)
+    meta.add_row("Source", item.source)
+    meta.add_row("Score", f"{item.score:.4f}" if item.score is not None else "—")
+    meta.add_row("Chars", str(item.chars) if item.chars is not None else "—")
+    meta.add_row("Usage", item.usage)
+
+    content_body = full_text or "(content unavailable)"
+    label = {
+        "T1": "Atom content",
+        "T2": "Scene title & summary",
+        "T3": "Core (current stored text)",
+    }.get(item.tier, "Content")
+    content_panel = Panel(escape(content_body), title=label, border_style="dim")
+
+    return Group(meta, Text(""), content_panel)
 
 
 class HistoryApp(App[None]):

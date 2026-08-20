@@ -7,6 +7,7 @@ import pytest
 
 from falda_analysis.store import (
     StoreError,
+    load_atom_full_text,
     load_core_full_text,
     load_last_recall,
     load_latest_pass,
@@ -382,3 +383,29 @@ def test_load_last_recall_t2_snippet_is_truncated(falda_root: Path) -> None:
     assert t2.content is not None
     assert len(t2.content) <= 301  # 300 chars + possible "…"
     assert t2.content.endswith("…")
+
+
+def test_load_atom_full_text_returns_content(falda_root: Path) -> None:
+    text = load_atom_full_text(falda_root, "acme", "a2")
+    assert text == "third fact"
+
+
+def test_load_atom_full_text_unknown_returns_none(falda_root: Path) -> None:
+    assert load_atom_full_text(falda_root, "acme", "no-such-atom") is None
+
+
+def test_load_atom_full_text_is_untruncated(falda_root: Path) -> None:
+    db_path, _ = store_paths(falda_root, "acme")
+    long_content = "X" * 500
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute(
+            "INSERT INTO atoms(id,type,content,status,pinned,created_at) VALUES(?,?,?,?,?,?)",
+            ("a-long", "fact", long_content, "active", 0, "2025-01-04T00:00:00Z"),
+        )
+        db.commit()
+    finally:
+        db.close()
+    text = load_atom_full_text(falda_root, "acme", "a-long")
+    assert text == long_content
+    assert len(text) == 500
