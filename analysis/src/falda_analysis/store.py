@@ -496,8 +496,8 @@ def _resolve_recall_items(
             parts = [p for p in (title, summary) if p]
             if parts:
                 raw = " — ".join(parts)
-                content = (
-                    raw[:_CONTENT_SNIPPET_LEN] + ("…" if len(raw) > _CONTENT_SNIPPET_LEN else "")
+                content = raw[:_CONTENT_SNIPPET_LEN] + (
+                    "…" if len(raw) > _CONTENT_SNIPPET_LEN else ""
                 )
         elif tier == "T3":
             content = core_content
@@ -602,9 +602,7 @@ def load_atom_full_text(root: Path, tenant: str, atom_id: str) -> str | None:
     """Return the full untruncated content of a T1 atom, or None if not found."""
     try:
         with open_store(root, tenant) as db:
-            row = db.execute(
-                "SELECT content FROM atoms WHERE id=?", (atom_id,)
-            ).fetchone()
+            row = db.execute("SELECT content FROM atoms WHERE id=?", (atom_id,)).fetchone()
         if row is None or row["content"] is None:
             return None
         return str(row["content"])

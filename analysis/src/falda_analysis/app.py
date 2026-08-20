@@ -46,6 +46,7 @@ from .store import (
 
 class ZoomModal(ModalScreen[None]):
     """Shared modal chrome for all pop-out detail views."""
+
     CSS = """
     ZoomModal { align: center middle; }
     #zoom-box {
@@ -117,11 +118,13 @@ def _narration_failure_count(p: Pass | None) -> int | None:
     if _NARRATION_FAILURE_PHRASE not in p.error:
         return None
     import re
+
     m = re.search(r"(\d+)\s+scene narration failure", p.error)
     return int(m.group(1)) if m else 1
 
 
 # ─── change-signature helpers ────────────────────────────────────────────────
+
 
 def _pass_sig(p: Pass | None) -> tuple[object, ...]:
     if p is None:
@@ -382,6 +385,7 @@ class LiveScreen(Screen[None]):
 
 # ─── live renderers ──────────────────────────────────────────────────────────
 
+
 def _live_summary(summary: StoreSummary, changed: bool) -> Text:
     delta = " [bold yellow]Δ[/bold yellow]" if changed else ""
     dirty = (
@@ -456,8 +460,7 @@ def _live_pass_detail(p: Pass | None) -> Group:
 
     if p.core:
         core_text = (
-            f"T3 core: {p.core.effect}  "
-            f"{p.core.old_chars or 0} → {p.core.new_chars or 0} chars"
+            f"T3 core: {p.core.effect}  {p.core.old_chars or 0} → {p.core.new_chars or 0} chars"
         )
         lines.append(Text(core_text))
 
