@@ -458,8 +458,7 @@ async def test_recall_t2_row_opens_zoom_modal(falda_root: Path) -> None:
         t2_row = next(
             row_idx
             for row_idx, row_key in enumerate(table.rows)
-            if str(row_key.value) != "__empty__"
-            and table.get_row(row_key)[1] == "T2"
+            if str(row_key.value) != "__empty__" and table.get_row(row_key)[1] == "T2"
         )
         table.move_cursor(row=t2_row)
         await pilot.press("enter")
@@ -481,8 +480,7 @@ async def test_recall_t2_zoom_shows_full_untruncated_text(falda_root: Path) -> N
         t2_row = next(
             row_idx
             for row_idx, row_key in enumerate(table.rows)
-            if str(row_key.value) != "__empty__"
-            and table.get_row(row_key)[1] == "T2"
+            if str(row_key.value) != "__empty__" and table.get_row(row_key)[1] == "T2"
         )
         table.move_cursor(row=t2_row)
         await pilot.press("enter")
@@ -505,8 +503,7 @@ async def test_recall_t3_row_opens_zoom_with_core_text(falda_root: Path) -> None
         t3_row = next(
             row_idx
             for row_idx, row_key in enumerate(table.rows)
-            if str(row_key.value) != "__empty__"
-            and table.get_row(row_key)[1] == "T3"
+            if str(row_key.value) != "__empty__" and table.get_row(row_key)[1] == "T3"
         )
         table.move_cursor(row=t3_row)
         await pilot.press("enter")
@@ -529,8 +526,7 @@ async def test_recall_t1_row_now_opens_zoom(falda_root: Path) -> None:
         t1_row = next(
             row_idx
             for row_idx, row_key in enumerate(table.rows)
-            if str(row_key.value) != "__empty__"
-            and table.get_row(row_key)[1] == "T1"
+            if str(row_key.value) != "__empty__" and table.get_row(row_key)[1] == "T1"
         )
         table.move_cursor(row=t1_row)
         await pilot.press("enter")
@@ -554,8 +550,7 @@ async def test_recall_zoom_closes_with_escape(falda_root: Path) -> None:
         t3_row = next(
             row_idx
             for row_idx, row_key in enumerate(table.rows)
-            if str(row_key.value) != "__empty__"
-            and table.get_row(row_key)[1] == "T3"
+            if str(row_key.value) != "__empty__" and table.get_row(row_key)[1] == "T3"
         )
         table.move_cursor(row=t3_row)
         await pilot.press("enter")
@@ -625,9 +620,12 @@ async def test_live_t2_detail_renders_with_scenes(falda_root: Path) -> None:
         unchanged = [s for s in scenes if s.effect == "unchanged"]
         assert len(changed) > 0
         assert len(unchanged) > 0
-        sorted_scenes = sorted(scenes, key=lambda sc: not (
-            sc.effect != "unchanged" or sc.summary_regenerated or sc.embedding_regenerated
-        ))
+        sorted_scenes = sorted(
+            scenes,
+            key=lambda sc: (
+                not (sc.effect != "unchanged" or sc.summary_regenerated or sc.embedding_regenerated)
+            ),
+        )
         assert sorted_scenes[0].effect != "unchanged"
 
 
@@ -727,6 +725,7 @@ async def test_live_t2_scene_zoom_closes_with_escape(falda_root: Path) -> None:
 
 # ─── Scene diff view tests ────────────────────────────────────────────────────
 
+
 def _make_atom(atom_id: str, content: str = "c") -> AtomView:
     return AtomView(atom_id=atom_id, atom_type="fact", content=content, current_status="active")
 
@@ -739,16 +738,25 @@ def _make_membership(
     summary_regen: bool = False,
 ) -> SceneMembership:
     scene = SceneEffect(
-        scene_id="s1", scene_kind="episode", title="Test",
-        effect="updated", members_before=len(before), members_after=len(after),
+        scene_id="s1",
+        scene_kind="episode",
+        title="Test",
+        effect="updated",
+        members_before=len(before),
+        members_after=len(after),
         added=tuple(a.atom_id for a in added),
         removed=tuple(a.atom_id for a in removed),
-        summary_regenerated=summary_regen, embedding_regenerated=False,
+        summary_regenerated=summary_regen,
+        embedding_regenerated=False,
     )
     return SceneMembership(
-        scene=scene, quality="complete",
+        scene=scene,
+        quality="complete",
         message="Reconstructed from baseline.",
-        before=before, after=after, added=added, removed=removed,
+        before=before,
+        after=after,
+        added=added,
+        removed=removed,
     )
 
 
@@ -774,7 +782,10 @@ def test_diff_rows_markers_and_styles() -> None:
     a1 = _make_atom("a1")
     a2 = _make_atom("a2")
     membership = _make_membership(
-        before=(a1,), after=(a2,), added=(a2,), removed=(a1,),
+        before=(a1,),
+        after=(a2,),
+        added=(a2,),
+        removed=(a1,),
     )
     rows = _membership_diff_rows(membership)
     assert rows[0][0] == "−"
@@ -786,7 +797,10 @@ def test_diff_rows_markers_and_styles() -> None:
 def test_diff_rows_no_changes() -> None:
     a1 = _make_atom("a1")
     membership = _make_membership(
-        before=(a1,), after=(a1,), added=(), removed=(),
+        before=(a1,),
+        after=(a1,),
+        added=(),
+        removed=(),
     )
     rows = _membership_diff_rows(membership)
     assert len(rows) == 1
@@ -802,17 +816,22 @@ def test_diff_rows_empty_scene() -> None:
 
 def test_diff_counts_in_title() -> None:
     from falda_analysis.app import _scene_zoom
+
     a1 = _make_atom("a1")
     a2 = _make_atom("a2")
     a3 = _make_atom("a3", "kept")
     membership = _make_membership(
-        before=(a1, a3), after=(a2, a3), added=(a2,), removed=(a1,),
+        before=(a1, a3),
+        after=(a2, a3),
+        added=(a2,),
+        removed=(a1,),
     )
     group = _scene_zoom(membership)
     # The table title is the second element of the Group (after heading Text)
     import io
 
     from rich.console import Console
+
     buf = io.StringIO()
     Console(file=buf, width=200, highlight=False).print(group)
     rendered = buf.getvalue()
@@ -827,6 +846,7 @@ def test_diff_regen_note_shown_when_set() -> None:
     from rich.console import Console
 
     from falda_analysis.app import _scene_zoom
+
     a1 = _make_atom("a1")
     membership = _make_membership(
         before=(a1,), after=(a1,), added=(), removed=(), summary_regen=True
@@ -842,6 +862,7 @@ def test_diff_regen_note_absent_when_not_set() -> None:
     from rich.console import Console
 
     from falda_analysis.app import _scene_zoom
+
     a1 = _make_atom("a1")
     membership = _make_membership(before=(a1,), after=(a1,), added=(), removed=())
     buf = io.StringIO()
@@ -854,12 +875,21 @@ def test_diff_regen_note_absent_when_not_set() -> None:
 
 def _make_pass(status: str, error: str | None) -> Pass:
     from falda_analysis.models import Pass
+
     return Pass(
-        pass_id="p", store_key="t:self",
-        watermark_start=0, watermark_end=1,
-        started_at="2025-01-01T00:00:00Z", completed_at="2025-01-01T00:01:00Z",
-        status=status, input_turn_count=1, candidate_count=1,  # type: ignore[arg-type]
-        error=error, model=None, prompt_version=None, distiller_version=None,
+        pass_id="p",
+        store_key="t:self",
+        watermark_start=0,
+        watermark_end=1,
+        started_at="2025-01-01T00:00:00Z",
+        completed_at="2025-01-01T00:01:00Z",
+        status=status,
+        input_turn_count=1,
+        candidate_count=1,  # type: ignore[arg-type]
+        error=error,
+        model=None,
+        prompt_version=None,
+        distiller_version=None,
     )
 
 
@@ -909,6 +939,7 @@ def test_live_pass_heading_shows_narration_marker() -> None:
     from rich.console import Console
 
     from falda_analysis.app import _live_pass_heading
+
     p = _make_pass(
         "failed",
         "L2/L3 reconciliation incomplete: 2 scene narration failure(s)",
@@ -926,6 +957,7 @@ def test_live_pass_heading_no_narration_marker_for_other_failure() -> None:
     from rich.console import Console
 
     from falda_analysis.app import _live_pass_heading
+
     p = _make_pass("failed", "core synthesis failed")
     buf = io.StringIO()
     Console(file=buf, width=200, highlight=False).print(_live_pass_heading(p, False))
@@ -940,6 +972,7 @@ def test_live_pass_heading_no_marker_for_done() -> None:
     from rich.console import Console
 
     from falda_analysis.app import _live_pass_heading
+
     p = _make_pass("done", None)
     buf = io.StringIO()
     Console(file=buf, width=200, highlight=False).print(_live_pass_heading(p, False))
@@ -957,6 +990,7 @@ def test_scene_zoom_summary_regenerated_note() -> None:
     from rich.console import Console
 
     from falda_analysis.app import _scene_zoom
+
     a1 = _make_atom("a1")
     membership = _make_membership(
         before=(a1,), after=(a1,), added=(), removed=(), summary_regen=True
@@ -975,6 +1009,7 @@ def test_scene_zoom_narration_failed_note() -> None:
     from rich.console import Console
 
     from falda_analysis.app import _scene_zoom
+
     a1 = _make_atom("a1")
     membership = _make_membership(before=(a1,), after=(a1,), added=(), removed=())
     p = _make_pass(
@@ -996,6 +1031,7 @@ def test_scene_zoom_unchanged_note_when_clean_pass() -> None:
     from rich.console import Console
 
     from falda_analysis.app import _scene_zoom
+
     a1 = _make_atom("a1")
     membership = _make_membership(before=(a1,), after=(a1,), added=(), removed=())
     p = _make_pass("done", None)
@@ -1012,6 +1048,7 @@ def test_scene_zoom_unchanged_note_when_no_pass_context() -> None:
     from rich.console import Console
 
     from falda_analysis.app import _scene_zoom
+
     a1 = _make_atom("a1")
     membership = _make_membership(before=(a1,), after=(a1,), added=(), removed=())
     buf = io.StringIO()
