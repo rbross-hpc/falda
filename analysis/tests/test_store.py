@@ -37,7 +37,7 @@ def test_load_summary(falda_root: Path) -> None:
 
 def test_load_passes_oldest_first_and_surfaces_failures(falda_root: Path) -> None:
     passes = load_passes(falda_root, "acme")
-    assert [item.pass_id for item in passes] == ["pass-1", "pass-2", "pass-3"]
+    assert [item.pass_id for item in passes] == ["pass-1", "pass-2", "pass-3", "pass-4"]
     assert passes[1].status == "failed"
     assert passes[1].likely_reconciliation
     assert passes[1].error == "core synthesis failed"
@@ -273,9 +273,9 @@ def test_topic_scene_membership_reconstructs(falda_root: Path) -> None:
 def test_load_latest_pass_returns_newest(falda_root: Path) -> None:
     p = load_latest_pass(falda_root, "acme")
     assert p is not None
-    assert p.pass_id == "pass-3"
-    assert p.status == "done"
-    assert len(p.decisions) == 1
+    assert p.pass_id == "pass-4"
+    assert p.status == "failed"
+    assert "narration" in (p.error or "")
 
 
 def test_load_latest_pass_empty_store(falda_root: Path) -> None:
@@ -344,7 +344,7 @@ def test_load_live_state_bundles_all_three(falda_root: Path) -> None:
     state = load_live_state(falda_root, "acme")
     assert state.summary.label == "acme:self"
     assert state.latest_pass is not None
-    assert state.latest_pass.pass_id == "pass-3"
+    assert state.latest_pass.pass_id == "pass-4"
     assert state.last_recall is not None
     assert state.last_recall.recall_id == "recall-1"
 

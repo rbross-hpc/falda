@@ -4,8 +4,15 @@ from pathlib import Path
 
 from textual.widgets import Collapsible, DataTable, Label, ListView, Select, Static
 
-from falda_analysis.app import HistoryApp, LiveScreen, RecallZoom, SceneZoom, _membership_diff_rows
-from falda_analysis.models import AtomView, SceneEffect, SceneMembership
+from falda_analysis.app import (
+    HistoryApp,
+    LiveScreen,
+    RecallZoom,
+    SceneZoom,
+    _membership_diff_rows,
+    _narration_failure_count,
+)
+from falda_analysis.models import AtomView, Pass, SceneEffect, SceneMembership
 from falda_analysis.store import store_paths
 
 
@@ -268,7 +275,7 @@ async def test_refresh_reloads_and_resets_to_all_first_pass(falda_root: Path) ->
         assert timeline2.index == 0
         assert app.selected_pass is not None
         assert app.selected_pass.pass_id == "pass-1"
-        assert len(app.all_passes) == 3
+        assert len(app.all_passes) == 4
 
 
 # ─── LiveScreen tests ─────────────────────────────────────────────────────────
@@ -302,7 +309,7 @@ async def test_live_screen_shows_latest_pass(falda_root: Path) -> None:
         await pilot.pause()
         heading = screen.query_one("#live-pass-heading", Static)
         rendered = str(heading.render())
-        assert "pass-3" in rendered
+        assert "pass-4" in rendered
 
 
 async def test_live_screen_shows_recall(falda_root: Path) -> None:
@@ -595,6 +602,17 @@ def test_scene_changed_sort_puts_changed_first() -> None:
 
 
 async def test_live_t2_detail_renders_with_scenes(falda_root: Path) -> None:
+    # Use pass-3 (done, has 1 changed + 1 unchanged scene) not pass-4 (all unchanged).
+    db_path, _ = store_paths(falda_root, "acme")
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute(
+            "UPDATE distillation_passes SET started_at=? WHERE pass_id=?",
+            ("2025-01-02T00:30:00Z", "pass-4"),
+        )
+        db.commit()
+    finally:
+        db.close()
     screen = LiveScreen(falda_root, "acme")
     app = HistoryApp(falda_root, "acme")
     async with app.run_test() as pilot:
@@ -616,7 +634,22 @@ async def test_live_t2_detail_renders_with_scenes(falda_root: Path) -> None:
 # ─── Live T2 collapse / DataTable tests ──────────────────────────────────────
 
 
+def _push_pass4_to_past(falda_root: Path) -> None:
+    """Shift pass-4 before pass-3 so pass-3 remains the latest by started_at."""
+    db_path, _ = store_paths(falda_root, "acme")
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute(
+            "UPDATE distillation_passes SET started_at=? WHERE pass_id=?",
+            ("2025-01-02T00:30:00Z", "pass-4"),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+
 async def test_live_t2_changed_table_populated(falda_root: Path) -> None:
+    _push_pass4_to_past(falda_root)
     screen = LiveScreen(falda_root, "acme")
     app = HistoryApp(falda_root, "acme")
     async with app.run_test() as pilot:
@@ -630,6 +663,7 @@ async def test_live_t2_changed_table_populated(falda_root: Path) -> None:
 
 
 async def test_live_t2_unchanged_collapsible_starts_collapsed(falda_root: Path) -> None:
+    _push_pass4_to_past(falda_root)
     screen = LiveScreen(falda_root, "acme")
     app = HistoryApp(falda_root, "acme")
     async with app.run_test() as pilot:
@@ -641,6 +675,7 @@ async def test_live_t2_unchanged_collapsible_starts_collapsed(falda_root: Path) 
 
 
 async def test_live_t2_unchanged_table_populated_when_expanded(falda_root: Path) -> None:
+    _push_pass4_to_past(falda_root)
     screen = LiveScreen(falda_root, "acme")
     app = HistoryApp(falda_root, "acme")
     async with app.run_test() as pilot:
@@ -656,6 +691,7 @@ async def test_live_t2_unchanged_table_populated_when_expanded(falda_root: Path)
 
 
 async def test_live_t2_changed_row_opens_scene_zoom(falda_root: Path) -> None:
+    _push_pass4_to_past(falda_root)
     screen = LiveScreen(falda_root, "acme")
     app = HistoryApp(falda_root, "acme")
     async with app.run_test() as pilot:
@@ -671,6 +707,7 @@ async def test_live_t2_changed_row_opens_scene_zoom(falda_root: Path) -> None:
 
 
 async def test_live_t2_scene_zoom_closes_with_escape(falda_root: Path) -> None:
+    _push_pass4_to_past(falda_root)
     screen = LiveScreen(falda_root, "acme")
     app = HistoryApp(falda_root, "acme")
     async with app.run_test() as pilot:
@@ -810,3 +847,255 @@ def test_diff_regen_note_absent_when_not_set() -> None:
     buf = io.StringIO()
     Console(file=buf, width=200, highlight=False).print(_scene_zoom(membership))
     assert "Regenerated" not in buf.getvalue()
+
+
+# ─── _narration_failure_count tests ──────────────────────────────────────────
+
+
+def _make_pass(status: str, error: str | None) -> Pass:
+    from falda_analysis.models import Pass
+    return Pass(
+        pass_id="p", store_key="t:self",
+        watermark_start=0, watermark_end=1,
+        started_at="2025-01-01T00:00:00Z", completed_at="2025-01-01T00:01:00Z",
+        status=status, input_turn_count=1, candidate_count=1,  # type: ignore[arg-type]
+        error=error, model=None, prompt_version=None, distiller_version=None,
+    )
+
+
+def test_narration_failure_count_parses_n() -> None:
+    p = _make_pass(
+        "failed",
+        "L2/L3 reconciliation incomplete: 2 scene narration failure(s)",
+    )
+    assert _narration_failure_count(p) == 2
+
+
+def test_narration_failure_count_combined_error() -> None:
+    p = _make_pass(
+        "failed",
+        "L2/L3 reconciliation incomplete: 3 scene narration failure(s), core failed",
+    )
+    assert _narration_failure_count(p) == 3
+
+
+def test_narration_failure_count_none_for_done() -> None:
+    assert _narration_failure_count(_make_pass("done", None)) is None
+
+
+def test_narration_failure_count_none_for_core_only_failure() -> None:
+    assert _narration_failure_count(_make_pass("failed", "core synthesis failed")) is None
+
+
+def test_narration_failure_count_none_for_l1_failure() -> None:
+    assert _narration_failure_count(_make_pass("failed", "L1 transaction failed")) is None
+
+
+def test_narration_failure_count_none_for_none_pass() -> None:
+    assert _narration_failure_count(None) is None
+
+
+def test_narration_failure_count_fallback_when_no_number() -> None:
+    p = _make_pass("failed", "L2/L3 reconciliation incomplete: scene narration failure")
+    assert _narration_failure_count(p) == 1
+
+
+# ─── _live_pass_heading narration marker tests ────────────────────────────────
+
+
+def test_live_pass_heading_shows_narration_marker() -> None:
+    import io
+
+    from rich.console import Console
+
+    from falda_analysis.app import _live_pass_heading
+    p = _make_pass(
+        "failed",
+        "L2/L3 reconciliation incomplete: 2 scene narration failure(s)",
+    )
+    buf = io.StringIO()
+    Console(file=buf, width=200, highlight=False).print(_live_pass_heading(p, False))
+    rendered = buf.getvalue()
+    assert "narration" in rendered
+    assert "2" in rendered
+
+
+def test_live_pass_heading_no_narration_marker_for_other_failure() -> None:
+    import io
+
+    from rich.console import Console
+
+    from falda_analysis.app import _live_pass_heading
+    p = _make_pass("failed", "core synthesis failed")
+    buf = io.StringIO()
+    Console(file=buf, width=200, highlight=False).print(_live_pass_heading(p, False))
+    rendered = buf.getvalue()
+    assert "narration" not in rendered
+    assert "FAILED" in rendered
+
+
+def test_live_pass_heading_no_marker_for_done() -> None:
+    import io
+
+    from rich.console import Console
+
+    from falda_analysis.app import _live_pass_heading
+    p = _make_pass("done", None)
+    buf = io.StringIO()
+    Console(file=buf, width=200, highlight=False).print(_live_pass_heading(p, False))
+    rendered = buf.getvalue()
+    assert "narration" not in rendered
+    assert "FAILED" not in rendered
+
+
+# ─── _scene_zoom 3-state summary note tests ───────────────────────────────────
+
+
+def test_scene_zoom_summary_regenerated_note() -> None:
+    import io
+
+    from rich.console import Console
+
+    from falda_analysis.app import _scene_zoom
+    a1 = _make_atom("a1")
+    membership = _make_membership(
+        before=(a1,), after=(a1,), added=(), removed=(), summary_regen=True
+    )
+    buf = io.StringIO()
+    Console(file=buf, width=200, highlight=False).print(_scene_zoom(membership))
+    rendered = buf.getvalue()
+    assert "regenerated" in rendered.lower()
+    assert "not completed" not in rendered
+    assert "unchanged this pass" not in rendered
+
+
+def test_scene_zoom_narration_failed_note() -> None:
+    import io
+
+    from rich.console import Console
+
+    from falda_analysis.app import _scene_zoom
+    a1 = _make_atom("a1")
+    membership = _make_membership(before=(a1,), after=(a1,), added=(), removed=())
+    p = _make_pass(
+        "failed",
+        "L2/L3 reconciliation incomplete: 2 scene narration failure(s)",
+    )
+    buf = io.StringIO()
+    Console(file=buf, width=200, highlight=False).print(_scene_zoom(membership, p))
+    rendered = buf.getvalue()
+    assert "not completed" in rendered
+    assert "2" in rendered
+    assert "retry" in rendered
+    assert "regenerated" not in rendered.lower() or "not completed" in rendered
+
+
+def test_scene_zoom_unchanged_note_when_clean_pass() -> None:
+    import io
+
+    from rich.console import Console
+
+    from falda_analysis.app import _scene_zoom
+    a1 = _make_atom("a1")
+    membership = _make_membership(before=(a1,), after=(a1,), added=(), removed=())
+    p = _make_pass("done", None)
+    buf = io.StringIO()
+    Console(file=buf, width=200, highlight=False).print(_scene_zoom(membership, p))
+    rendered = buf.getvalue()
+    assert "unchanged this pass" in rendered
+    assert "not completed" not in rendered
+
+
+def test_scene_zoom_unchanged_note_when_no_pass_context() -> None:
+    import io
+
+    from rich.console import Console
+
+    from falda_analysis.app import _scene_zoom
+    a1 = _make_atom("a1")
+    membership = _make_membership(before=(a1,), after=(a1,), added=(), removed=())
+    buf = io.StringIO()
+    Console(file=buf, width=200, highlight=False).print(_scene_zoom(membership))
+    rendered = buf.getvalue()
+    assert "unchanged this pass" in rendered
+
+
+# ─── Integration: SceneZoom opened with narration-failed pass ─────────────────
+
+
+async def test_history_scene_zoom_narration_failed_pass(falda_root: Path) -> None:
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        timeline = app.query_one("#timeline", ListView)
+        # Navigate to pass-4 (last, index 3)
+        timeline.index = 3
+        await pilot.pause()
+        assert app.selected_pass is not None
+        assert app.selected_pass.pass_id == "pass-4"
+        # pass-4 has no changed scenes (all unchanged) — check unchanged table
+        unchanged_section = app.query_one("#t2-unchanged-section", Collapsible)
+        unchanged_section.collapsed = False
+        await pilot.pause()
+        unchanged = app.query_one("#t2-unchanged", DataTable)
+        unchanged.focus()
+        unchanged.move_cursor(row=0)
+        await pilot.press("enter")
+        await pilot.pause()
+        assert isinstance(app.screen, SceneZoom)
+        assert app.screen.pass_ is not None
+        assert app.screen.pass_.pass_id == "pass-4"
+        assert _narration_failure_count(app.screen.pass_) == 2
+
+
+async def test_live_scene_zoom_narration_failed_pass(falda_root: Path) -> None:
+    db_path, _ = store_paths(falda_root, "acme")
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute(
+            "INSERT INTO distillation_passes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "pass-narr",
+                "acme:self",
+                3,
+                4,
+                "2025-01-05T00:00:00Z",
+                "2025-01-05T00:01:00Z",
+                "failed",
+                1,
+                1,
+                "L2/L3 reconciliation incomplete: 1 scene narration failure(s)",
+                "model",
+                "v1",
+                "0.1.0",
+            ),
+        )
+        db.execute(
+            "INSERT INTO pass_scene_effects VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            ("pass-narr", "episode-1", "episode", "First", "unchanged", 1, 1, "[]", "[]", 0, 0),
+        )
+        db.execute(
+            "INSERT INTO pass_core_effects VALUES(?,?,?,?,?,?)",
+            ("pass-narr", "unchanged", "hash3", "hash3", 20, 20),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause(delay=0.5)
+
+        unchanged_section = screen.query_one("#live-t2-unchanged-section", Collapsible)
+        unchanged_section.collapsed = False
+        await pilot.pause()
+        unchanged = screen.query_one("#live-t2-unchanged", DataTable)
+        unchanged.focus()
+        unchanged.move_cursor(row=0)
+        await pilot.press("enter")
+        await pilot.pause(delay=0.5)
+
+        assert isinstance(app.screen, SceneZoom)
+        assert app.screen.pass_ is not None
+        assert _narration_failure_count(app.screen.pass_) == 1

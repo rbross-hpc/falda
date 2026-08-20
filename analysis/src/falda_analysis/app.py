@@ -77,13 +77,14 @@ class ZoomModal(ModalScreen[None]):
 
 
 class SceneZoom(ZoomModal):
-    def __init__(self, membership: SceneMembership) -> None:
+    def __init__(self, membership: SceneMembership, pass_: Pass | None = None) -> None:
         label = membership.scene.title or membership.scene.scene_id
         super().__init__(f"{membership.scene.scene_kind} scene — {label}")
         self.membership = membership
+        self.pass_ = pass_
 
     def zoom_body(self) -> ComposeResult:
-        yield Static(_scene_zoom(self.membership))
+        yield Static(_scene_zoom(self.membership, self.pass_))
 
 
 class RecallZoom(ZoomModal):
@@ -98,6 +99,26 @@ class RecallZoom(ZoomModal):
 
 def _scene_changed(scene: SceneEffect) -> bool:
     return scene.effect != "unchanged" or scene.summary_regenerated or scene.embedding_regenerated
+
+
+_NARRATION_FAILURE_PHRASE = "scene narration failure"
+
+
+def _narration_failure_count(p: Pass | None) -> int | None:
+    """Return the number of scene narration failures for this pass, or None if none.
+
+    Only returns a value when the pass failed specifically due to scene narration
+    (engine error text: "L2/L3 reconciliation incomplete: N scene narration failure(s)").
+    Returns None for a done pass, a running pass, or a failed pass whose error is
+    unrelated to scene narration (e.g. L1 failure, core-only failure).
+    """
+    if p is None or p.status != "failed" or not p.error:
+        return None
+    if _NARRATION_FAILURE_PHRASE not in p.error:
+        return None
+    import re
+    m = re.search(r"(\d+)\s+scene narration failure", p.error)
+    return int(m.group(1)) if m else 1
 
 
 # ─── change-signature helpers ────────────────────────────────────────────────
@@ -328,7 +349,7 @@ class LiveScreen(Screen[None]):
         membership = reconstruct_scene_membership(
             self.root, self.tenant, all_passes, matched, scene
         )
-        self.app.push_screen(SceneZoom(membership))
+        self.app.push_screen(SceneZoom(membership, matched))
 
     def _update_live_t2(self, p: Pass | None) -> None:
         heading = self.query_one("#live-t2-heading", Static)
@@ -392,7 +413,11 @@ def _live_pass_heading(p: Pass | None, changed: bool) -> Text:
     if p.status == "running":
         status_markup = "[bold yellow]RUNNING[/bold yellow]"
     elif p.status == "failed":
-        status_markup = "[bold red]FAILED[/bold red]"
+        n = _narration_failure_count(p)
+        if n is not None:
+            status_markup = f"[bold red]FAILED · narration ×{n}[/bold red]"
+        else:
+            status_markup = "[bold red]FAILED[/bold red]"
     else:
         status_markup = "[green]done[/green]"
     completed = f" → {p.completed_at[:19]}" if p.completed_at else ""
@@ -601,7 +626,7 @@ class HistoryApp(App[None]):
         membership = reconstruct_scene_membership(
             self.root, self.tenant, self.all_passes, self.selected_pass, scene
         )
-        self.push_screen(SceneZoom(membership))
+        self.push_screen(SceneZoom(membership, self.selected_pass))
 
     def action_first_pass(self) -> None:
         timeline = self.query_one("#timeline", ListView)
@@ -847,7 +872,7 @@ def _membership_diff_rows(
     return rows
 
 
-def _scene_zoom(membership: SceneMembership) -> Group:
+def _scene_zoom(membership: SceneMembership, pass_: Pass | None = None) -> Group:
     scene = membership.scene
     regen_parts = [
         label
@@ -857,12 +882,24 @@ def _scene_zoom(membership: SceneMembership) -> Group:
         )
         if flag
     ]
-    regen_note = f"  Regenerated: {', '.join(regen_parts)}" if regen_parts else ""
+    if regen_parts:
+        summary_line = f"  Summary: regenerated ({', '.join(regen_parts)})"
+    else:
+        n_fail = _narration_failure_count(pass_)
+        if n_fail is not None:
+            summary_line = (
+                f"  Summary: not completed this pass"
+                f" — pass reported {n_fail} narration failure(s)"
+                f" (this scene may be one; will retry)"
+            )
+        else:
+            summary_line = "  Summary: unchanged this pass"
     heading = Text(
         f"{scene.scene_kind} scene: {scene.title or 'Unavailable'}\n"
         f"{scene.scene_id}\n"
         f"Reconstruction: {membership.quality.upper()} — {membership.message}\n"
-        f"Atom status is current, not status at this pass.{regen_note}",
+        f"Atom status is current, not status at this pass.\n"
+        f"{summary_line}",
         style=("green" if membership.quality == "complete" else "yellow"),
     )
 
