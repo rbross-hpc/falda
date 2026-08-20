@@ -46,6 +46,8 @@ jobs:
           enable-cache: true
       - name: Install analysis dependencies
         run: uv sync --project analysis --locked --all-groups
+      - name: Check analysis formatting
+        run: uv run --project analysis ruff format --check analysis
       - name: Lint analysis package
         run: uv run --project analysis ruff check analysis
       - name: Type-check analysis package
