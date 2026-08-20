@@ -458,7 +458,7 @@ async def test_recall_t2_row_opens_zoom_modal(falda_root: Path) -> None:
         await pilot.pause()
 
         assert isinstance(app.screen, RecallZoom)
-        assert "T2" in app.screen._header or "episode-1" in app.screen._header
+        assert "T2" in app.screen._title or "episode-1" in app.screen._title
 
 
 async def test_recall_t2_zoom_shows_full_untruncated_text(falda_root: Path) -> None:
@@ -481,7 +481,8 @@ async def test_recall_t2_zoom_shows_full_untruncated_text(falda_root: Path) -> N
         await pilot.pause()
 
         assert isinstance(app.screen, RecallZoom)
-        assert app.screen._body == "A" * 400
+        assert app.screen._full_text is not None
+        assert "A" * 400 in app.screen._full_text
 
 
 async def test_recall_t3_row_opens_zoom_with_core_text(falda_root: Path) -> None:
@@ -504,10 +505,11 @@ async def test_recall_t3_row_opens_zoom_with_core_text(falda_root: Path) -> None
         await pilot.pause()
 
         assert isinstance(app.screen, RecallZoom)
-        assert "Core" in app.screen._body
+        assert app.screen._full_text is not None
+        assert "Core" in app.screen._full_text
 
 
-async def test_recall_t1_row_does_not_open_zoom(falda_root: Path) -> None:
+async def test_recall_t1_row_now_opens_zoom(falda_root: Path) -> None:
     screen = LiveScreen(falda_root, "acme")
     app = HistoryApp(falda_root, "acme")
     async with app.run_test() as pilot:
@@ -526,7 +528,10 @@ async def test_recall_t1_row_does_not_open_zoom(falda_root: Path) -> None:
         await pilot.press("enter")
         await pilot.pause()
 
-        assert not isinstance(app.screen, RecallZoom)
+        assert isinstance(app.screen, RecallZoom)
+        assert "T1" in app.screen._title
+        assert app.screen._full_text is not None
+        assert "third fact" in app.screen._full_text
 
 
 async def test_recall_zoom_closes_with_escape(falda_root: Path) -> None:
@@ -605,3 +610,78 @@ async def test_live_t2_detail_renders_with_scenes(falda_root: Path) -> None:
             sc.effect != "unchanged" or sc.summary_regenerated or sc.embedding_regenerated
         ))
         assert sorted_scenes[0].effect != "unchanged"
+
+
+# ─── Live T2 collapse / DataTable tests ──────────────────────────────────────
+
+
+async def test_live_t2_changed_table_populated(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause(delay=0.5)
+        changed = screen.query_one("#live-t2-changed", DataTable)
+        # pass-3 has 1 updated + 1 unchanged scene; changed table should have 1 row
+        row_keys = [k for k in changed.rows if str(k.value) != "__empty__"]
+        assert len(row_keys) == 1
+        assert str(row_keys[0].value) == "episode-1"
+
+
+async def test_live_t2_unchanged_collapsible_starts_collapsed(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause(delay=0.5)
+        section = screen.query_one("#live-t2-unchanged-section", Collapsible)
+        assert section.collapsed
+        assert "1" in section.title  # "Unchanged scenes (1)"
+
+
+async def test_live_t2_unchanged_table_populated_when_expanded(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause(delay=0.5)
+        section = screen.query_one("#live-t2-unchanged-section", Collapsible)
+        section.collapsed = False
+        await pilot.pause()
+        unchanged = screen.query_one("#live-t2-unchanged", DataTable)
+        row_keys = [k for k in unchanged.rows if str(k.value) != "__empty__"]
+        assert len(row_keys) == 1
+        assert str(row_keys[0].value) == "topic-1"
+
+
+async def test_live_t2_changed_row_opens_scene_zoom(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause(delay=0.5)
+        changed = screen.query_one("#live-t2-changed", DataTable)
+        changed.focus()
+        changed.move_cursor(row=0)
+        await pilot.press("enter")
+        await pilot.pause(delay=0.5)
+        assert isinstance(app.screen, SceneZoom)
+        assert app.screen.membership.scene.scene_id == "episode-1"
+
+
+async def test_live_t2_scene_zoom_closes_with_escape(falda_root: Path) -> None:
+    screen = LiveScreen(falda_root, "acme")
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        app.push_screen(screen)
+        await pilot.pause(delay=0.5)
+        changed = screen.query_one("#live-t2-changed", DataTable)
+        changed.focus()
+        changed.move_cursor(row=0)
+        await pilot.press("enter")
+        await pilot.pause(delay=0.5)
+        assert isinstance(app.screen, SceneZoom)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, SceneZoom)
+        assert isinstance(app.screen, LiveScreen)
