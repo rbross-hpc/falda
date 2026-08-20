@@ -4,7 +4,8 @@ from pathlib import Path
 
 from textual.widgets import Collapsible, DataTable, Label, ListView, Select, Static
 
-from falda_analysis.app import HistoryApp, LiveScreen, RecallZoom, SceneZoom
+from falda_analysis.app import HistoryApp, LiveScreen, RecallZoom, SceneZoom, _membership_diff_rows
+from falda_analysis.models import AtomView, SceneEffect, SceneMembership
 from falda_analysis.store import store_paths
 
 
@@ -685,3 +686,127 @@ async def test_live_t2_scene_zoom_closes_with_escape(falda_root: Path) -> None:
         await pilot.pause()
         assert not isinstance(app.screen, SceneZoom)
         assert isinstance(app.screen, LiveScreen)
+
+
+# ─── Scene diff view tests ────────────────────────────────────────────────────
+
+def _make_atom(atom_id: str, content: str = "c") -> AtomView:
+    return AtomView(atom_id=atom_id, atom_type="fact", content=content, current_status="active")
+
+
+def _make_membership(
+    before: tuple[AtomView, ...],
+    after: tuple[AtomView, ...],
+    added: tuple[AtomView, ...],
+    removed: tuple[AtomView, ...],
+    summary_regen: bool = False,
+) -> SceneMembership:
+    scene = SceneEffect(
+        scene_id="s1", scene_kind="episode", title="Test",
+        effect="updated", members_before=len(before), members_after=len(after),
+        added=tuple(a.atom_id for a in added),
+        removed=tuple(a.atom_id for a in removed),
+        summary_regenerated=summary_regen, embedding_regenerated=False,
+    )
+    return SceneMembership(
+        scene=scene, quality="complete",
+        message="Reconstructed from baseline.",
+        before=before, after=after, added=added, removed=removed,
+    )
+
+
+def test_diff_rows_removed_first_then_kept_then_added() -> None:
+    a1 = _make_atom("a1", "old fact")
+    a2 = _make_atom("a2", "kept fact")
+    a3 = _make_atom("a3", "new fact")
+    membership = _make_membership(
+        before=(a1, a2),
+        after=(a2, a3),
+        added=(a3,),
+        removed=(a1,),
+    )
+    rows = _membership_diff_rows(membership)
+    assert len(rows) == 3
+    markers = [m for m, _, _ in rows]
+    assert markers == ["−", " ", "+"]
+    atom_ids = [a.atom_id for _, _, a in rows]
+    assert atom_ids == ["a1", "a2", "a3"]
+
+
+def test_diff_rows_markers_and_styles() -> None:
+    a1 = _make_atom("a1")
+    a2 = _make_atom("a2")
+    membership = _make_membership(
+        before=(a1,), after=(a2,), added=(a2,), removed=(a1,),
+    )
+    rows = _membership_diff_rows(membership)
+    assert rows[0][0] == "−"
+    assert "red" in rows[0][1]
+    assert rows[1][0] == "+"
+    assert "green" in rows[1][1]
+
+
+def test_diff_rows_no_changes() -> None:
+    a1 = _make_atom("a1")
+    membership = _make_membership(
+        before=(a1,), after=(a1,), added=(), removed=(),
+    )
+    rows = _membership_diff_rows(membership)
+    assert len(rows) == 1
+    assert rows[0][0] == " "
+    assert rows[0][2].atom_id == "a1"
+
+
+def test_diff_rows_empty_scene() -> None:
+    membership = _make_membership(before=(), after=(), added=(), removed=())
+    rows = _membership_diff_rows(membership)
+    assert rows == []
+
+
+def test_diff_counts_in_title() -> None:
+    from falda_analysis.app import _scene_zoom
+    a1 = _make_atom("a1")
+    a2 = _make_atom("a2")
+    a3 = _make_atom("a3", "kept")
+    membership = _make_membership(
+        before=(a1, a3), after=(a2, a3), added=(a2,), removed=(a1,),
+    )
+    group = _scene_zoom(membership)
+    # The table title is the second element of the Group (after heading Text)
+    import io
+
+    from rich.console import Console
+    buf = io.StringIO()
+    Console(file=buf, width=200, highlight=False).print(group)
+    rendered = buf.getvalue()
+    assert "−1" in rendered
+    assert "=1" in rendered
+    assert "+1" in rendered
+
+
+def test_diff_regen_note_shown_when_set() -> None:
+    import io
+
+    from rich.console import Console
+
+    from falda_analysis.app import _scene_zoom
+    a1 = _make_atom("a1")
+    membership = _make_membership(
+        before=(a1,), after=(a1,), added=(), removed=(), summary_regen=True
+    )
+    buf = io.StringIO()
+    Console(file=buf, width=200, highlight=False).print(_scene_zoom(membership))
+    assert "summary" in buf.getvalue().lower()
+
+
+def test_diff_regen_note_absent_when_not_set() -> None:
+    import io
+
+    from rich.console import Console
+
+    from falda_analysis.app import _scene_zoom
+    a1 = _make_atom("a1")
+    membership = _make_membership(before=(a1,), after=(a1,), added=(), removed=())
+    buf = io.StringIO()
+    Console(file=buf, width=200, highlight=False).print(_scene_zoom(membership))
+    assert "Regenerated" not in buf.getvalue()

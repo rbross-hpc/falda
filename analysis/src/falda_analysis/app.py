@@ -827,41 +827,71 @@ def _populate_scene_table(
         )
 
 
+def _membership_diff_rows(
+    membership: SceneMembership,
+) -> list[tuple[str, str, AtomView]]:
+    """Return (marker, style, atom) rows for the unified membership diff.
+
+    Order: removed (−) first, then kept (=), then added (+).
+    Removed and added come from the exact audit delta; kept = after − added.
+    """
+    added_ids = {a.atom_id for a in membership.added}
+    rows: list[tuple[str, str, AtomView]] = []
+    for atom in membership.removed:
+        rows.append(("−", "bold red", atom))
+    for atom in membership.after:
+        if atom.atom_id not in added_ids:
+            rows.append((" ", "dim", atom))
+    for atom in membership.added:
+        rows.append(("+", "bold green", atom))
+    return rows
+
+
 def _scene_zoom(membership: SceneMembership) -> Group:
     scene = membership.scene
+    regen_parts = [
+        label
+        for label, flag in (
+            ("summary", scene.summary_regenerated),
+            ("embedding", scene.embedding_regenerated),
+        )
+        if flag
+    ]
+    regen_note = f"  Regenerated: {', '.join(regen_parts)}" if regen_parts else ""
     heading = Text(
         f"{scene.scene_kind} scene: {scene.title or 'Unavailable'}\n"
         f"{scene.scene_id}\n"
         f"Reconstruction: {membership.quality.upper()} — {membership.message}\n"
-        "Atom status is current, not status at this pass.",
+        f"Atom status is current, not status at this pass.{regen_note}",
         style=("green" if membership.quality == "complete" else "yellow"),
     )
-    return Group(
-        heading,
-        _atom_table("Before", membership.before),
-        _atom_table("After", membership.after),
-        _atom_table("Added (exact audit delta)", membership.added),
-        _atom_table("Removed (exact audit delta)", membership.removed),
-    )
 
+    diff_rows = _membership_diff_rows(membership)
+    n_removed = sum(1 for m, _, _ in diff_rows if m == "−")
+    n_kept = sum(1 for m, _, _ in diff_rows if m == " ")
+    n_added = sum(1 for m, _, _ in diff_rows if m == "+")
+    title = f"Membership diff  −{n_removed} / ={n_kept} / +{n_added}"
 
-def _atom_table(title: str, atoms: tuple[AtomView, ...]) -> Table:
-    table = Table(title=f"{title} ({len(atoms)})", expand=True)
+    table = Table(title=title, expand=True)
+    table.add_column("", width=2, no_wrap=True)
     table.add_column("Atom ID")
     table.add_column("Type", width=12)
-    table.add_column("Current status", width=14)
+    table.add_column("Status", width=14)
     table.add_column("Content")
-    if not atoms:
-        table.add_row("—", "—", "—", "None")
-        return table
-    for atom in atoms:
-        table.add_row(
-            escape(atom.atom_id),
-            escape(atom.atom_type or "Unavailable"),
-            escape(atom.current_status or "Deleted/unavailable"),
-            escape(atom.content or "Atom content unavailable"),
-        )
-    return table
+
+    if not diff_rows:
+        table.add_row("", "—", "—", "—", "No membership changes")
+    else:
+        for marker, style, atom in diff_rows:
+            table.add_row(
+                Text(marker, style=style),
+                Text(escape(atom.atom_id), style=style),
+                Text(escape(atom.atom_type or "—"), style=style),
+                Text(escape(atom.current_status or "deleted/unavailable"), style=style),
+                Text(escape(atom.content or "(content unavailable)"), style=style),
+            )
+
+    return Group(heading, table)
 
 
 def _t3(item: Pass, previous: Pass | None) -> Group:
