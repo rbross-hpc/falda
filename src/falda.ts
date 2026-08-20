@@ -1229,8 +1229,8 @@ export class Falda {
    * (this.embed / this.dim). Used by `falda reembed` when switching
    * embedding models/dimensions (docs/OPERATIONS.md).
    *
-   * Dimension is baked into the vec0 schema (`embedding float[${dim}]` —
-   * see src/store/schema.ts's initSchema()), so a dim change can't be done as a row rewrite:
+   * Dimension is baked into the vec0 schema (`embedding float[${dim}]`,
+   * see initSchema() in src/store/schema.ts), so a dim change can't be done as a row rewrite:
    * the *_vec tables are dropped and recreated at `this.dim` before
    * repopulating. Safe to call even when only the model (not the dim)
    * changed — the drop/recreate is just extra I/O in that case.
