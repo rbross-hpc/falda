@@ -14,21 +14,20 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { spawn } from "node:child_process";
-
-const mcp: any = await import("../integrations/claude-code/hooks/lib/mcp.mjs");
-const creds: any = await import("../integrations/claude-code/hooks/lib/creds.mjs");
-const state: any = await import("../integrations/claude-code/hooks/lib/state.mjs");
+import * as mcp from "../integrations/claude-code/hooks/lib/mcp.mjs";
+import * as creds from "../integrations/claude-code/hooks/lib/creds.mjs";
+import * as state from "../integrations/claude-code/hooks/lib/state.mjs";
 
 describe("cc plugin: mcp envelope parsing", () => {
   test("unwraps an SSE-framed JSON-RPC response", () => {
     const raw = 'event: message\ndata: {"result":{"content":[{"type":"text","text":"{\\"tenant\\":\\"t1\\"}"}]},"jsonrpc":"2.0","id":1}\n\n';
     const env = mcp.parseEnvelope(raw, "text/event-stream");
-    assert.equal(env.result.content[0].text, '{"tenant":"t1"}');
+    assert.equal(env?.result?.content?.[0]?.text, '{"tenant":"t1"}');
   });
 
   test("unwraps a bare JSON response", () => {
     const env = mcp.parseEnvelope('{"result":{"ok":true}}', "application/json");
-    assert.equal(env.result.ok, true);
+    assert.deepEqual(env?.result, { ok: true });
   });
 
   test("returns null on malformed body instead of throwing", () => {
@@ -339,7 +338,9 @@ describe("cc plugin: packaging", () => {
     const raw = fs.readFileSync(new URL(".mcp.json", pluginRoot), "utf8");
     const match = raw.match(/\$\{FALDA_MCP_URL:-([^}]+)\}/);
     assert.ok(match, ".mcp.json must give FALDA_MCP_URL a shell default via ${VAR:-default}");
-    assert.equal(match![1], creds.resolveCreds({ FALDA_TOKEN: "t", FALDA_TENANT: "x" }).mcpUrl,
+    const resolved = creds.resolveCreds({ FALDA_TOKEN: "t", FALDA_TENANT: "x" });
+    assert.ok(resolved);
+    assert.equal(match[1], resolved.mcpUrl,
       "an unset FALDA_MCP_URL must resolve to the same default for both the hooks and the model's MCP tools");
   });
 

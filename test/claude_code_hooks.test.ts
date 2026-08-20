@@ -16,6 +16,7 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { serve, type ServeHandle } from "../src/server.js";
 import { PRIORITY_EXPLICIT } from "../src/distill/queue.js";
+import * as mcp from "../integrations/claude-code/hooks/lib/mcp.mjs";
 
 const HOOK = fileURLToPath(new URL("../integrations/claude-code/hooks/falda-hook.mjs", import.meta.url));
 
@@ -107,10 +108,11 @@ describe("cc plugin: stateless MCP contract", () => {
     });
     assert.equal(res.status, 200);
 
-    const mcp: any = await import("../integrations/claude-code/hooks/lib/mcp.mjs");
     const envelope = mcp.parseEnvelope(await res.text(), res.headers.get("content-type") ?? "");
     assert.ok(envelope, "response envelope parsed (bare JSON or SSE-framed)");
-    assert.deepEqual(JSON.parse(envelope.result.content[0].text), { tenant: "ccproj" });
+    const text = envelope.result?.content?.[0]?.text;
+    assert.ok(text, "response envelope contains tool result text");
+    assert.deepEqual(JSON.parse(text), { tenant: "ccproj" });
   });
 });
 
@@ -198,7 +200,6 @@ describe("cc plugin: failure policy", () => {
  * positional rather than semantic.
  */
 async function seedMemory(content: string): Promise<void> {
-  const mcp: any = await import("../integrations/claude-code/hooks/lib/mcp.mjs");
   const creds = { mcpUrl: env.FALDA_MCP_URL, token: env.FALDA_TOKEN, tenant: env.FALDA_TENANT };
   const saved = await mcp.callTool(creds, "falda_remember", {
     content, type: "fact", pinned: true,
