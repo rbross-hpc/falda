@@ -22,13 +22,18 @@ import { consolidationBatchPrompt, consolidationPrompt } from "../src/distill/pr
 import { Falda } from "../src/falda.js";
 import { makeLocalEmbedder } from "../src/embedder.js";
 
+// Helpers: build allowed-target-id sets for parseConsolidationBatch tests.
+// Each entry is a set of the IDs that were shown to the LLM for that candidate.
+function noTargets(): ReadonlySet<string> { return new Set(); }
+function withTargets(...ids: string[]): ReadonlySet<string> { return new Set(ids); }
+
 describe("parseConsolidationBatch", () => {
   test("maps a well-formed array by explicit index", () => {
     const raw = JSON.stringify([
       { candidate: 0, action: "store", target_ids: [], rationale: "new" },
       { candidate: 1, action: "skip", target_ids: [], rationale: "redundant" },
     ]);
-    const out = parseConsolidationBatch(raw, 2);
+    const out = parseConsolidationBatch(raw, [noTargets(), noTargets()]);
     assert.equal(out.length, 2);
     assert.equal(out[0]?.action, "store");
     assert.equal(out[1]?.action, "skip");
@@ -41,7 +46,7 @@ describe("parseConsolidationBatch", () => {
       { candidate: 1, action: "merge", target_ids: ["a", "b"], rationale: "unify" },
       { candidate: 0, action: "store", target_ids: [], rationale: "new" },
     ]);
-    const out = parseConsolidationBatch(raw, 2);
+    const out = parseConsolidationBatch(raw, [noTargets(), withTargets("a", "b")]);
     assert.equal(out[0]?.action, "store", "candidate 0 got its own decision");
     assert.equal(out[1]?.action, "merge", "candidate 1 got its own decision");
     assert.deepEqual(out[1]?.target_ids, ["a", "b"]);
@@ -51,7 +56,7 @@ describe("parseConsolidationBatch", () => {
     const raw = JSON.stringify([
       { candidate: 0, action: "store", target_ids: [], rationale: "new" },
     ]);
-    const out = parseConsolidationBatch(raw, 3);
+    const out = parseConsolidationBatch(raw, [noTargets(), noTargets(), noTargets()]);
     assert.equal(out[0]?.action, "store");
     assert.equal(out[1], undefined, "candidate 1 unresolved");
     assert.equal(out[2], undefined, "candidate 2 unresolved");
@@ -62,16 +67,16 @@ describe("parseConsolidationBatch", () => {
       { candidate: 7, action: "merge", target_ids: ["x"], rationale: "oops" },
       { candidate: -1, action: "store", target_ids: [], rationale: "oops" },
     ]);
-    const out = parseConsolidationBatch(raw, 2);
+    const out = parseConsolidationBatch(raw, [noTargets(), noTargets()]);
     assert.deepEqual(out, [undefined, undefined]);
   });
 
   test("keeps the first of a duplicated index", () => {
     const raw = JSON.stringify([
       { candidate: 0, action: "store", target_ids: [], rationale: "first" },
-      { candidate: 0, action: "merge", target_ids: ["z"], rationale: "second" },
+      { candidate: 0, action: "store", target_ids: [], rationale: "second" },
     ]);
-    const out = parseConsolidationBatch(raw, 1);
+    const out = parseConsolidationBatch(raw, [noTargets()]);
     assert.equal(out[0]?.rationale, "first");
   });
 
@@ -79,12 +84,14 @@ describe("parseConsolidationBatch", () => {
     const raw = JSON.stringify([
       { candidate: 0, action: "obliterate", target_ids: [], rationale: "no" },
     ]);
-    assert.deepEqual(parseConsolidationBatch(raw, 1), [undefined]);
+    assert.deepEqual(parseConsolidationBatch(raw, [noTargets()]), [undefined]);
   });
 
   test("returns all-unresolved for a completely malformed reply", () => {
-    assert.deepEqual(parseConsolidationBatch("I'm afraid I can't do that.", 2),
-      [undefined, undefined]);
+    assert.deepEqual(
+      parseConsolidationBatch("I'm afraid I can't do that.", [noTargets(), noTargets()]),
+      [undefined, undefined],
+    );
   });
 
   test("tolerates code fences and a line-delimited body", () => {
@@ -92,29 +99,106 @@ describe("parseConsolidationBatch", () => {
       `{"candidate":0,"action":"store","target_ids":[],"rationale":"a"},\n` +
       `{"candidate":1,"action":"skip","target_ids":[],"rationale":"b"}\n` +
       "```";
-    const out = parseConsolidationBatch(raw, 2);
+    const out = parseConsolidationBatch(raw, [noTargets(), noTargets()]);
     assert.equal(out[0]?.action, "store");
     assert.equal(out[1]?.action, "skip");
   });
 
-  test("coerces non-string target_ids and a missing rationale", () => {
+  test("non-string target_id entries are now invalid (no coercion)", () => {
     const raw = JSON.stringify([{ candidate: 0, action: "merge", target_ids: [1, 2] }]);
-    const out = parseConsolidationBatch(raw, 1);
-    assert.deepEqual(out[0]?.target_ids, ["1", "2"]);
+    const out = parseConsolidationBatch(raw, [withTargets("1", "2")]);
+    assert.equal(out[0], undefined, "numeric target_ids must not be coerced to strings");
+  });
+
+  test("missing rationale is tolerated as empty string", () => {
+    const raw = JSON.stringify([{ candidate: 0, action: "store", target_ids: [] }]);
+    const out = parseConsolidationBatch(raw, [noTargets()]);
+    assert.equal(out[0]?.action, "store");
     assert.equal(out[0]?.rationale, "");
   });
 
-  test("bare single-object reply with non-empty target_ids resolves correctly", () => {
+  test("bare single-object reply with valid merge targets resolves correctly", () => {
     const raw = JSON.stringify({ candidate: 0, action: "merge", target_ids: ["a", "b"], rationale: "x" });
-    const out = parseConsolidationBatch(raw, 1);
+    const out = parseConsolidationBatch(raw, [withTargets("a", "b")]);
     assert.equal(out[0]?.action, "merge");
     assert.deepEqual(out[0]?.target_ids, ["a", "b"]);
   });
 
   test("prose-wrapped array still parses via the array path", () => {
     const raw = 'Here is the result: [{"candidate":0,"action":"store","target_ids":[],"rationale":"n"}]';
-    const out = parseConsolidationBatch(raw, 1);
+    const out = parseConsolidationBatch(raw, [noTargets()]);
     assert.equal(out[0]?.action, "store");
+  });
+
+  // ─── Strict cardinality validation ─────────────────────────────────────────
+
+  test("store with a non-empty target_ids is unresolved", () => {
+    const raw = JSON.stringify([{ candidate: 0, action: "store", target_ids: ["a"], rationale: "r" }]);
+    assert.equal(parseConsolidationBatch(raw, [withTargets("a")])[0], undefined);
+  });
+
+  test("skip with a non-empty target_ids is unresolved", () => {
+    const raw = JSON.stringify([{ candidate: 0, action: "skip", target_ids: ["a"], rationale: "r" }]);
+    assert.equal(parseConsolidationBatch(raw, [withTargets("a")])[0], undefined);
+  });
+
+  test("update with zero targets is unresolved", () => {
+    const raw = JSON.stringify([{ candidate: 0, action: "update", target_ids: [], rationale: "r" }]);
+    assert.equal(parseConsolidationBatch(raw, [noTargets()])[0], undefined);
+  });
+
+  test("update with two targets is unresolved", () => {
+    const raw = JSON.stringify([{ candidate: 0, action: "update", target_ids: ["a", "b"], rationale: "r" }]);
+    assert.equal(parseConsolidationBatch(raw, [withTargets("a", "b")])[0], undefined);
+  });
+
+  test("merge with zero targets is unresolved", () => {
+    const raw = JSON.stringify([{ candidate: 0, action: "merge", target_ids: [], rationale: "r" }]);
+    assert.equal(parseConsolidationBatch(raw, [noTargets()])[0], undefined);
+  });
+
+  test("merge with one target is unresolved", () => {
+    const raw = JSON.stringify([{ candidate: 0, action: "merge", target_ids: ["a"], rationale: "r" }]);
+    assert.equal(parseConsolidationBatch(raw, [withTargets("a")])[0], undefined);
+  });
+
+  test("merge with duplicate target ids is unresolved", () => {
+    const raw = JSON.stringify([{ candidate: 0, action: "merge", target_ids: ["a", "a"], rationale: "r" }]);
+    assert.equal(parseConsolidationBatch(raw, [withTargets("a")])[0], undefined, "dupes must not satisfy 2+ count");
+  });
+
+  // ─── Candidate-local membership ─────────────────────────────────────────────
+
+  test("target not in allowed set is unresolved", () => {
+    const raw = JSON.stringify([{ candidate: 0, action: "update", target_ids: ["unknown"], rationale: "r" }]);
+    assert.equal(parseConsolidationBatch(raw, [withTargets("a", "b")])[0], undefined);
+  });
+
+  test("target from another candidate's set is unresolved", () => {
+    // candidate 0 is allowed ["a"]; candidate 1 is allowed ["b"].
+    // candidate 0 tries to use "b" — must be rejected.
+    const raw = JSON.stringify([
+      { candidate: 0, action: "update", target_ids: ["b"], rationale: "cross" },
+      { candidate: 1, action: "skip",   target_ids: [],    rationale: "ok" },
+    ]);
+    const out = parseConsolidationBatch(raw, [withTargets("a"), withTargets("b")]);
+    assert.equal(out[0], undefined, "cross-candidate target must be rejected");
+    assert.equal(out[1]?.action, "skip", "valid candidate is unaffected");
+  });
+
+  test("one valid + one unknown merge target is unresolved (no partial membership)", () => {
+    const raw = JSON.stringify([{ candidate: 0, action: "merge", target_ids: ["a", "invented"], rationale: "r" }]);
+    assert.equal(parseConsolidationBatch(raw, [withTargets("a", "b")])[0], undefined);
+  });
+
+  test("missing target_ids field is unresolved", () => {
+    const raw = JSON.stringify([{ candidate: 0, action: "store", rationale: "r" }]);
+    assert.equal(parseConsolidationBatch(raw, [noTargets()])[0], undefined);
+  });
+
+  test("scalar target_ids is unresolved", () => {
+    const raw = JSON.stringify([{ candidate: 0, action: "update", target_ids: "a", rationale: "r" }]);
+    assert.equal(parseConsolidationBatch(raw, [withTargets("a")])[0], undefined);
   });
 });
 
