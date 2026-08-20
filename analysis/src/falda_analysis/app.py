@@ -24,8 +24,10 @@ from textual.worker import Worker
 from .models import AtomView, LiveState, Pass, SceneEffect, SceneMembership, StoreSummary
 from .store import (
     StoreError,
+    load_core_full_text,
     load_live_state,
     load_passes,
+    load_scene_full_text,
     load_summary,
     reconstruct_scene_membership,
 )
@@ -52,6 +54,35 @@ class SceneZoom(ModalScreen[None]):
 
     def action_close(self) -> None:
         self.dismiss()
+
+
+class RecallZoom(ModalScreen[None]):
+    CSS = """
+    RecallZoom { align: center middle; }
+    #recall-zoom {
+        width: 90%; height: 90%; padding: 1 2;
+        border: thick $accent; background: $surface;
+    }
+    """
+    BINDINGS = [("escape", "close", "Close"), ("q", "close", "Close")]
+
+    def __init__(self, header: str, body: str) -> None:
+        super().__init__()
+        self._header = header
+        self._body = body
+
+    def compose(self) -> ComposeResult:
+        with VerticalScroll(id="recall-zoom"):
+            yield Static(Text(self._header, style="bold cyan"))
+            yield Static(escape(self._body))
+        yield Footer()
+
+    def action_close(self) -> None:
+        self.dismiss()
+
+
+def _scene_changed(scene: SceneEffect) -> bool:
+    return scene.effect != "unchanged" or scene.summary_regenerated or scene.embedding_regenerated
 
 
 # ─── change-signature helpers ────────────────────────────────────────────────
@@ -89,7 +120,7 @@ class LiveScreen(Screen[None]):
     #live-pass-heading { padding: 0 1; color: $text-muted; }
     #live-pass-detail { padding: 0 1; }
     #live-recall-heading { padding: 0 1; color: $text-muted; }
-    #live-recall-detail { padding: 0 1; }
+    #live-recall { height: auto; max-height: 20; margin: 0 1; }
     .flash { background: $warning 30%; }
     .running-label { color: $warning; }
     .failed-label { color: $error; }
@@ -122,7 +153,7 @@ class LiveScreen(Screen[None]):
             yield Static(id="live-pass-heading")
             yield Static(id="live-pass-detail")
             yield Static(id="live-recall-heading")
-            yield Static(id="live-recall-detail")
+            yield DataTable(id="live-recall", cursor_type="row")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -208,12 +239,42 @@ class LiveScreen(Screen[None]):
             self._flash(pass_detail)
 
         recall_heading = self.query_one("#live-recall-heading", Static)
-        recall_detail = self.query_one("#live-recall-detail", Static)
+        recall_table = self.query_one("#live-recall", DataTable)
         recall_heading.update(_live_recall_heading(state.last_recall, recall_changed))
-        recall_detail.update(_live_recall_detail(state.last_recall))
+        _populate_recall_table(recall_table, state.last_recall)
         if recall_changed:
             self._flash(recall_heading)
-            self._flash(recall_detail)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        if event.data_table.id != "live-recall" or self._state is None:
+            return
+        recall = self._state.last_recall
+        if recall is None:
+            return
+        ordinal_key = event.row_key.value
+        if ordinal_key is None:
+            return
+        item = next(
+            (i for i in recall.items if i.ordinal == int(ordinal_key)), None
+        )
+        if item is None or item.tier not in {"T2", "T3"}:
+            return
+        if item.tier == "T2":
+            result = load_scene_full_text(self.root, self.tenant, item.item_id)
+            if result is None:
+                header = f"{item.tier}  {item.item_id}"
+                body = "(content unavailable)"
+            else:
+                title, summary = result
+                header = f"T2 scene  {item.item_id}"
+                if title:
+                    header += f"  —  {title}"
+                body = summary or "(no summary stored)"
+        else:
+            text = load_core_full_text(self.root, self.tenant)
+            header = "T3 core  (current stored text)"
+            body = text or "(core.md not found)"
+        self.app.push_screen(RecallZoom(header, body))
 
     def _flash(self, widget: Static) -> None:
         widget.add_class("flash")
@@ -297,7 +358,7 @@ def _live_pass_detail(p: Pass | None) -> Group:
         t2_table.add_column("Title")
         t2_table.add_column("Members")
         t2_table.add_column("Delta")
-        for s in p.scenes:
+        for s in sorted(p.scenes, key=lambda sc: not _scene_changed(sc)):
             t2_table.add_row(
                 s.scene_kind,
                 s.effect,
@@ -331,29 +392,25 @@ def _live_recall_heading(recall: object, changed: bool) -> Text:
     )
     return Text.from_markup(
         f"[bold]Last recall[/bold]{delta}  {escape(r.created_at[:19])}  "
-        f"mode={escape(r.mode)}  {budget}  {len(r.items)} items\n"
+        f"mode={escape(r.mode)}  {budget}  {len(r.items)} items  "
+        f"[dim]select T2/T3 row + Enter to view full text[/dim]\n"
         f"[italic]{escape(r.query[:120])}{'…' if len(r.query) > 120 else ''}[/italic]"
     )
 
 
-def _live_recall_detail(recall: object) -> Group:
+def _populate_recall_table(table: DataTable[object], recall: object) -> None:
     from .models import LiveRecall as _LR
 
+    table.clear(columns=True)
+    table.add_columns("Ord", "Tier", "Source", "Score", "Chars", "Usage", "Content")
     if recall is None or not isinstance(recall, _LR):
-        return Group()
+        table.add_row("—", "—", "—", "—", "—", "—", "No recall telemetry", key="__empty__")
+        return
     r: _LR = recall
-    table = Table(title="Recall items", expand=True)
-    table.add_column("Ord", width=4)
-    table.add_column("Tier", width=4)
-    table.add_column("Source", width=8)
-    table.add_column("Score", width=6)
-    table.add_column("Chars", width=6)
-    table.add_column("Usage", width=8)
-    table.add_column("Content")
     for item in r.items:
         score_str = f"{item.score:.3f}" if item.score is not None else "—"
         chars_str = str(item.chars) if item.chars is not None else "—"
-        content_str = escape(item.content or f"({item.item_id})")
+        content_str = item.content or f"({item.item_id})"
         table.add_row(
             str(item.ordinal),
             item.tier,
@@ -362,8 +419,8 @@ def _live_recall_detail(recall: object) -> Group:
             chars_str,
             item.usage,
             content_str,
+            key=str(item.ordinal),
         )
-    return Group(table)
 
 
 class HistoryApp(App[None]):
@@ -537,14 +594,8 @@ class HistoryApp(App[None]):
         self.query_one("#gaps", Static).update(_gaps(selected))
 
     def _update_t2(self, selected: Pass, previous: Pass | None) -> None:
-        changed = [
-            scene
-            for scene in selected.scenes
-            if scene.effect != "unchanged"
-            or scene.summary_regenerated
-            or scene.embedding_regenerated
-        ]
-        unchanged = [scene for scene in selected.scenes if scene not in changed]
+        changed = [scene for scene in selected.scenes if _scene_changed(scene)]
+        unchanged = [scene for scene in selected.scenes if not _scene_changed(scene)]
         prior = (
             f"{len(previous.scenes)} effect rows" if previous else "Unavailable: first audited pass"
         )

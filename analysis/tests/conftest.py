@@ -110,7 +110,13 @@ def falda_root(tmp_path: Path) -> Path:
     db.executemany(
         "INSERT INTO scenes VALUES(?,?,?,?,?)",
         [
-            ("episode-1", "episode", "active", "First Episode", "A summary of episode one."),
+            (
+                "episode-1",
+                "episode",
+                "active",
+                "First Episode",
+                "A" * 400,
+            ),
             ("topic-1", "topic", "retired", "Stable Topic", "A summary of the stable topic."),
         ],
     )
