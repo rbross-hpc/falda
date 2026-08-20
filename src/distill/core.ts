@@ -193,6 +193,38 @@ export interface ConsolidationDecision {
   rationale: string;
 }
 
+/**
+ * Thrown when a consolidation `update`/`merge` target that was active at
+ * retrieval/decision time is no longer active by the time the L1 write
+ * transaction applies it — e.g. archived, superseded, merged, or hard-
+ * deleted by a concurrent foreground request, or consumed by an earlier
+ * operation in the same pass.
+ *
+ * Prompt-time candidate-local membership validation (validated by
+ * validateConsolidationDecision) proves only "this id was shown to the
+ * model for this candidate" — it says nothing about whether the target is
+ * still eligible at application time. This error closes that gap: it is
+ * thrown from inside the synchronous L1 transaction, which rolls back
+ * every write the pass attempted (winner atoms/indexes, evidence,
+ * lifecycle changes, decisions) and leaves the watermark unchanged, so the
+ * queue's normal retry/backoff re-runs the identical input window. The
+ * decision itself is never rewritten (no silent downgrade to store/skip,
+ * no partial merge) — see docs/MODEL.md §8.2.
+ */
+export class ConsolidationTargetConflictError extends Error {
+  constructor(
+    public readonly action: "update" | "merge",
+    public readonly targetId: string,
+    public readonly reason: "missing" | "inactive",
+  ) {
+    super(
+      `consolidation ${action} target ${targetId} is no longer eligible ` +
+        `(${reason === "missing" ? "no longer exists" : "no longer active"})`,
+    );
+    this.name = "ConsolidationTargetConflictError";
+  }
+}
+
 const CONSOLIDATION_ACTIONS = ["store", "update", "merge", "skip"] as const;
 
 /**
@@ -473,6 +505,36 @@ function packConsolidationChunks<T>(
 
 function atomIdFromContent(type: string, content: string): string {
   return "l1-" + createHash("sha256").update(`${type}:${content}`).digest("hex").slice(0, 24);
+}
+
+/**
+ * Assert that every named `update`/`merge` target is still active, as of
+ * right now, under the caller's L1 `BEGIN IMMEDIATE` transaction.
+ *
+ * Must be called from inside the synchronous L1 transaction (never before
+ * it opens) — that is what makes this check race-free: no other writer can
+ * commit a lifecycle change between this check and the mutation it guards,
+ * because SQLite's write lock is already held. Calling it before the
+ * transaction opens would just move the TOCTOU window, not close it.
+ *
+ * Synchronous by construction — store.getAtom() is a plain SELECT, so this
+ * performs no I/O beyond the same connection the transaction already owns.
+ *
+ * Throws ConsolidationTargetConflictError (not a boolean) so a stale target
+ * always aborts the whole L1 unit via the transaction's own rollback path,
+ * matching how every other invalid-decision case in this pipeline behaves
+ * (finding 16: never silently reinterpret a bad plan as a smaller one).
+ */
+function assertTargetsActive(
+  store: Falda,
+  action: "update" | "merge",
+  targetIds: readonly string[],
+): void {
+  for (const id of targetIds) {
+    const atom = store.getAtom(id);
+    if (!atom) throw new ConsolidationTargetConflictError(action, id, "missing");
+    if (atom.status !== "active") throw new ConsolidationTargetConflictError(action, id, "inactive");
+  }
 }
 
 /**
@@ -825,6 +887,24 @@ async function distillOncePass(
   const countedStoredIds = new Set<string>();
 
   const commitL1 = db.transaction(() => {
+    // Phase 0: revalidate every update/merge target's eligibility BEFORE
+    // Phase A writes any winner atom. Candidate retrieval and the LLM
+    // decision it produced happened entirely before this transaction opened
+    // (searchAtoms, consolidation calls, winner embedding — all async), so a
+    // target that was active when shown to the model may have since been
+    // archived, superseded, merged, or hard-deleted by a concurrent
+    // foreground request. Checking here, before Phase A, matters because a
+    // target id can coincide with another candidate's deterministic newId
+    // (both are content-hash-derived) — running this first means Phase A
+    // cannot repair/recreate a just-hard-deleted target before we get a
+    // chance to see it was gone. A conflict throws and rolls back the whole
+    // transaction (docs/MODEL.md §8.2/§8.5) — never a silent downgrade.
+    for (const op of writeOps) {
+      if (op.action === "update" || op.action === "merge") {
+        assertTargetsActive(store, op.action, op.targetIds);
+      }
+    }
+
     // Phase A: ensure/repair each unique prepared atom exactly once. Doing
     // this once per unique id (rather than once per write-op) means
     // duplicate extracted candidates don't repeatedly delete+reinsert the
@@ -859,6 +939,15 @@ async function distillOncePass(
 
       } else if (op.action === "update") {
         const oldId = op.targetIds[0];
+        // Revalidate immediately before applying, not just once at Phase 0
+        // above: two operations in THIS SAME pass can name the same target
+        // (e.g. two candidates both decide to update the same existing
+        // atom). Phase 0 alone would pass both, because neither has been
+        // applied yet when it runs. Re-checking here catches the case where
+        // an earlier operation in this loop already made oldId terminal —
+        // the throw rolls back everything this transaction has done so far,
+        // including that earlier operation.
+        assertTargetsActive(store, "update", [oldId]);
         if (preparedAtoms.has(op.newId)) {
           // Inherited evidence is read here, inside the transaction, so it
           // reflects the current committed state rather than a snapshot
@@ -880,6 +969,10 @@ async function distillOncePass(
         });
 
       } else if (op.action === "merge") {
+        // Revalidate immediately before applying — see the "update" branch
+        // above for why Phase 0 alone is insufficient when multiple
+        // operations in this same pass can consume the same target.
+        assertTargetsActive(store, "merge", op.targetIds);
         if (preparedAtoms.has(op.newId)) {
           const inherited = new Set<string>();
           for (const tid of op.targetIds) {

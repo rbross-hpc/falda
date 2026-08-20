@@ -18,7 +18,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { createHash } from "node:crypto";
 import { Falda } from "../src/falda.js";
-import { distillOnce } from "../src/distill/core.js";
+import { distillOnce, ConsolidationTargetConflictError } from "../src/distill/core.js";
 
 function makeStore(embed: (text: string) => Promise<number[]>, dim = 32) {
   const blobDir = fs.mkdtempSync(path.join(os.tmpdir(), "falda-l1-atomic-"));
@@ -464,6 +464,340 @@ describe("Finding 1: merge-self exclusion", () => {
       assert.deepEqual(targetIds.sort(), [other.id, winnerId].sort(), "decision target list recorded as given");
 
       assert.equal(result.atoms_merged, 1, "atoms_merged counts the one actual lifecycle merge");
+    } finally { cleanup(s, blobDir); }
+  });
+});
+
+// ─── Test 8 — Stale consolidation target eligibility (target TOCTOU) ─────────
+//
+// Candidate retrieval, the consolidation LLM decision, and winner-embedding
+// preparation are all async and happen BEFORE the L1 transaction opens
+// (src/distill/core.ts). A target that was active when shown to the model
+// can be archived/hard-deleted/consumed by another operation before the
+// transaction actually applies the decision. These tests arm a mutation to
+// fire during that async window — via a wrapped prepareAtomEmbedding(),
+// which core.ts calls once per unique winner id right before opening the
+// transaction — and verify the whole L1 unit rejects and rolls back rather
+// than silently applying a stale plan.
+
+describe("Finding: consolidation target eligibility (TOCTOU)", () => {
+  test("update target archived during the async planning window: whole pass rejects, target stays archived", async () => {
+    const emb = makeControllableEmbedder(32);
+    const { s, blobDir } = makeStore(emb.embed);
+    try {
+      const oldContent = "The sensor calibrates at 4.1K.";
+      const oldId = atomIdFromContent("fact", oldContent);
+      await s.upsertAtom({ id: oldId, type: "fact", content: oldContent });
+
+      await s.addStream("sess-1", [{ role: "user", content: "confirmed: sensor calibrates at 4.2K" }]);
+
+      const newContent = "The sensor calibrates at 4.2K.";
+      const newId = atomIdFromContent("fact", newContent);
+
+      const originalPrepare = s.prepareAtomEmbedding.bind(s);
+      (s as any).prepareAtomEmbedding = async (content: string) => {
+        // Fires exactly once, for the winner's own content, right before
+        // the L1 transaction opens — simulating a concurrent foreground
+        // /atoms/archive request racing this pass.
+        if (content === newContent) s.archiveAtom(oldId);
+        return originalPrepare(content);
+      };
+
+      const llm = makeMockLLM([
+        `{"type":"fact","content":"${newContent}","confidence":"high"}`,
+        `{"action":"update","target_ids":["${oldId}"],"rationale":"Refresh."}`,
+      ]);
+
+      await assert.rejects(
+        () => distillOnce(s, llm, { storeKey: "target-race-update:self" }),
+        (err: unknown) => {
+          assert.ok(err instanceof ConsolidationTargetConflictError, "rejects with the typed conflict error");
+          assert.equal((err as ConsolidationTargetConflictError).action, "update");
+          assert.equal((err as ConsolidationTargetConflictError).targetId, oldId);
+          assert.equal((err as ConsolidationTargetConflictError).reason, "inactive");
+          return true;
+        },
+      );
+
+      const db = (s as any).db as Database.Database;
+      const oldRow = db.prepare("SELECT status FROM atoms WHERE id=?").get(oldId) as any;
+      assert.equal(oldRow.status, "archived", "target remains archived, not rewritten to superseded");
+
+      const c = counts(db, newId);
+      assert.equal(c.atoms, 0, "no winner atom row survives");
+      assert.equal(c.fts, 0, "no winner fts row survives");
+      assert.equal(c.vec, 0, "no winner vec row survives");
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM atom_evidence WHERE atom_id=?").get(newId) as any).c, 0,
+        "no evidence attached to the winner",
+      );
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM consolidation_decisions").get() as any).c, 0,
+        "no decision row survives",
+      );
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM distill_watermark").get() as any).c, 0,
+        "watermark not advanced",
+      );
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("update target hard-deleted during the async planning window: no phantom update is recorded", async () => {
+    const emb = makeControllableEmbedder(32);
+    const { s, blobDir } = makeStore(emb.embed);
+    try {
+      const oldContent = "The sensor calibrates at 4.1K.";
+      const oldId = atomIdFromContent("fact", oldContent);
+      await s.upsertAtom({ id: oldId, type: "fact", content: oldContent });
+
+      await s.addStream("sess-1", [{ role: "user", content: "confirmed: sensor calibrates at 4.2K" }]);
+
+      const newContent = "The sensor calibrates at 4.2K.";
+      const newId = atomIdFromContent("fact", newContent);
+
+      const originalPrepare = s.prepareAtomEmbedding.bind(s);
+      (s as any).prepareAtomEmbedding = async (content: string) => {
+        if (content === newContent) s.hardDeleteAtomsUnsafe([oldId]);
+        return originalPrepare(content);
+      };
+
+      const llm = makeMockLLM([
+        `{"type":"fact","content":"${newContent}","confidence":"high"}`,
+        `{"action":"update","target_ids":["${oldId}"],"rationale":"Refresh."}`,
+      ]);
+
+      await assert.rejects(
+        () => distillOnce(s, llm, { storeKey: "target-race-delete:self" }),
+        /no longer eligible/,
+      );
+
+      const db = (s as any).db as Database.Database;
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM atoms WHERE id=?").get(oldId) as any).c, 0,
+        "target remains absent",
+      );
+      const c = counts(db, newId);
+      assert.equal(c.atoms, 0, "no replacement winner atom row survives");
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM consolidation_decisions").get() as any).c, 0,
+        "no phantom update decision recorded",
+      );
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM distill_watermark").get() as any).c, 0,
+        "watermark not advanced",
+      );
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("merge with one target archived mid-flight: whole pass rejects, no partial merge", async () => {
+    const emb = makeControllableEmbedder(32);
+    const { s, blobDir } = makeStore(emb.embed);
+    try {
+      const targetA = await s.upsertAtom({ type: "fact", content: "Fact A." });
+      const targetB = await s.upsertAtom({ type: "fact", content: "Fact B, same meaning." });
+
+      await s.addStream("sess-1", [{ role: "user", content: "A and B are the same fact" }]);
+
+      const newContent = "Facts A and B describe the same durable configuration.";
+      const newId = atomIdFromContent("fact", newContent);
+
+      const originalPrepare = s.prepareAtomEmbedding.bind(s);
+      (s as any).prepareAtomEmbedding = async (content: string) => {
+        if (content === newContent) s.archiveAtom(targetB.id);
+        return originalPrepare(content);
+      };
+
+      const llm = makeMockLLM([
+        `{"type":"fact","content":"${newContent}","confidence":"high"}`,
+        `{"action":"merge","target_ids":["${targetA.id}","${targetB.id}"],"rationale":"Same configuration."}`,
+      ]);
+
+      await assert.rejects(
+        () => distillOnce(s, llm, { storeKey: "target-race-merge:self" }),
+        /no longer eligible/,
+      );
+
+      const db = (s as any).db as Database.Database;
+      const rowA = db.prepare("SELECT status FROM atoms WHERE id=?").get(targetA.id) as any;
+      assert.equal(rowA.status, "active", "surviving target is NOT partially merged");
+      const rowB = db.prepare("SELECT status FROM atoms WHERE id=?").get(targetB.id) as any;
+      assert.equal(rowB.status, "archived", "archived target is not rewritten to merged");
+
+      const c = counts(db, newId);
+      assert.equal(c.atoms, 0, "no winner atom row survives");
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM consolidation_decisions").get() as any).c, 0,
+        "no decision row survives",
+      );
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM distill_watermark").get() as any).c, 0,
+        "watermark not advanced",
+      );
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("two candidates in one pass target the same atom: second operation detects the first made it stale, whole transaction rolls back", async () => {
+    const emb = makeControllableEmbedder(32);
+    const { s, blobDir } = makeStore(emb.embed);
+    try {
+      const sharedContent = "The sensor calibrates at 4.1K.";
+      const sharedId = atomIdFromContent("fact", sharedContent);
+      await s.upsertAtom({ id: sharedId, type: "fact", content: sharedContent });
+
+      await s.addStream("sess-1", [{ role: "user", content: "two independent confirmations of the sensor reading" }]);
+
+      // Two DIFFERENT extracted candidates both decide to update the SAME
+      // existing target — no timing or external mutation needed, this is a
+      // deterministic intra-pass conflict.
+      const candidateA = "Sensor calibration confirmed by team A.";
+      const candidateB = "Sensor calibration confirmed by team B.";
+      const idA = atomIdFromContent("fact", candidateA);
+      const idB = atomIdFromContent("fact", candidateB);
+
+      const llm = makeMockLLM([
+        [
+          `{"type":"fact","content":"${candidateA}","confidence":"high"}`,
+          `{"type":"fact","content":"${candidateB}","confidence":"high"}`,
+        ].join("\n"),
+        // Batched consolidation reply: both candidates update the same target.
+        JSON.stringify([
+          { candidate: 0, action: "update", target_ids: [sharedId], rationale: "Team A confirms." },
+          { candidate: 1, action: "update", target_ids: [sharedId], rationale: "Team B confirms." },
+        ]),
+      ]);
+
+      await assert.rejects(
+        () => distillOnce(s, llm, { storeKey: "target-race-intra-pass:self" }),
+        /no longer eligible/,
+      );
+
+      const db = (s as any).db as Database.Database;
+      const sharedRow = db.prepare("SELECT status FROM atoms WHERE id=?").get(sharedId) as any;
+      assert.equal(sharedRow.status, "active", "original target remains active — first operation's effect rolled back too");
+
+      assert.equal(counts(db, idA).atoms, 0, "neither winner survives");
+      assert.equal(counts(db, idB).atoms, 0, "neither winner survives");
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM consolidation_decisions").get() as any).c, 0,
+        "neither decision survives",
+      );
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM distill_watermark").get() as any).c, 0,
+        "watermark not advanced",
+      );
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("a stale-target conflict is retryable: a fresh pass with current state succeeds and advances the watermark", async () => {
+    const emb = makeControllableEmbedder(32);
+    const { s, blobDir } = makeStore(emb.embed);
+    try {
+      const oldContent = "The sensor calibrates at 4.1K.";
+      const oldId = atomIdFromContent("fact", oldContent);
+      await s.upsertAtom({ id: oldId, type: "fact", content: oldContent });
+
+      await s.addStream("sess-1", [{ role: "user", content: "confirmed: sensor calibrates at 4.2K" }]);
+
+      const newContent = "The sensor calibrates at 4.2K.";
+      const newId = atomIdFromContent("fact", newContent);
+
+      const originalPrepare = s.prepareAtomEmbedding.bind(s);
+      (s as any).prepareAtomEmbedding = async (content: string) => {
+        if (content === newContent) s.archiveAtom(oldId);
+        return originalPrepare(content);
+      };
+
+      const failLlm = makeMockLLM([
+        `{"type":"fact","content":"${newContent}","confidence":"high"}`,
+        `{"action":"update","target_ids":["${oldId}"],"rationale":"Refresh."}`,
+      ]);
+      await assert.rejects(() => distillOnce(s, failLlm, { storeKey: "target-race-retry:self" }));
+
+      const db = (s as any).db as Database.Database;
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM distill_watermark").get() as any).c, 0,
+        "watermark unchanged after the conflict",
+      );
+
+      // Restore normal embedding behavior and retry with fresh retrieval:
+      // oldId is now archived, so a fresh consolidation call correctly sees
+      // no eligible existing target and stores a new atom instead.
+      (s as any).prepareAtomEmbedding = originalPrepare;
+      const retryLlm = makeMockLLM([
+        `{"type":"fact","content":"${newContent}","confidence":"high"}`,
+        `{"action":"store","target_ids":[],"rationale":"No eligible existing target found."}`,
+        "Sensor session", "Sensor reading reconfirmed.",
+        "Sensor topic", "Sensor calibration facts.",
+        "# Core\n\nSensor at 4.2K.",
+      ]);
+      const result = await distillOnce(s, retryLlm, { storeKey: "target-race-retry:self" });
+      assert.equal(result.atoms_stored, 1, "retry succeeds with current state");
+
+      const c = counts(db, newId);
+      assert.equal(c.atoms, 1, "winner atom now exists");
+      assert.ok(
+        (db.prepare("SELECT COUNT(*) c FROM distill_watermark").get() as any).c > 0,
+        "watermark advanced after successful retry",
+      );
+    } finally { cleanup(s, blobDir); }
+  });
+
+  test("update-to-self target hard-deleted mid-flight: Phase 0 must see it missing BEFORE Phase A can recreate it", async () => {
+    // Distinguishing regression for the Phase-0-before-Phase-A ordering
+    // (src/distill/core.ts: target revalidation runs before any winner is
+    // written). The earlier hard-delete test used a DIFFERENT id for the
+    // deleted target and the prepared winner, so it could not detect an
+    // accidental reordering: Phase A never touches that target's id in that
+    // scenario either way. Here oldId === newId (an "update-to-self"
+    // decision, content unchanged), so if target revalidation ran AFTER
+    // Phase A instead of before it, Phase A's upsertDistilledAtomSync()
+    // would silently RECREATE the just-hard-deleted row under the same
+    // deterministic id — and the revalidation check would then wrongly see
+    // it as active, letting a stale plan through undetected.
+    const emb = makeControllableEmbedder(32);
+    const { s, blobDir } = makeStore(emb.embed);
+    try {
+      const content = "The sensor calibrates at 4.2K.";
+      const id = atomIdFromContent("fact", content);
+      await s.upsertAtom({ id, type: "fact", content });
+
+      await s.addStream("sess-1", [{ role: "user", content: "confirmed: sensor calibrates at 4.2K" }]);
+
+      const originalPrepare = s.prepareAtomEmbedding.bind(s);
+      (s as any).prepareAtomEmbedding = async (embContent: string) => {
+        // Fires for the winner's own content — which is the SAME id as the
+        // update target, since this is an update-to-self decision.
+        if (embContent === content) s.hardDeleteAtomsUnsafe([id]);
+        return originalPrepare(embContent);
+      };
+
+      const llm = makeMockLLM([
+        `{"type":"fact","content":"${content}","confidence":"high"}`,
+        `{"action":"update","target_ids":["${id}"],"rationale":"Reconfirms existing fact."}`,
+      ]);
+
+      await assert.rejects(
+        () => distillOnce(s, llm, { storeKey: "target-race-update-self-delete:self" }),
+        /no longer eligible/,
+      );
+
+      const db = (s as any).db as Database.Database;
+      const c = counts(db, id);
+      assert.equal(c.atoms, 0, "the hard-deleted id was NOT recreated by Phase A");
+      assert.equal(c.fts, 0, "no fts row was created for it");
+      assert.equal(c.vec, 0, "no vec row was created for it");
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM atom_evidence WHERE atom_id=?").get(id) as any).c, 0,
+        "no evidence attached",
+      );
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM consolidation_decisions").get() as any).c, 0,
+        "no decision row survives",
+      );
+      assert.equal(
+        (db.prepare("SELECT COUNT(*) c FROM distill_watermark").get() as any).c, 0,
+        "watermark not advanced",
+      );
     } finally { cleanup(s, blobDir); }
   });
 });
