@@ -12,7 +12,10 @@ from .models import (
     DataGap,
     Decision,
     EvidenceTurn,
+    LiveRecall,
+    LiveState,
     Pass,
+    RecallItem,
     ReconstructionQuality,
     SceneEffect,
     SceneMembership,
@@ -394,3 +397,171 @@ def _gaps(
     if core is None:
         gaps.append(DataGap("T3", "No core effect row was recorded for this pass."))
     return tuple(gaps)
+
+
+# ─── live view support ────────────────────────────────────────────────────────
+
+_CONTENT_SNIPPET_LEN = 300
+
+
+def tenant_store_key(tenant: str) -> str:
+    return f"{tenant}:self"
+
+
+def recall_trace_db_path(root: Path) -> Path:
+    return root.expanduser().resolve() / "recall_traces.db"
+
+
+@contextmanager
+def _open_recall_traces(root: Path) -> Iterator[sqlite3.Connection | None]:
+    """Yields a read-only connection to recall_traces.db, or None if absent."""
+    db_path = recall_trace_db_path(root)
+    if not db_path.is_file():
+        yield None
+        return
+    uri = f"file:{quote(str(db_path))}?mode=ro"
+    db: sqlite3.Connection | None = None
+    try:
+        db = sqlite3.connect(uri, uri=True)
+        db.row_factory = sqlite3.Row
+        db.execute("PRAGMA query_only = ON")
+        yield db
+    except sqlite3.Error as error:
+        raise StoreError(f"cannot read recall_traces.db: {error}") from error
+    finally:
+        if db is not None:
+            db.close()
+
+
+def _load_scene_summaries(
+    root: Path, tenant: str, scene_ids: tuple[str, ...]
+) -> dict[str, tuple[str | None, str | None]]:
+    """Return {scene_id: (title, summary)} for the given ids.
+
+    Falls back gracefully when the scenes table lacks title/summary columns
+    (e.g. the minimal test fixture) — returns (None, None) for every id.
+    """
+    if not scene_ids:
+        return {}
+    placeholders = ",".join("?" for _ in scene_ids)
+    try:
+        with open_store(root, tenant) as db:
+            rows = db.execute(
+                f"SELECT scene_id, title, summary FROM scenes WHERE scene_id IN ({placeholders})",
+                scene_ids,
+            ).fetchall()
+        return {
+            str(row["scene_id"]): (
+                str(row["title"]) if row["title"] is not None else None,
+                str(row["summary"]) if row["summary"] is not None else None,
+            )
+            for row in rows
+        }
+    except (sqlite3.OperationalError, StoreError):
+        return {}
+
+
+def _resolve_recall_items(
+    root: Path,
+    tenant: str,
+    rows: list[sqlite3.Row],
+    blob_dir: Path,
+) -> tuple[RecallItem, ...]:
+    """Resolve content for each recall_trace_items row."""
+    t1_ids = tuple(str(r["item_id"]) for r in rows if str(r["tier"]) == "T1")
+    t2_ids = tuple(str(r["item_id"]) for r in rows if str(r["tier"]) == "T2")
+
+    atoms = _load_atoms(root, tenant, t1_ids) if t1_ids else {}
+    scenes = _load_scene_summaries(root, tenant, t2_ids) if t2_ids else {}
+
+    core_content: str | None = None
+    core_path = blob_dir / "core.md"
+    if core_path.is_file():
+        text = core_path.read_text(encoding="utf-8")
+        suffix = "…" if len(text) > _CONTENT_SNIPPET_LEN else ""
+        core_content = text[:_CONTENT_SNIPPET_LEN] + suffix
+
+    items: list[RecallItem] = []
+    for row in rows:
+        tier = str(row["tier"])
+        item_id = str(row["item_id"])
+        content: str | None = None
+        if tier == "T1":
+            av = atoms.get(item_id)
+            if av and av.content:
+                c = av.content
+                content = c[:_CONTENT_SNIPPET_LEN] + ("…" if len(c) > _CONTENT_SNIPPET_LEN else "")
+        elif tier == "T2":
+            title, summary = scenes.get(item_id, (None, None))
+            parts = [p for p in (title, summary) if p]
+            if parts:
+                raw = " — ".join(parts)
+                content = (
+                    raw[:_CONTENT_SNIPPET_LEN] + ("…" if len(raw) > _CONTENT_SNIPPET_LEN else "")
+                )
+        elif tier == "T3":
+            content = core_content
+        items.append(
+            RecallItem(
+                ordinal=int(row["ordinal"]),
+                tier=tier,
+                item_id=item_id,
+                source=str(row["source"]),
+                score=float(row["score"]) if row["score"] is not None else None,
+                chars=int(row["chars"]) if row["chars"] is not None else None,
+                usage=str(row["usage"]),
+                content=content,
+            )
+        )
+    return tuple(items)
+
+
+def load_last_recall(root: Path, tenant: str) -> LiveRecall | None:
+    """Return the most recent recall trace for this tenant, with resolved content."""
+    store_key = tenant_store_key(tenant)
+    _, blob_dir = store_paths(root, tenant)
+    with _open_recall_traces(root) as db:
+        if db is None:
+            return None
+        trace = db.execute(
+            "SELECT * FROM recall_traces WHERE store_key=? ORDER BY created_at DESC LIMIT 1",
+            (store_key,),
+        ).fetchone()
+        if trace is None:
+            return None
+        item_rows = db.execute(
+            "SELECT * FROM recall_trace_items WHERE recall_id=? ORDER BY ordinal",
+            (str(trace["recall_id"]),),
+        ).fetchall()
+
+    items = _resolve_recall_items(root, tenant, list(item_rows), blob_dir)
+    return LiveRecall(
+        recall_id=str(trace["recall_id"]),
+        query=str(trace["query"]),
+        mode=str(trace["mode"]) if trace["mode"] is not None else "explicit",
+        created_at=str(trace["created_at"]),
+        requested_budget=(
+            int(trace["requested_budget"]) if trace["requested_budget"] is not None else None
+        ),
+        used_budget=int(trace["used_budget"]) if trace["used_budget"] is not None else None,
+        items=items,
+    )
+
+
+def load_latest_pass(root: Path, tenant: str) -> Pass | None:
+    """Return the most recent distillation pass (by started_at, rowid), fully loaded."""
+    with open_store(root, tenant) as db:
+        row = db.execute(
+            "SELECT * FROM distillation_passes ORDER BY started_at DESC, rowid DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            return None
+        return _load_pass(db, row)
+
+
+def load_live_state(root: Path, tenant: str) -> LiveState:
+    """Bundle current summary, latest pass, and last recall for the live view."""
+    summary = load_summary(root, tenant)
+    latest_pass = load_latest_pass(root, tenant)
+    last_recall = load_last_recall(root, tenant)
+    return LiveState(summary=summary, latest_pass=latest_pass, last_recall=last_recall)

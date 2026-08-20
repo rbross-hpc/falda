@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from rich.console import Group
@@ -7,7 +7,7 @@ from rich.table import Table
 from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, VerticalScroll
-from textual.screen import ModalScreen
+from textual.screen import ModalScreen, Screen
 from textual.widgets import (
     Collapsible,
     DataTable,
@@ -19,9 +19,16 @@ from textual.widgets import (
     Select,
     Static,
 )
+from textual.worker import Worker
 
-from .models import AtomView, Pass, SceneEffect, SceneMembership, StoreSummary
-from .store import StoreError, load_passes, load_summary, reconstruct_scene_membership
+from .models import AtomView, LiveState, Pass, SceneEffect, SceneMembership, StoreSummary
+from .store import (
+    StoreError,
+    load_live_state,
+    load_passes,
+    load_summary,
+    reconstruct_scene_membership,
+)
 
 
 class SceneZoom(ModalScreen[None]):
@@ -47,6 +54,318 @@ class SceneZoom(ModalScreen[None]):
         self.dismiss()
 
 
+# ─── change-signature helpers ────────────────────────────────────────────────
+
+def _pass_sig(p: Pass | None) -> tuple[object, ...]:
+    if p is None:
+        return ()
+    return (p.pass_id, p.status, p.candidate_count, p.core.new_input_hash if p.core else None)
+
+
+def _summary_sig(s: StoreSummary) -> tuple[object, ...]:
+    return (
+        s.atoms.get("active"),
+        s.atoms.get("superseded"),
+        s.atoms.get("merged"),
+        s.scenes.get("episode_active"),
+        s.scenes.get("topic_active"),
+        s.core_chars,
+        s.dirty_reason,
+        s.stream_head_seq,
+    )
+
+
+_FLASH_DURATION = 0.8  # seconds
+
+
+class LiveScreen(Screen[None]):
+    CSS = """
+    LiveScreen { overflow-y: auto; }
+    #live-header {
+        height: 3; padding: 0 1; border-bottom: solid $accent;
+        background: $surface-darken-1;
+    }
+    #live-summary { padding: 0 1; margin: 1 0; border-bottom: dashed $accent; }
+    #live-pass-heading { padding: 0 1; color: $text-muted; }
+    #live-pass-detail { padding: 0 1; }
+    #live-recall-heading { padding: 0 1; color: $text-muted; }
+    #live-recall-detail { padding: 0 1; }
+    .flash { background: $warning 30%; }
+    .running-label { color: $warning; }
+    .failed-label { color: $error; }
+    """
+    BINDINGS = [
+        ("p", "toggle_pause", "Pause/resume"),
+        ("r", "force_poll", "Force refresh"),
+        ("l", "back", "Back to history"),
+        ("escape", "back", "Back to history"),
+        ("q", "quit", "Quit"),
+    ]
+
+    POLL_INTERVAL = 2.0
+
+    def __init__(self, root: Path, tenant: str) -> None:
+        super().__init__()
+        self.root = root
+        self.tenant = tenant
+        self.paused = False
+        self._state: LiveState | None = None
+        self._prev_pass_sig: tuple[object, ...] = ()
+        self._prev_summary_sig: tuple[object, ...] = ()
+        self._prev_recall_id: str | None = None
+        self._first_poll = True
+
+    def compose(self) -> ComposeResult:
+        yield Static(id="live-header")
+        with VerticalScroll():
+            yield Static(id="live-summary")
+            yield Static(id="live-pass-heading")
+            yield Static(id="live-pass-detail")
+            yield Static(id="live-recall-heading")
+            yield Static(id="live-recall-detail")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._trigger_poll()
+        self.set_interval(self.POLL_INTERVAL, self._trigger_poll)
+        self._refresh_header()
+
+    def _refresh_header(self) -> None:
+        now = datetime.now(UTC).strftime("%H:%M:%S")
+        state = "PAUSED" if self.paused else "LIVE"
+        self.query_one("#live-header", Static).update(
+            Text.from_markup(
+                f"[bold]{state}[/bold]  {self.tenant}:self  "
+                f"last updated {now}  poll every {self.POLL_INTERVAL:.0f}s  "
+                f"[dim]p=pause  r=refresh  l/esc=history[/dim]"
+            )
+        )
+
+    def action_toggle_pause(self) -> None:
+        self.paused = not self.paused
+        self._refresh_header()
+
+    def action_force_poll(self) -> None:
+        self._do_poll()
+
+    def action_back(self) -> None:
+        self.dismiss()
+
+    def _trigger_poll(self) -> None:
+        if self.paused:
+            return
+        self._do_poll()
+
+    def _do_poll(self) -> None:
+        """Load live state in a thread worker; result applied via on_worker_state_changed."""
+        root, tenant = self.root, self.tenant
+
+        def load() -> LiveState:
+            return load_live_state(root, tenant)
+
+        self.run_worker(load, thread=True, exclusive=True, name="live-poll")
+
+    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+        if event.worker.name != "live-poll":
+            return
+        from textual.worker import WorkerState
+
+        if event.state == WorkerState.SUCCESS:
+            result = event.worker.result
+            if isinstance(result, LiveState):
+                self._apply_state(result)
+        elif event.state == WorkerState.ERROR:
+            self.notify(f"Poll error: {event.worker.error}", severity="error")
+
+    def _apply_state(self, state: LiveState) -> None:
+        self._state = state
+        self._refresh_header()
+
+        new_summary_sig = _summary_sig(state.summary)
+        new_pass_sig = _pass_sig(state.latest_pass)
+        new_recall_id = state.last_recall.recall_id if state.last_recall else None
+
+        summary_changed = not self._first_poll and new_summary_sig != self._prev_summary_sig
+        pass_changed = not self._first_poll and new_pass_sig != self._prev_pass_sig
+        recall_changed = not self._first_poll and new_recall_id != self._prev_recall_id
+
+        self._prev_summary_sig = new_summary_sig
+        self._prev_pass_sig = new_pass_sig
+        self._prev_recall_id = new_recall_id
+        self._first_poll = False
+
+        summary_widget = self.query_one("#live-summary", Static)
+        summary_widget.update(_live_summary(state.summary, summary_changed))
+        if summary_changed:
+            self._flash(summary_widget)
+
+        pass_heading = self.query_one("#live-pass-heading", Static)
+        pass_detail = self.query_one("#live-pass-detail", Static)
+        pass_heading.update(_live_pass_heading(state.latest_pass, pass_changed))
+        pass_detail.update(_live_pass_detail(state.latest_pass))
+        if pass_changed:
+            self._flash(pass_heading)
+            self._flash(pass_detail)
+
+        recall_heading = self.query_one("#live-recall-heading", Static)
+        recall_detail = self.query_one("#live-recall-detail", Static)
+        recall_heading.update(_live_recall_heading(state.last_recall, recall_changed))
+        recall_detail.update(_live_recall_detail(state.last_recall))
+        if recall_changed:
+            self._flash(recall_heading)
+            self._flash(recall_detail)
+
+    def _flash(self, widget: Static) -> None:
+        widget.add_class("flash")
+        self.set_timer(_FLASH_DURATION, lambda: widget.remove_class("flash"))
+
+
+# ─── live renderers ──────────────────────────────────────────────────────────
+
+def _live_summary(summary: StoreSummary, changed: bool) -> Text:
+    delta = " [bold yellow]Δ[/bold yellow]" if changed else ""
+    dirty = (
+        f"\n[bold red]DIRTY since {escape(summary.dirty_marked_at or '')}: "
+        f"{escape(summary.dirty_reason or '')}[/bold red]"
+        if summary.dirty_reason
+        else ""
+    )
+    core = f"present ({summary.core_chars} chars)" if summary.core_present else "absent"
+    return Text.from_markup(
+        f"[bold]{escape(summary.label)}[/bold]{delta}  stream: {summary.stream_total} turns "
+        f"(head seq={summary.stream_head_seq})\n"
+        f"atoms: active={summary.atoms.get('active', 0)} "
+        f"superseded={summary.atoms.get('superseded', 0)} "
+        f"merged={summary.atoms.get('merged', 0)} "
+        f"archived={summary.atoms.get('archived', 0)}\n"
+        f"scenes: episodes={summary.scenes.get('episode_active', 0)}/"
+        f"{summary.scenes.get('episode_retired', 0)} "
+        f"topics={summary.scenes.get('topic_active', 0)}/"
+        f"{summary.scenes.get('topic_retired', 0)}  "
+        f"core: {escape(core)}{dirty}"
+    )
+
+
+def _live_pass_heading(p: Pass | None, changed: bool) -> Text:
+    delta = " [bold yellow]Δ[/bold yellow]" if changed else ""
+    if p is None:
+        return Text.from_markup(f"[bold]Last distillation[/bold]{delta}  —  no passes yet")
+    if p.status == "running":
+        status_markup = "[bold yellow]RUNNING[/bold yellow]"
+    elif p.status == "failed":
+        status_markup = "[bold red]FAILED[/bold red]"
+    else:
+        status_markup = "[green]done[/green]"
+    completed = f" → {p.completed_at[:19]}" if p.completed_at else ""
+    return Text.from_markup(
+        f"[bold]Last distillation[/bold]{delta}  {escape(p.pass_id)}  "
+        f"{status_markup}  {p.started_at[:19]}{escape(completed)}"
+    )
+
+
+def _live_pass_detail(p: Pass | None) -> Group:
+    if p is None:
+        return Group()
+    counts_text = "  ".join(
+        f"{action}={p.decision_counts.get(action, 0)}"
+        for action in ("store", "update", "merge", "skip")
+    )
+    from rich.console import RenderableType
+
+    lines: list[RenderableType] = [Text(f"candidates: {p.candidate_count or 0}  {counts_text}")]
+    if p.error:
+        lines.append(Text(f"error: {p.error}", style="bold red"))
+
+    t1_table = Table(title="T1 decisions", expand=True)
+    t1_table.add_column("Action", width=8)
+    t1_table.add_column("Content")
+    t1_table.add_column("Result atom")
+    t1_table.add_column("Rationale")
+    if p.decisions:
+        for d in p.decisions:
+            content = escape(d.candidate_content or "—")
+            result = escape(d.atom_id or "—")
+            t1_table.add_row(d.action, content, result, escape(d.rationale or "—"))
+    else:
+        t1_table.add_row("—", "No decision rows", "—", "—")
+    lines.append(t1_table)
+
+    if p.scenes:
+        t2_table = Table(title="T2 scene effects", expand=True)
+        t2_table.add_column("Kind", width=8)
+        t2_table.add_column("Effect", width=10)
+        t2_table.add_column("Title")
+        t2_table.add_column("Members")
+        t2_table.add_column("Delta")
+        for s in p.scenes:
+            t2_table.add_row(
+                s.scene_kind,
+                s.effect,
+                escape(s.title or "—"),
+                f"{s.members_before} → {s.members_after}",
+                f"+{len(s.added)} / -{len(s.removed)}",
+            )
+        lines.append(t2_table)
+
+    if p.core:
+        core_text = (
+            f"T3 core: {p.core.effect}  "
+            f"{p.core.old_chars or 0} → {p.core.new_chars or 0} chars"
+        )
+        lines.append(Text(core_text))
+
+    return Group(*lines)
+
+
+def _live_recall_heading(recall: object, changed: bool) -> Text:
+    from .models import LiveRecall as _LR
+
+    delta = " [bold yellow]Δ[/bold yellow]" if changed else ""
+    if recall is None or not isinstance(recall, _LR):
+        return Text.from_markup(f"[bold]Last recall[/bold]{delta}  —  no telemetry available")
+    r: _LR = recall
+    budget = (
+        f"budget {r.used_budget}/{r.requested_budget}"
+        if r.requested_budget is not None
+        else "budget unknown"
+    )
+    return Text.from_markup(
+        f"[bold]Last recall[/bold]{delta}  {escape(r.created_at[:19])}  "
+        f"mode={escape(r.mode)}  {budget}  {len(r.items)} items\n"
+        f"[italic]{escape(r.query[:120])}{'…' if len(r.query) > 120 else ''}[/italic]"
+    )
+
+
+def _live_recall_detail(recall: object) -> Group:
+    from .models import LiveRecall as _LR
+
+    if recall is None or not isinstance(recall, _LR):
+        return Group()
+    r: _LR = recall
+    table = Table(title="Recall items", expand=True)
+    table.add_column("Ord", width=4)
+    table.add_column("Tier", width=4)
+    table.add_column("Source", width=8)
+    table.add_column("Score", width=6)
+    table.add_column("Chars", width=6)
+    table.add_column("Usage", width=8)
+    table.add_column("Content")
+    for item in r.items:
+        score_str = f"{item.score:.3f}" if item.score is not None else "—"
+        chars_str = str(item.chars) if item.chars is not None else "—"
+        content_str = escape(item.content or f"({item.item_id})")
+        table.add_row(
+            str(item.ordinal),
+            item.tier,
+            item.source,
+            score_str,
+            chars_str,
+            item.usage,
+            content_str,
+        )
+    return Group(table)
+
+
 class HistoryApp(App[None]):
     CSS = """
     #store-summary { height: 6; padding: 0 1; border-bottom: solid $accent; }
@@ -64,6 +383,7 @@ class HistoryApp(App[None]):
     BINDINGS = [
         ("q", "quit", "Quit"),
         ("r", "refresh", "Refresh"),
+        ("l", "live", "Live view"),
         ("home", "first_pass", "First pass"),
         ("end", "last_pass", "Last pass"),
     ]
@@ -170,6 +490,9 @@ class HistoryApp(App[None]):
         )
         self.query_one("#history-range", Select).value = "all"
         self._set_visible(self.all_passes)
+
+    def action_live(self) -> None:
+        self.push_screen(LiveScreen(self.root, self.tenant))
 
     def _set_visible(self, passes: list[Pass]) -> None:
         self.visible_passes = passes

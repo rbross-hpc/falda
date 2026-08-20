@@ -7,6 +7,9 @@ import pytest
 
 from falda_analysis.store import (
     StoreError,
+    load_last_recall,
+    load_latest_pass,
+    load_live_state,
     load_passes,
     load_summary,
     open_store,
@@ -262,3 +265,82 @@ def test_topic_scene_membership_reconstructs(falda_root: Path) -> None:
     after_ids = [atom.atom_id for atom in membership.after]
     assert before_ids == after_ids
     assert "a1" in before_ids
+
+
+def test_load_latest_pass_returns_newest(falda_root: Path) -> None:
+    p = load_latest_pass(falda_root, "acme")
+    assert p is not None
+    assert p.pass_id == "pass-3"
+    assert p.status == "done"
+    assert len(p.decisions) == 1
+
+
+def test_load_latest_pass_empty_store(falda_root: Path) -> None:
+    db_path, _ = store_paths(falda_root, "acme")
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute("DELETE FROM distillation_passes")
+        db.commit()
+    finally:
+        db.close()
+    assert load_latest_pass(falda_root, "acme") is None
+
+
+def test_load_last_recall_returns_most_recent(falda_root: Path) -> None:
+    recall = load_last_recall(falda_root, "acme")
+    assert recall is not None
+    assert recall.recall_id == "recall-1"
+    assert recall.query == "what do we know about the project?"
+    assert recall.mode == "explicit"
+    assert len(recall.items) == 3
+
+
+def test_load_last_recall_resolves_t1_content(falda_root: Path) -> None:
+    recall = load_last_recall(falda_root, "acme")
+    assert recall is not None
+    t1 = next(item for item in recall.items if item.tier == "T1")
+    assert t1.item_id == "a2"
+    assert t1.content is not None
+    assert "third fact" in t1.content
+
+
+def test_load_last_recall_resolves_t2_content(falda_root: Path) -> None:
+    recall = load_last_recall(falda_root, "acme")
+    assert recall is not None
+    t2 = next(item for item in recall.items if item.tier == "T2")
+    assert t2.item_id == "episode-1"
+    assert t2.content is not None
+    assert "First Episode" in t2.content
+
+
+def test_load_last_recall_resolves_t3_content(falda_root: Path) -> None:
+    recall = load_last_recall(falda_root, "acme")
+    assert recall is not None
+    t3 = next(item for item in recall.items if item.tier == "T3")
+    assert t3.item_id == "core"
+    assert t3.content is not None
+    assert "Core" in t3.content
+
+
+def test_load_last_recall_absent_db(falda_root: Path) -> None:
+    (falda_root / "recall_traces.db").unlink()
+    assert load_last_recall(falda_root, "acme") is None
+
+
+def test_load_last_recall_no_traces_for_tenant(falda_root: Path) -> None:
+    db = sqlite3.connect(falda_root / "recall_traces.db")
+    try:
+        db.execute("DELETE FROM recall_traces")
+        db.commit()
+    finally:
+        db.close()
+    assert load_last_recall(falda_root, "acme") is None
+
+
+def test_load_live_state_bundles_all_three(falda_root: Path) -> None:
+    state = load_live_state(falda_root, "acme")
+    assert state.summary.label == "acme:self"
+    assert state.latest_pass is not None
+    assert state.latest_pass.pass_id == "pass-3"
+    assert state.last_recall is not None
+    assert state.last_recall.recall_id == "recall-1"
