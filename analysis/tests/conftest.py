@@ -4,6 +4,10 @@ from pathlib import Path
 import pytest
 
 
+def pytest_configure(config: pytest.Config) -> None:
+    config.option.asyncio_mode = "auto"
+
+
 def _seed_recall_traces(tmp_path: Path) -> None:
     """Create recall_traces.db at the Falda root with one trace for acme:self."""
     db = sqlite3.connect(tmp_path / "recall_traces.db")
