@@ -21,7 +21,7 @@ from textual.widgets import (
 )
 
 from .models import AtomView, Pass, SceneEffect, SceneMembership, StoreSummary
-from .store import load_passes, load_summary, reconstruct_scene_membership
+from .store import StoreError, load_passes, load_summary, reconstruct_scene_membership
 
 
 class SceneZoom(ModalScreen[None]):
@@ -63,6 +63,7 @@ class HistoryApp(App[None]):
     """
     BINDINGS = [
         ("q", "quit", "Quit"),
+        ("r", "refresh", "Refresh"),
         ("home", "first_pass", "First pass"),
         ("end", "last_pass", "Last pass"),
     ]
@@ -157,6 +158,19 @@ class HistoryApp(App[None]):
         if self.visible_passes:
             timeline.index = len(self.visible_passes) - 1
 
+    def action_refresh(self) -> None:
+        try:
+            self.summary = load_summary(self.root, self.tenant)
+            self.all_passes = load_passes(self.root, self.tenant)
+        except StoreError as exc:
+            self.notify(str(exc), severity="error")
+            return
+        self.query_one("#store-summary", Static).update(
+            _summary(self.summary, len(self.all_passes))
+        )
+        self.query_one("#history-range", Select).value = "all"
+        self._set_visible(self.all_passes)
+
     def _set_visible(self, passes: list[Pass]) -> None:
         self.visible_passes = passes
         timeline = self.query_one("#timeline", ListView)
@@ -166,10 +180,16 @@ class HistoryApp(App[None]):
             self._clear_detail()
             return
         for item in passes:
-            status = "FAILED" if item.status == "failed" else item.status.upper()
+            if item.status == "failed":
+                status = "FAILED"
+            elif item.status == "running":
+                status = "RUNNING"
+            else:
+                status = ""
             reconciliation = "  RECONCILE?" if item.likely_reconciliation else ""
             gaps = f"  {len(item.gaps)} GAPS" if item.gaps else ""
-            label = f"{item.started_at[:19]}  {status}{reconciliation}{gaps}\n{item.pass_id}"
+            status_part = f"  {status}" if status else ""
+            label = f"{item.started_at[:19]}{status_part}{reconciliation}{gaps}"
             timeline.append(
                 ListItem(
                     Label(

@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
-from textual.widgets import Collapsible, DataTable, ListView, Select, Static
+from textual.widgets import Collapsible, DataTable, Label, ListView, Select, Static
 
 from falda_analysis.app import HistoryApp, SceneZoom
 from falda_analysis.store import store_paths
@@ -176,3 +176,98 @@ async def test_empty_scene_table_rows_are_inert(falda_root: Path) -> None:
         await pilot.press("enter")
         await pilot.pause()
         assert not isinstance(app.screen, SceneZoom)
+
+
+def _get_timeline_label(app: HistoryApp, index: int) -> str:
+    timeline = app.query_one("#timeline", ListView)
+    item = timeline.children[index]
+    label = item.query_one(Label)
+    return str(label.render())
+
+
+async def test_done_pass_label_has_no_status_word_or_pass_id(falda_root: Path) -> None:
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        label = _get_timeline_label(app, 0)
+        assert "2025-01-01T00:00:00" in label
+        assert "DONE" not in label
+        assert "pass-1" not in label
+
+
+async def test_failed_pass_label_shows_failed(falda_root: Path) -> None:
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        label = _get_timeline_label(app, 1)
+        assert "2025-01-02T00:00:00" in label
+        assert "FAILED" in label
+        assert "pass-2" not in label
+
+
+async def test_running_pass_label_shows_running(falda_root: Path) -> None:
+    db_path, _ = store_paths(falda_root, "acme")
+    db = sqlite3.connect(db_path)
+    try:
+        db.execute(
+            "INSERT INTO distillation_passes VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "pass-running",
+                "acme:self",
+                3,
+                None,
+                "2025-01-04T00:00:00Z",
+                None,
+                "running",
+                None,
+                None,
+                None,
+                "model",
+                "v1",
+                "0.1.0",
+            ),
+        )
+        db.commit()
+    finally:
+        db.close()
+
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        await pilot.pause()
+        timeline = app.query_one("#timeline", ListView)
+        last_index = len(timeline.children) - 1
+        label = _get_timeline_label(app, last_index)
+        assert "RUNNING" in label
+        assert "DONE" not in label
+        assert "pass-running" not in label
+
+
+async def test_refresh_reloads_and_resets_to_all_first_pass(falda_root: Path) -> None:
+    app = HistoryApp(falda_root, "acme")
+    async with app.run_test() as pilot:
+        selector = app.query_one("#history-range", Select)
+        selector.value = "day"
+        await pilot.pause()
+        timeline = app.query_one("#timeline", ListView)
+        assert "No passes in this range" in str(timeline.children[0].query_one(Static).render())
+
+        db_path, _ = store_paths(falda_root, "acme")
+        db = sqlite3.connect(db_path)
+        try:
+            db.execute(
+                "UPDATE distillation_passes SET started_at=? WHERE pass_id=?",
+                ("2025-01-01T00:00:00Z", "pass-1"),
+            )
+            db.commit()
+        finally:
+            db.close()
+
+        await pilot.press("r")
+        await pilot.pause()
+
+        assert selector.value == "all"
+        timeline2 = app.query_one("#timeline", ListView)
+        assert timeline2.index == 0
+        assert app.selected_pass is not None
+        assert app.selected_pass.pass_id == "pass-1"
+        assert len(app.all_passes) == 3
