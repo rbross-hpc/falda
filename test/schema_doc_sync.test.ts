@@ -400,7 +400,8 @@ test("docs/schema/tables.sql matches falda.db's runtime schema", () => {
   // distill_watermark/core_state are initialized against the store's db
   // connection by the distill package (src/distill/core.ts), not by the
   // Falda constructor itself — replicate that here so this test covers the
-  // full falda.db schema, not just the tables Falda.initSchema creates.
+  // full falda.db schema, not just the tables initSchema() (src/store/
+  // schema.ts, invoked from Falda's constructor) creates.
   initWatermarkSchema(db);
   initCoreStateSchema(db);
   const live = stripFtsVecShadowTables(liveSchema(db));
