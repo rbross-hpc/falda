@@ -353,6 +353,14 @@ the fixtures reproduce the original bug by reverting the fix locally and
 observing `no such column: seq` thrown at construction. `npm run build`
 clean; `npm test` 364/364 (359 baseline + 5 new).
 
+*Update:* `initSchema()`/`createIndexes()` and `migrate()`/
+`assertNoDuplicateTurnKeys()`/`LegacyMigrationError` were later extracted
+out of `Falda` into `src/store/schema.ts` and `src/store/migrations.ts`
+respectively (behavior-preserving refactor; `Falda`'s constructor still
+calls them in the same order, inside the same single init transaction).
+References to `src/falda.ts:*` line numbers above describe the code as it
+existed at the time this finding landed, not its current location.
+
 **7. `falda smoke` invokes a nonexistent npm script. — ✅ addressed**
 Both `bin/falda smoke` (`bin/falda:117-119`) and `install.sh`
 (`install.sh:88-95`) run `npm run smoke`, but `package.json` defines no

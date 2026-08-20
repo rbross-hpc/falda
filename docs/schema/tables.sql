@@ -18,7 +18,8 @@
 
 -- ============================================================================
 -- DB 1 of 3: falda.db — one per (tenant, self) store or named pool (§2)
--- Created by: src/falda.ts (Falda.initSchema / Falda.migrate)
+-- Created by: src/store/schema.ts (initSchema/createIndexes), src/store/migrations.ts
+-- (migrate), invoked from Falda's constructor (src/falda.ts)
 -- ============================================================================
 
 -- T0 — Stream (docs/MODEL.md §4)

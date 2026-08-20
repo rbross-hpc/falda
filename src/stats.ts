@@ -16,8 +16,9 @@
  *     operator's current env doesn't match a store's locked embedder.
  *   - No embedder is invoked at all: every store is opened as a plain
  *     read-only `better-sqlite3` connection and inspected with hand-rolled
- *     COUNT/GROUP BY SQL against the tables `Falda`'s initSchema() creates
- *     (src/falda.ts). This works even against a `vec0` virtual-table schema
+ *     COUNT/GROUP BY SQL against the tables initSchema() creates
+ *     (src/store/schema.ts, invoked from Falda's constructor). This works
+ *     even against a `vec0` virtual-table schema
  *     without loading the sqlite-vec extension, because we only ever touch
  *     the plain tables (stream/atoms/scenes), never the `_vec`/`_fts` ones.
  *
