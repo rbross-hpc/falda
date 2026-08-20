@@ -180,21 +180,23 @@ describe("finding 16: malformed extraction → retryable failure, watermark unch
     const root = makeTempRoot();
     try {
       const fenced = "```json\n" + VALID_CANDIDATE + "\n```";
-      // Supply enough responses for L2/L3 (scene title, summary, core) so
-      // the pass can run all the way through without stub-LLM exhaustion.
-      const err = await runDistillOnce(root, makeLlm(
+      // Provide the full response tail for one stored atom: extraction,
+      // consolidation, episode title, episode summary, topic title, topic
+      // summary, core — matching distill_consolidation_batch.test.ts's TAIL.
+      const { store } = await runDistillOnce(root, makeLlm(
         fenced, VALID_CONSOLIDATION,
-        "Sensor Nominal",           // scene title
-        "The sensor was nominal.",  // scene summary
-        "# Proj\nNominal.",         // core
-      )).then(() => null, (e: Error) => e);
-      // Extraction and consolidation must not have been the source of failure.
-      if (err) {
-        assert.ok(
-          !/malformed|extraction|consolidation/i.test(err.message),
-          `fenced JSON must not fail extraction/consolidation; got: ${err.message}`,
-        );
-      }
+        "Sensor Nominal",          // episode title
+        "The sensor was nominal.", // episode summary
+        "Sensor Topic",            // topic title
+        "Nominal sensor topic.",   // topic summary
+        "# Proj\nNominal.",        // core
+      ));
+      const db = (store as any).db as Database.Database;
+      const atomCount = (db.prepare("SELECT COUNT(*) c FROM atoms WHERE status='active'").get() as any).c as number;
+      assert.equal(atomCount, 1, "fenced extraction must produce exactly one stored atom");
+      initWatermarkSchema(db);
+      const wm = getWatermark(db, "proj:self");
+      assert.ok(wm !== null, "watermark must advance on successful fenced extraction");
     } finally { cleanup(root); }
   });
 
@@ -204,18 +206,19 @@ describe("finding 16: malformed extraction → retryable failure, watermark unch
       const arr = JSON.stringify([
         { type: "fact", content: "The sensor reads nominal.", confidence: "high" },
       ]);
-      const err = await runDistillOnce(root, makeLlm(
+      const { store } = await runDistillOnce(root, makeLlm(
         arr, VALID_CONSOLIDATION,
         "Sensor Nominal",
         "The sensor was nominal.",
+        "Sensor Topic",
+        "Nominal sensor topic.",
         "# Proj\nNominal.",
-      )).then(() => null, (e: Error) => e);
-      if (err) {
-        assert.ok(
-          !/malformed|extraction|consolidation/i.test(err.message),
-          `JSON array must not fail extraction/consolidation; got: ${err.message}`,
-        );
-      }
+      ));
+      const db = (store as any).db as Database.Database;
+      const atomCount = (db.prepare("SELECT COUNT(*) c FROM atoms WHERE status='active'").get() as any).c as number;
+      assert.equal(atomCount, 1, "JSON array extraction must produce exactly one stored atom");
+      initWatermarkSchema(db);
+      assert.ok(getWatermark(db, "proj:self") !== null, "watermark must advance on successful array extraction");
     } finally { cleanup(root); }
   });
 });
