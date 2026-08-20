@@ -2,7 +2,14 @@
   "extends": "./tsconfig.json",
   "compilerOptions": {
     "noEmit": true,
-    "rootDir": "."
+    "rootDir": ".",
+    // tsconfig.json enables noUnusedLocals/noUnusedParameters for the
+    // production build (npm run build enforces it against src/**). Test
+    // files carry a number of pre-existing unused locals/params unrelated
+    // to that enforcement; relaxing both here only for the test-inclusive
+    // typecheck avoids an unrelated mass edit across test/**.
+    "noUnusedLocals": false,
+    "noUnusedParameters": false
   },
   "include": [
     "src/**/*.ts",

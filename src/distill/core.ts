@@ -679,7 +679,7 @@ export async function distillOnce(
   try {
     return await distillOncePass(store, llm, db, {
       storeKey, candidateLimit, topicSimilarityThreshold, sceneMatchThreshold, sceneReorgThreshold,
-      verbose, log, turns, afterSeq, lastTurn, pid, result, sceneEffects,
+      log, turns, afterSeq, lastTurn, pid, result, sceneEffects,
     });
   } catch (e) {
     try {
@@ -708,14 +708,14 @@ async function distillOncePass(
   ctx: {
     storeKey: string; candidateLimit: number;
     topicSimilarityThreshold: number; sceneMatchThreshold: number; sceneReorgThreshold: number;
-    verbose: boolean; log: (...args: any[]) => void;
+    log: (...args: any[]) => void;
     turns: StreamTurn[]; afterSeq: number | null; lastTurn: StreamTurn | null;
     pid: string; result: DistillResult; sceneEffects: Map<string, SceneEffectAccum>;
   },
 ): Promise<DistillResult> {
   const {
     storeKey, candidateLimit, topicSimilarityThreshold, sceneMatchThreshold, sceneReorgThreshold,
-    verbose, log, turns, lastTurn, pid, result, sceneEffects,
+    log, turns, lastTurn, pid, result, sceneEffects,
   } = ctx;
 
   // ── L1: Extract + Consolidate (one atomic transaction) ────────────────────

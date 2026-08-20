@@ -23,8 +23,6 @@ import type {
   PassSummary, SceneEffectView,
 } from "./types.js";
 
-const ALL_ACTIONS: DecisionAction[] = ["store", "update", "merge", "skip"];
-
 // Evidence truncation defaults (spec §Evidence mode). --verbose expands both.
 const DEFAULT_MAX_EVIDENCE_TURNS = 10;
 const DEFAULT_MAX_EVIDENCE_CHARS = 1000;
@@ -436,5 +434,3 @@ function buildRandomDecisionReport(sel: InspectSelector, warnThresholds?: Inspec
     closeAll(open);
   }
 }
-
-export { ALL_ACTIONS };

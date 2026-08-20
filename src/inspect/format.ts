@@ -89,7 +89,7 @@ function renderCore(c: CoreEffectView | null): string[] {
   return lines;
 }
 
-function renderPass(p: PassDetail, report: InspectReport, verbose: boolean): string[] {
+function renderPass(p: PassDetail, verbose: boolean): string[] {
   const lines: string[] = [];
   lines.push(`Pass ${p.pass_id}`);
   lines.push(`${p.started_at}${p.completed_at ? ` → ${p.completed_at}` : ""}  [${p.status}]`);
@@ -145,7 +145,7 @@ export function renderHuman(report: InspectReport, verbose = false): string {
   }
   for (let i = 0; i < report.passes.length; i++) {
     if (i > 0) lines.push("", "═".repeat(60), "");
-    lines.push(...renderPass(report.passes[i], report, verbose));
+    lines.push(...renderPass(report.passes[i], verbose));
   }
   return lines.join("\n");
 }

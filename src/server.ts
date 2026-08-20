@@ -42,7 +42,6 @@
  */
 import { createServer } from "node:http";
 import { PoolError } from "./pools.js";
-import { AuthError, parseBearer } from "./mcp_auth.js";
 import { handleRequest } from "./gateway.js";
 import { handleFaldaMcpRequest } from "./mcp.js";
 import { startDistiller, resolveWorkerIntervals, type DistillerHandle } from "./distill/worker.js";

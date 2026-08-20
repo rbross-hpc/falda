@@ -139,9 +139,6 @@ export interface Scene {
 
 export interface SceneHit extends Scene { score: number; }
 
-/** @deprecated path-addressed API removed in Branch A. Use id-addressed scene methods. */
-export interface SceneEntry { path: string; created_at: string; updated_at: string; }
-
 export interface AddStreamResult {
   ids: string[];
   affected_atom_ids?: string[];
@@ -502,13 +499,6 @@ export class Falda {
   }
 
   private tableExists(name: string): boolean {
-    const row = this.db.prepare(
-      "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?"
-    ).get(name);
-    return !!row;
-  }
-
-  private vtableExists(name: string): boolean {
     const row = this.db.prepare(
       "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?"
     ).get(name);
