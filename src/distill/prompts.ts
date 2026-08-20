@@ -4,10 +4,8 @@
  */
 
 export const VALID_TYPES = ["fact", "pattern", "preference", "constraint", "instruction"] as const;
-export type DistillType = typeof VALID_TYPES[number];
 
 export const VALID_CONFIDENCE = ["high", "medium", "low"] as const;
-export type DistillConfidence = typeof VALID_CONFIDENCE[number];
 
 /**
  * Hand-maintained identifier for the current extraction/consolidation/scene/

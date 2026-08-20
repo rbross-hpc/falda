@@ -12,7 +12,6 @@ import {
   makeLocalEmbedder,
   makeOnnxEmbedder,
   resolveOnnxModel,
-  type EmbedderConfig,
 } from "./embedder.js";
 import type { Embedder } from "./falda.js";
 import { validateRegistry, PoolError } from "./pools.js";
