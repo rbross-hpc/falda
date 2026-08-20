@@ -263,7 +263,7 @@ describe("cc plugin: auto-recall", () => {
     ]) {
       const r = await runHook("auto-recall",
         { session_id: `sess-never2-${Math.random()}`, prompt_id: "x", prompt: "q" }, bad);
-      assert.equal(r.code, 0, `must exit 0 with env ${JSON.stringify(bad.FALDA_MCP_URL)}`);
+      assert.equal(r.code, 0, `must exit 0 with env ${JSON.stringify(bad)}`);
     }
   });
 });

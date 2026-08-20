@@ -330,7 +330,7 @@ describe("distillOnce", () => {
       ]);
       await distillOnce(s, llmFactory(), { storeKey: "replay-test:self" });
       const db = (s as any).db as Database.Database;
-      const rows1 = db.prepare("SELECT * FROM consolidation_decisions").all();
+      const rows1 = db.prepare("SELECT * FROM consolidation_decisions").all() as Array<{ pass_id: string }>;
 
       // Note: second pass would be a no-op due to watermark; so just check rows exist.
       assert.ok(rows1.length > 0, "decisions recorded");

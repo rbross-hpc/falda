@@ -54,7 +54,7 @@ describe("HTTP body-size cap", () => {
         body: JSON.stringify({ content: "small atom" }),
       });
       assert.equal(resp.status, 200);
-      const json = await resp.json();
+      const json = await resp.json() as { id?: string };
       assert.ok(json.id);
     });
   });
@@ -71,7 +71,7 @@ describe("HTTP body-size cap", () => {
         body: oversized,
       });
       assert.equal(resp.status, 413);
-      const json = await resp.json();
+      const json = await resp.json() as { error: string; limit: number };
       assert.match(json.error, /too large/);
       assert.equal(json.limit, 16);
     });

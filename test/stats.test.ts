@@ -201,7 +201,7 @@ describe("stats: recall metrics", () => {
           recency_half_life_days: 30,
           version: "v1",
         },
-        items: [{ tier: "T1", id: "a1", kind: "atom", source: "fts", score: 1, chars: 100 }],
+        items: [{ tier: "T1", id: "a1", kind: "atom", source: "ranked", score: 1, chars: 100 }],
       });
       db.close();
 

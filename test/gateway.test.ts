@@ -140,7 +140,7 @@ test("6. /healthz needs no auth", async () => {
   try {
     const res = await fetch(`http://127.0.0.1:${port}/healthz`);
     assert.equal(res.status, 200, "GET /healthz returns 200 with no Authorization header");
-    const body = await res.json();
+    const body = await res.json() as { ok: boolean };
     assert.equal(body.ok, true, "/healthz body reports ok");
   } finally {
     server.close();
