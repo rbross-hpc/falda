@@ -26,7 +26,7 @@ Run this full loop before committing any change to `analysis/`:
 ```bash
 uv run --project analysis ruff format --check analysis   # formatting
 uv run --project analysis ruff check analysis/src analysis/tests  # lint
-uv run --project analysis mypy analysis/src              # type checking
+uv run --project analysis mypy analysis/src analysis/tests  # type checking
 uv run --project analysis pytest analysis/tests -q       # tests
 ```
 

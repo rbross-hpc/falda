@@ -12,7 +12,7 @@ from falda_analysis.app import (
     _membership_diff_rows,
     _narration_failure_count,
 )
-from falda_analysis.models import AtomView, Pass, SceneEffect, SceneMembership
+from falda_analysis.models import AtomView, Pass, PassStatus, SceneEffect, SceneMembership
 from falda_analysis.store import store_paths
 
 
@@ -873,7 +873,7 @@ def test_diff_regen_note_absent_when_not_set() -> None:
 # ─── _narration_failure_count tests ──────────────────────────────────────────
 
 
-def _make_pass(status: str, error: str | None) -> Pass:
+def _make_pass(status: PassStatus, error: str | None) -> Pass:
     from falda_analysis.models import Pass
 
     return Pass(
