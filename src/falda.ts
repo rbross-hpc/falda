@@ -23,6 +23,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { resolveLegacyAtomBudget } from "./recall/budgets.js";
 import { initDirtySchema, markDirty } from "./distill/watermark.js";
+import { initSchema, createIndexes } from "./store/schema.js";
+import { migrate } from "./store/migrations.js";
+export { LegacyMigrationError } from "./store/migrations.js";
 
 export type Embedder = (text: string) => Promise<number[]>;
 
@@ -168,15 +171,6 @@ export class AtomTypeError extends Error {
   constructor(msg: string) { super(msg); this.name = "AtomTypeError"; }
 }
 
-/** Thrown when a legacy store cannot be safely upgraded because it already
- *  violates an invariant a new unique index would enforce (e.g. duplicate
- *  (session_id, turn_index) rows created before that constraint existed).
- *  See docs/future/reliability-hardening.md finding 6 — we fail loudly
- *  rather than silently deduplicating historical data. */
-export class LegacyMigrationError extends Error {
-  constructor(msg: string) { super(msg); this.name = "LegacyMigrationError"; }
-}
-
 // ─── FTS sanitizer ─────────────────────────────────────────────────────────────
 
 function toFtsQuery(raw: string): string {
@@ -311,9 +305,9 @@ export class Falda {
     // a duplicate-key LegacyMigrationError from createIndexes()) leaves the
     // on-disk store exactly as it was, not half-migrated.
     this.db.transaction(() => {
-      this.initSchema();
-      this.migrate();
-      this.createIndexes();
+      initSchema(this.db, this.dim);
+      migrate(this.db);
+      createIndexes(this.db);
     }).immediate();
   }
 
@@ -491,313 +485,6 @@ export class Falda {
     this.db.prepare("INSERT INTO atoms_vec(id,embedding) VALUES(?,?)").run(input.id, this.vecBuf(embedding));
     const row = this.db.prepare("SELECT * FROM atoms WHERE id=?").get(input.id);
     return { atom: rowToAtom(row), inserted: true };
-  }
-
-  private hasColumn(table: string, column: string): boolean {
-    const rows = this.db.prepare(`PRAGMA table_info("${table}")`).all() as Array<{ name: string }>;
-    return rows.some((r) => r.name === column);
-  }
-
-  private tableExists(name: string): boolean {
-    const row = this.db.prepare(
-      "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?"
-    ).get(name);
-    return !!row;
-  }
-
-  /** Creates base tables and virtual tables only — no indexes. Indexes are
-   *  created later by createIndexes(), after migrate() has added any
-   *  missing columns, so that opening a genuinely old store never tries to
-   *  index a column that doesn't exist yet
-   *  (docs/future/reliability-hardening.md finding 6). */
-  private initSchema() {
-    const d = this.dim;
-    this.db.exec(`
-      CREATE TABLE IF NOT EXISTS stream (
-        id TEXT PRIMARY KEY,
-        session_id TEXT NOT NULL,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        ts TEXT NOT NULL,
-        turn_index INTEGER,
-        turn_id TEXT,
-        seq INTEGER
-      );
-      CREATE VIRTUAL TABLE IF NOT EXISTS stream_fts
-        USING fts5(content, id UNINDEXED, tokenize='porter unicode61');
-      CREATE VIRTUAL TABLE IF NOT EXISTS stream_vec
-        USING vec0(id TEXT PRIMARY KEY, embedding float[${d}]);
-
-      CREATE TABLE IF NOT EXISTS atoms (
-        id TEXT PRIMARY KEY,
-        type TEXT NOT NULL CHECK(type IN ('fact','pattern','preference','constraint','instruction')),
-        content TEXT NOT NULL,
-        background TEXT,
-        priority INTEGER NOT NULL DEFAULT 100,
-        confidence TEXT NOT NULL DEFAULT 'medium' CHECK(confidence IN ('high','medium','low')),
-        pinned INTEGER NOT NULL DEFAULT 0,
-        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','superseded','merged','archived')),
-        tags TEXT NOT NULL DEFAULT '[]',
-        supersedes TEXT,
-        source_turn_ids TEXT NOT NULL DEFAULT '[]',
-        source_session_ids TEXT NOT NULL DEFAULT '[]',
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE VIRTUAL TABLE IF NOT EXISTS atoms_fts
-        USING fts5(content, id UNINDEXED, tokenize='porter unicode61');
-      CREATE VIRTUAL TABLE IF NOT EXISTS atoms_vec
-        USING vec0(id TEXT PRIMARY KEY, embedding float[${d}]);
-
-      CREATE TABLE IF NOT EXISTS atom_evidence (
-        atom_id TEXT NOT NULL REFERENCES atoms(id),
-        stream_id TEXT NOT NULL REFERENCES stream(id),
-        added_at TEXT NOT NULL,
-        PRIMARY KEY (atom_id, stream_id)
-      );
-
-      CREATE TABLE IF NOT EXISTS consolidation_decisions (
-        id TEXT PRIMARY KEY,
-        pass_id TEXT NOT NULL,
-        action TEXT NOT NULL,
-        atom_id TEXT,
-        target_ids TEXT,
-        rationale TEXT,
-        decided_at TEXT NOT NULL,
-        candidate_type TEXT,
-        candidate_content TEXT,
-        candidate_confidence TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS distillation_passes (
-        pass_id TEXT PRIMARY KEY,
-        store_key TEXT NOT NULL,
-        watermark_start INTEGER,
-        watermark_end INTEGER,
-        started_at TEXT NOT NULL,
-        completed_at TEXT,
-        status TEXT NOT NULL DEFAULT 'running' CHECK(status IN ('running','done','failed')),
-        input_turn_count INTEGER,
-        candidate_count INTEGER,
-        error TEXT,
-        model TEXT,
-        prompt_version TEXT,
-        distiller_version TEXT
-      );
-
-      CREATE TABLE IF NOT EXISTS pass_scene_effects (
-        pass_id TEXT NOT NULL,
-        scene_id TEXT NOT NULL,
-        scene_kind TEXT NOT NULL,
-        title TEXT,
-        effect TEXT NOT NULL CHECK(effect IN ('created','updated','retired','unchanged')),
-        members_before INTEGER NOT NULL DEFAULT 0,
-        members_after INTEGER NOT NULL DEFAULT 0,
-        added_json TEXT NOT NULL DEFAULT '[]',
-        removed_json TEXT NOT NULL DEFAULT '[]',
-        summary_regenerated INTEGER NOT NULL DEFAULT 0,
-        embedding_regenerated INTEGER NOT NULL DEFAULT 0,
-        PRIMARY KEY (pass_id, scene_id)
-      );
-
-      CREATE TABLE IF NOT EXISTS pass_core_effects (
-        pass_id TEXT PRIMARY KEY,
-        effect TEXT NOT NULL CHECK(effect IN ('unchanged','regenerated','deleted','failed')),
-        old_input_hash TEXT,
-        new_input_hash TEXT,
-        old_chars INTEGER,
-        new_chars INTEGER
-      );
-
-      CREATE TABLE IF NOT EXISTS scenes (
-        scene_id TEXT PRIMARY KEY,
-        scene_kind TEXT NOT NULL CHECK(scene_kind IN ('episode','topic')),
-        title TEXT NOT NULL,
-        atom_ids TEXT NOT NULL DEFAULT '[]',
-        summary TEXT,
-        content_hash TEXT,
-        render_hash TEXT,
-        status TEXT NOT NULL DEFAULT 'active' CHECK(status IN ('active','retired')),
-        derived_from TEXT,
-        superseded_by TEXT,
-        created_at TEXT NOT NULL,
-        updated_at TEXT NOT NULL
-      );
-      CREATE VIRTUAL TABLE IF NOT EXISTS scenes_fts
-        USING fts5(title, summary, scene_id UNINDEXED, tokenize='porter unicode61');
-      CREATE VIRTUAL TABLE IF NOT EXISTS scenes_vec
-        USING vec0(scene_id TEXT PRIMARY KEY, embedding float[${d}]);
-
-      CREATE TABLE IF NOT EXISTS scene_atoms (
-        scene_id TEXT NOT NULL REFERENCES scenes(scene_id),
-        atom_id TEXT NOT NULL REFERENCES atoms(id),
-        PRIMARY KEY (scene_id, atom_id)
-      );
-    `);
-  }
-
-  /** Additive migration: adds columns to pre-existing tables for stores that
-   *  were created before Branch A. Safe to call multiple times (idempotent). */
-  private migrate() {
-    const now = new Date().toISOString();
-
-    // stream: add turn_index, turn_id if missing (dependent unique indexes
-    // are created afterward by createIndexes(), once the columns exist).
-    if (this.tableExists("stream") && !this.hasColumn("stream", "turn_index")) {
-      this.db.exec("ALTER TABLE stream ADD COLUMN turn_index INTEGER");
-    }
-    if (this.tableExists("stream") && !this.hasColumn("stream", "turn_id")) {
-      this.db.exec("ALTER TABLE stream ADD COLUMN turn_id TEXT");
-    }
-    // stream: add monotonic seq column for cross-session distillation ordering.
-    // Backfill existing rows in rowid order (preserves original insertion order).
-    if (this.tableExists("stream") && !this.hasColumn("stream", "seq")) {
-      this.db.exec("ALTER TABLE stream ADD COLUMN seq INTEGER");
-      this.db.exec(`
-        WITH ranked AS (
-          SELECT id, ROW_NUMBER() OVER (ORDER BY rowid) AS rn FROM stream
-        )
-        UPDATE stream SET seq = (SELECT rn FROM ranked WHERE ranked.id = stream.id)
-      `);
-    }
-
-    // scenes: add render_hash column for embedding re-index gating (Branch 4).
-    if (this.tableExists("scenes") && !this.hasColumn("scenes", "render_hash")) {
-      this.db.exec("ALTER TABLE scenes ADD COLUMN render_hash TEXT");
-    }
-
-    // atoms: add new columns if missing, then backfill
-    const atomCols: Array<[string, string]> = [
-      ["priority", "INTEGER NOT NULL DEFAULT 100"],
-      ["confidence", "TEXT NOT NULL DEFAULT 'medium'"],
-      ["pinned", "INTEGER NOT NULL DEFAULT 0"],
-      ["status", "TEXT NOT NULL DEFAULT 'active'"],
-      ["tags", "TEXT NOT NULL DEFAULT '[]'"],
-      ["supersedes", "TEXT"],
-      ["source_turn_ids", "TEXT NOT NULL DEFAULT '[]'"],
-      ["source_session_ids", "TEXT NOT NULL DEFAULT '[]'"],
-    ];
-    if (this.tableExists("atoms")) {
-      for (const [col, def] of atomCols) {
-        if (!this.hasColumn("atoms", col)) {
-          this.db.exec(`ALTER TABLE atoms ADD COLUMN ${col} ${def}`);
-        }
-      }
-      // Backfill existing rows that were inserted before the new columns existed.
-      // Only rows that still have the old defaults need updating.
-      this.db.exec(`
-        UPDATE atoms SET
-          priority = COALESCE(priority, 100),
-          confidence = COALESCE(confidence, 'medium'),
-          pinned = COALESCE(pinned, 0),
-          status = COALESCE(status, 'active'),
-          tags = COALESCE(tags, '[]'),
-          source_turn_ids = COALESCE(source_turn_ids, '[]'),
-          source_session_ids = COALESCE(source_session_ids, '[]'),
-          updated_at = COALESCE(updated_at, '${now}')
-        WHERE priority IS NULL OR status IS NULL
-      `);
-    }
-
-    // consolidation_decisions: add candidate_* columns for stores created
-    // before candidate persistence (falda distill inspect). Nullable —
-    // pre-existing rows (especially historical skip decisions) cannot be
-    // backfilled; the candidate they described is already unrecoverable.
-    if (this.tableExists("consolidation_decisions")) {
-      for (const col of ["candidate_type", "candidate_content", "candidate_confidence"]) {
-        if (!this.hasColumn("consolidation_decisions", col)) {
-          this.db.exec(`ALTER TABLE consolidation_decisions ADD COLUMN ${col} TEXT`);
-        }
-      }
-    }
-
-    // One-time repair for stores that ran deleteStream() before it cleaned
-    // up stream_fts/stream_vec (docs/future/reliability-hardening.md
-    // finding 5): remove any index rows whose id has no matching primary
-    // stream row. Idempotent — a store where deleteStream always cleaned
-    // up properly has nothing to remove here.
-    if (this.tableExists("stream") && this.tableExists("stream_fts")) {
-      this.db.exec("DELETE FROM stream_fts WHERE id NOT IN (SELECT id FROM stream)");
-    }
-    if (this.tableExists("stream") && this.tableExists("stream_vec")) {
-      this.db.exec("DELETE FROM stream_vec WHERE id NOT IN (SELECT id FROM stream)");
-    }
-  }
-
-  /** Creates every ordinary (non-virtual) index. Runs after migrate() so
-   *  every column an index depends on is guaranteed to already exist —
-   *  including on a store that started out as a genuinely old schema
-   *  (docs/future/reliability-hardening.md finding 6). All ordinary
-   *  indexes live here, not just the ones currently known to depend on a
-   *  migrated column, so a future migration that adds a new indexed column
-   *  can't reintroduce this bug by mistake. Idempotent (IF NOT EXISTS). */
-  private createIndexes() {
-    this.assertNoDuplicateTurnKeys();
-
-    this.db.exec(`
-      CREATE INDEX IF NOT EXISTS idx_stream_seq ON stream(seq);
-      CREATE INDEX IF NOT EXISTS idx_stream_session ON stream(session_id);
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_stream_turn_index
-        ON stream(session_id, turn_index) WHERE turn_index IS NOT NULL;
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_stream_turn_id
-        ON stream(session_id, turn_id) WHERE turn_id IS NOT NULL;
-
-      CREATE INDEX IF NOT EXISTS idx_atoms_status ON atoms(status);
-      CREATE INDEX IF NOT EXISTS idx_atoms_type ON atoms(type);
-      CREATE INDEX IF NOT EXISTS idx_atoms_pinned ON atoms(pinned) WHERE pinned=1;
-
-      CREATE INDEX IF NOT EXISTS idx_evidence_stream ON atom_evidence(stream_id);
-
-      CREATE INDEX IF NOT EXISTS idx_decisions_pass ON consolidation_decisions(pass_id);
-
-      CREATE INDEX IF NOT EXISTS idx_passes_store ON distillation_passes(store_key);
-      CREATE INDEX IF NOT EXISTS idx_passes_started ON distillation_passes(started_at);
-
-      CREATE INDEX IF NOT EXISTS idx_pass_scene_effects_pass ON pass_scene_effects(pass_id);
-
-      CREATE INDEX IF NOT EXISTS idx_scenes_kind ON scenes(scene_kind);
-      CREATE INDEX IF NOT EXISTS idx_scenes_status ON scenes(status);
-
-      CREATE INDEX IF NOT EXISTS idx_scene_atoms_atom ON scene_atoms(atom_id);
-    `);
-  }
-
-  /** Guards the two UNIQUE indexes created in createIndexes(). A legacy
-   *  store that predates those constraints could in principle already
-   *  contain duplicate (session_id, turn_index) or (session_id, turn_id)
-   *  rows; silently deduplicating would destroy data, so we fail loudly
-   *  with a clear, actionable error instead
-   *  (docs/future/reliability-hardening.md finding 6). */
-  private assertNoDuplicateTurnKeys(): void {
-    if (!this.tableExists("stream")) return;
-    if (this.hasColumn("stream", "turn_index")) {
-      const dup = this.db.prepare(`
-        SELECT session_id, turn_index, COUNT(*) AS n FROM stream
-        WHERE turn_index IS NOT NULL
-        GROUP BY session_id, turn_index HAVING n > 1 LIMIT 1
-      `).get() as { session_id: string; turn_index: number; n: number } | undefined;
-      if (dup) {
-        throw new LegacyMigrationError(
-          `Cannot upgrade store: duplicate stream rows for session_id=${dup.session_id} ` +
-          `turn_index=${dup.turn_index} (${dup.n} rows) would violate the new unique ` +
-          `idx_stream_turn_index constraint. Resolve the duplicates manually before reopening.`
-        );
-      }
-    }
-    if (this.hasColumn("stream", "turn_id")) {
-      const dup = this.db.prepare(`
-        SELECT session_id, turn_id, COUNT(*) AS n FROM stream
-        WHERE turn_id IS NOT NULL
-        GROUP BY session_id, turn_id HAVING n > 1 LIMIT 1
-      `).get() as { session_id: string; turn_id: string; n: number } | undefined;
-      if (dup) {
-        throw new LegacyMigrationError(
-          `Cannot upgrade store: duplicate stream rows for session_id=${dup.session_id} ` +
-          `turn_id=${dup.turn_id} (${dup.n} rows) would violate the new unique ` +
-          `idx_stream_turn_id constraint. Resolve the duplicates manually before reopening.`
-        );
-      }
-    }
   }
 
   // ─── T0 Stream ──────────────────────────────────────────────────────────────
@@ -1629,7 +1316,7 @@ export class Falda {
    * embedding models/dimensions (docs/OPERATIONS.md).
    *
    * Dimension is baked into the vec0 schema (`embedding float[${dim}]` —
-   * see initSchema above), so a dim change can't be done as a row rewrite:
+   * see src/store/schema.ts's initSchema()), so a dim change can't be done as a row rewrite:
    * the *_vec tables are dropped and recreated at `this.dim` before
    * repopulating. Safe to call even when only the model (not the dim)
    * changed — the drop/recreate is just extra I/O in that case.
