@@ -36,25 +36,32 @@ describe("ServeHandle.close(): in-flight HTTP requests", () => {
         runtimeConfig: { root: path.join(root, "data"), dim: 32, tokensPath, label: "shutdown-http-test" },
       });
       const port = (handle.httpServer.address() as any).port;
+      const store = handle.runtime.pools.resolve("proj-a", undefined, true);
+      const originalUpsert = store.upsertAtom.bind(store);
+      let signalEntered!: () => void;
+      let releaseUpsert!: () => void;
+      const entered = new Promise<void>((resolve) => { signalEntered = resolve; });
+      const released = new Promise<void>((resolve) => { releaseUpsert = resolve; });
+      store.upsertAtom = async (atom) => {
+        signalEntered();
+        await released;
+        return originalUpsert(atom);
+      };
 
-      // Fire a real request but don't await it yet — we want it in flight
-      // when close() is called.
       const reqPromise = fetch(`http://127.0.0.1:${port}/atoms/upsert`, {
         method: "POST",
         headers: {
           "content-type": "application/json",
           authorization: "Bearer tok-a",
           "x-falda-tenant": "proj-a",
+          connection: "close",
         },
         body: JSON.stringify({ content: "in-flight request test atom" }),
       });
 
-      // Give the request a moment to actually be received by the server
-      // (its handler is tracked via InFlightTracker as soon as 'end' fires)
-      // before starting shutdown.
-      await new Promise((r) => setTimeout(r, 10));
-
+      await entered;
       const closePromise = handle.close();
+      releaseUpsert();
       const resp = await reqPromise;
       assert.equal(resp.status, 200, "in-flight request must still complete successfully");
       const json = await resp.json() as { id?: string };
