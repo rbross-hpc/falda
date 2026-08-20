@@ -17,7 +17,7 @@ export type DistillConfidence = typeof VALID_CONFIDENCE[number];
  * inspect` can attribute a decision to the prompt policy that produced it,
  * independent of the LLM model used.
  */
-export const PROMPT_VERSION = "distill-prompts-v1";
+export const PROMPT_VERSION = "distill-prompts-v2";
 
 /** L1 extraction: extract candidate atoms from a window of turns. */
 export function extractionPrompt(turns: Array<{ role: string; content: string }>): string {
@@ -35,6 +35,7 @@ Rules:
 - Each line must be valid JSON. Output ONLY the JSON lines, no other text.
 - Use "fact" for stable truths, "pattern" for recurring behaviors, "preference" for likes/dislikes,
   "constraint" for hard rules, "instruction" for standing directives.
+- If there is nothing durable to extract, output exactly: []
 
 Conversation:
 ${transcript}`;

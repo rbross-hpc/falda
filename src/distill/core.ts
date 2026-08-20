@@ -116,42 +116,75 @@ function validateCandidate(obj: any): CandidateAtom | null {
   return { type: type as AtomType, content: content.trim(), confidence: confidence as AtomConfidence };
 }
 
+/** Discriminated result from parseCandidates: either a (possibly empty) valid
+ *  candidate list, or a failure reason that must fail the pass. */
+type CandidateParseResult =
+  | { ok: true; candidates: CandidateAtom[] }
+  | { ok: false; reason: string };
+
 /**
  * Parse LLM extraction output into candidate atoms.
  *
  * Tolerates the common variations a chat model may emit despite "Output ONLY
- * the JSON lines" instructions:
+ * the JSON lines / [] if nothing" instructions:
  *   1. Markdown code fences (```json … ```) — stripped before parsing.
- *   2. A JSON array of objects ([ {…}, {…} ]) — parsed as one unit.
- *   3. Newline-delimited JSON objects (the intended format) — scanned line-by-line.
+ *   2. `[]` — intentional empty extraction (success, zero candidates).
+ *   3. A JSON array of objects ([ {…}, {…} ]) — parsed as one unit; any
+ *      invalid element fails the whole extraction.
+ *   4. Newline-delimited JSON objects — scanned line-by-line; any
+ *      object-looking line that is malformed or invalid fails the whole
+ *      extraction. Non-object prose lines are tolerated when at least one
+ *      valid object exists.
  *
- * Any object that fails field validation is silently skipped (best-effort).
+ * Blank/whitespace-only responses and fully prose-only responses are failures.
+ * This is in contrast to the old behaviour that silently returned [] in these
+ * cases, advancing the watermark past the source window with zero memories
+ * (docs/future/reliability-hardening.md finding 16).
  */
-function parseCandidates(raw: string): CandidateAtom[] {
+function parseCandidates(raw: string): CandidateParseResult {
   // Strip markdown code fences.
   const stripped = raw.replace(/^```(?:json)?\s*/m, "").replace(/\s*```\s*$/m, "").trim();
 
-  // Try JSON array first.
+  if (!stripped) return { ok: false, reason: "blank extraction response" };
+
+  // Explicit empty sentinel — the model confirmed there is nothing to extract.
+  if (stripped === "[]") return { ok: true, candidates: [] };
+
+  // JSON array path.
   if (stripped.startsWith("[")) {
-    try {
-      const arr = JSON.parse(stripped);
-      if (Array.isArray(arr)) {
-        return arr.map(validateCandidate).filter((c): c is CandidateAtom => c !== null);
-      }
-    } catch { /* fall through to line scan */ }
+    let arr: unknown;
+    try { arr = JSON.parse(stripped); } catch {
+      return { ok: false, reason: "extraction response started with '[' but is not valid JSON" };
+    }
+    if (!Array.isArray(arr)) {
+      return { ok: false, reason: "extraction response parsed as non-array JSON" };
+    }
+    const candidates: CandidateAtom[] = [];
+    for (let i = 0; i < arr.length; i++) {
+      const c = validateCandidate(arr[i]);
+      if (!c) return { ok: false, reason: `array element ${i} failed candidate validation` };
+      candidates.push(c);
+    }
+    return { ok: true, candidates };
   }
 
-  // Line-by-line scan: accept any line containing a parseable JSON object.
-  const results: CandidateAtom[] = [];
+  // JSON-lines path.
+  const candidates: CandidateAtom[] = [];
   for (const line of stripped.split("\n")) {
     const trimmed = line.trim();
-    if (!trimmed.startsWith("{")) continue;
-    try {
-      const candidate = validateCandidate(JSON.parse(trimmed));
-      if (candidate) results.push(candidate);
-    } catch { /* skip malformed line */ }
+    if (!trimmed.startsWith("{")) continue; // tolerate non-object prose
+    let obj: unknown;
+    try { obj = JSON.parse(trimmed); } catch {
+      return { ok: false, reason: `extraction response contains malformed JSON object: ${trimmed.slice(0, 80)}` };
+    }
+    const c = validateCandidate(obj);
+    if (!c) return { ok: false, reason: `extraction response contains invalid candidate fields: ${trimmed.slice(0, 80)}` };
+    candidates.push(c);
   }
-  return results;
+  if (candidates.length === 0) {
+    return { ok: false, reason: "extraction response contained no JSON objects" };
+  }
+  return { ok: true, candidates };
 }
 
 export interface ConsolidationDecision {
@@ -160,26 +193,33 @@ export interface ConsolidationDecision {
   rationale: string;
 }
 
-function parseConsolidation(raw: string): ConsolidationDecision {
+/**
+ * Parse a single consolidation LLM response.
+ *
+ * Returns a valid ConsolidationDecision, or undefined when the response is
+ * malformed. Callers must treat undefined as a retryable failure — they must
+ * NOT silently convert it into a skip, which would discard a validly-extracted
+ * candidate without any durable record (finding 16).
+ *
+ * Valid action:"skip" is distinct from a parse failure and remains a successful
+ * decision that advances the watermark.
+ */
+function parseConsolidation(raw: string): ConsolidationDecision | undefined {
   const trimmed = raw.trim();
   const jsonStart = trimmed.indexOf("{");
   const jsonEnd = trimmed.lastIndexOf("}");
-  if (jsonStart === -1 || jsonEnd === -1) {
-    return { action: "skip", target_ids: [], rationale: "malformed LLM response" };
-  }
+  if (jsonStart === -1 || jsonEnd === -1) return undefined;
   try {
     const obj = JSON.parse(trimmed.slice(jsonStart, jsonEnd + 1));
     const action = obj.action as string;
-    if (!["store", "update", "merge", "skip"].includes(action)) {
-      return { action: "skip", target_ids: [], rationale: "unknown action" };
-    }
+    if (!["store", "update", "merge", "skip"].includes(action)) return undefined;
     return {
       action: action as ConsolidationDecision["action"],
       target_ids: Array.isArray(obj.target_ids) ? obj.target_ids.map(String) : [],
       rationale: typeof obj.rationale === "string" ? obj.rationale : "",
     };
   } catch {
-    return { action: "skip", target_ids: [], rationale: "parse error" };
+    return undefined;
   }
 }
 
@@ -535,7 +575,11 @@ async function distillOncePass(
     const extractRaw = await llm(extractionPrompt(
       turns.map((t) => ({ role: t.role, content: t.content }))
     ));
-    const candidates = parseCandidates(extractRaw);
+    const parseResult = parseCandidates(extractRaw);
+    if (!parseResult.ok) {
+      throw new Error(`malformed extraction response: ${parseResult.reason}`);
+    }
+    const candidates = parseResult.candidates;
     log(`[distill] L1 extracted ${candidates.length} candidates`);
 
     // Phase 1: retrieve each candidate's neighbours. These are reads only
@@ -562,7 +606,11 @@ async function distillOncePass(
 
     const decideIndividually = async (i: number): Promise<void> => {
       const raw = await llm(consolidationPrompt(retrieved[i].candidate, retrieved[i].existing));
-      decisions[i] = parseConsolidation(raw);
+      const dec = parseConsolidation(raw);
+      if (dec === undefined) {
+        throw new Error(`malformed consolidation response for candidate ${i}`);
+      }
+      decisions[i] = dec;
     };
 
     if (batchSize <= 1 || retrieved.length <= 1) {
